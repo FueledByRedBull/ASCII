@@ -47,6 +47,7 @@ private:
     AVPacket* pkt_ = nullptr;
     SwsContext* sws_ctx_ = nullptr;
     int64_t pts_ = 0;
+    bool output_is_gif_ = false;
 };
 
 }

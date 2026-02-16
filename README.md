@@ -128,6 +128,12 @@ Export video:
 .\build-noopencv\ascii-engine.exe ".\media\clip.mp4" -o out.mp4
 ```
 
+Export animated GIF:
+
+```powershell
+.\build-noopencv\ascii-engine.exe ".\media\clip.mp4" -o out.gif
+```
+
 Export text:
 
 ```powershell

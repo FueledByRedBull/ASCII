@@ -1,13 +1,64 @@
 #include "video_encoder.hpp"
+#include <algorithm>
+#include <cctype>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
 
 namespace ascii {
+
+namespace {
+
+bool ends_with_ci(const std::string& value, const std::string& suffix) {
+    if (suffix.size() > value.size()) {
+        return false;
+    }
+    size_t offset = value.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        unsigned char a = static_cast<unsigned char>(value[offset + i]);
+        unsigned char b = static_cast<unsigned char>(suffix[i]);
+        if (std::tolower(a) != std::tolower(b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output) {
+    if (!codec || !codec->pix_fmts) {
+        return gif_output ? AV_PIX_FMT_RGB8 : AV_PIX_FMT_YUV420P;
+    }
+
+    if (gif_output) {
+        const AVPixelFormat preferred[] = {
+            AV_PIX_FMT_RGB8,
+            AV_PIX_FMT_BGR8,
+            AV_PIX_FMT_PAL8
+        };
+        for (AVPixelFormat pf : preferred) {
+            for (const AVPixelFormat* p = codec->pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+                if (*p == pf) {
+                    return pf;
+                }
+            }
+        }
+    } else {
+        for (const AVPixelFormat* p = codec->pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+            if (*p == AV_PIX_FMT_YUV420P) {
+                return AV_PIX_FMT_YUV420P;
+            }
+        }
+    }
+
+    return codec->pix_fmts[0];
+}
+
+}  // namespace
 
 VideoEncoder::VideoEncoder() = default;
 
@@ -17,6 +68,7 @@ VideoEncoder::~VideoEncoder() {
 
 bool VideoEncoder::open(const std::string& filename, const Config& config) {
     config_ = config;
+    output_is_gif_ = ends_with_ci(filename, ".gif");
     
     int ret = avformat_alloc_output_context2(&format_ctx_, nullptr, nullptr, filename.c_str());
     if (ret < 0 || !format_ctx_) {
@@ -69,15 +121,20 @@ void VideoEncoder::close() {
     }
     
     pts_ = 0;
+    output_is_gif_ = false;
 }
 
 bool VideoEncoder::write_frame(const FrameBuffer& frame) {
     if (!is_open() || !frame_) return false;
+
+    if (av_frame_make_writable(frame_) < 0) {
+        return false;
+    }
     
     if (!sws_ctx_) {
         sws_ctx_ = sws_getContext(
             frame.width(), frame.height(), AV_PIX_FMT_RGBA,
-            config_.width, config_.height, AV_PIX_FMT_YUV420P,
+            config_.width, config_.height, codec_ctx_->pix_fmt,
             SWS_BILINEAR, nullptr, nullptr, nullptr
         );
         if (!sws_ctx_) return false;
@@ -110,9 +167,14 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
 }
 
 bool VideoEncoder::init_codec() {
-    const AVCodec* codec = avcodec_find_encoder_by_name(config_.codec.c_str());
-    if (!codec) {
-        codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    const AVCodec* codec = nullptr;
+    if (output_is_gif_) {
+        codec = avcodec_find_encoder(AV_CODEC_ID_GIF);
+    } else {
+        codec = avcodec_find_encoder_by_name(config_.codec.c_str());
+        if (!codec) {
+            codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        }
     }
     if (!codec) return false;
     
@@ -123,15 +185,17 @@ bool VideoEncoder::init_codec() {
     codec_ctx_->height = config_.height;
     codec_ctx_->time_base = {1, config_.fps};
     codec_ctx_->framerate = {config_.fps, 1};
-    codec_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
-    codec_ctx_->bit_rate = config_.bitrate;
-    codec_ctx_->gop_size = config_.fps;
+    codec_ctx_->pix_fmt = choose_pixel_format(codec, output_is_gif_);
+    codec_ctx_->gop_size = std::max(1, config_.fps);
+    if (!output_is_gif_) {
+        codec_ctx_->bit_rate = config_.bitrate;
+    }
     
     if (format_ctx_->oformat->flags & AVFMT_GLOBALHEADER) {
         codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
     
-    if (config_.codec == "libx264") {
+    if (!output_is_gif_ && config_.codec == "libx264") {
         av_opt_set(codec_ctx_->priv_data, "preset", config_.preset.c_str(), 0);
     }
     

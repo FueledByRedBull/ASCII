@@ -159,7 +159,7 @@ void print_help(const char* prog) {
     printf("INPUT:\n");
     printf("  Path to video file, image, or \"webcam\" for live capture\n\n");
     printf("OPTIONS:\n");
-    printf("  -o, --output <FILE>     Output file (for video/image output)\n");
+    printf("  -o, --output <FILE>     Output file (.mp4 or .gif video, or .txt frames)\n");
     printf("      --config <FILE>     Config file path (default: platform-specific)\n");
     printf("      --replay <FILE>     Write deterministic replay to .areplay file\n");
     printf("  -f, --fps <N>           Target FPS (default: 30, range: 1-120)\n");

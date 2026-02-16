@@ -118,6 +118,19 @@ bool check_image_extension(const std::string& path) {
            lower.ends_with(".webp");
 }
 
+bool is_gif_extension(const std::string& path) {
+    std::string lower = to_lower_copy(path);
+    return lower.ends_with(".gif");
+}
+
+bool should_force_image2(const std::string& path) {
+    std::string lower = to_lower_copy(path);
+    // Keep animated GIF on normal demux path, otherwise frames collapse to still-image behavior.
+    return lower.ends_with(".png") || lower.ends_with(".jpg") ||
+           lower.ends_with(".jpeg") || lower.ends_with(".bmp") ||
+           lower.ends_with(".tiff") || lower.ends_with(".webp");
+}
+
 #ifndef ASCII_USE_OPENCV
 AVCodecID image_codec_from_extension(const std::string& path) {
     std::string lower = to_lower_copy(path);
@@ -201,7 +214,7 @@ bool init_video_decoder(const std::string& uri, FFmpegDecoder& dec, Size& size, 
     dec.close();
 
     const AVInputFormat* input_fmt = nullptr;
-    if (check_image_extension(uri)) {
+    if (should_force_image2(uri)) {
         input_fmt = av_find_input_format("image2");
     }
 
@@ -788,6 +801,11 @@ std::unique_ptr<FrameSource> create_source(const std::string& uri) {
 
     if (uri == "webcam" || uri.find("/dev/video") == 0 || is_numeric(uri)) {
         return std::make_unique<WebcamSource>();
+    }
+
+    if (is_gif_extension(uri)) {
+        // Animated GIF should be treated as video stream.
+        return std::make_unique<VideoFileSource>();
     }
 
     if (check_image_extension(uri)) {
