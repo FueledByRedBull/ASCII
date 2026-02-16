@@ -17,6 +17,7 @@ Recent performance-oriented updates include:
 1. Hierarchical motion estimation (coarse-to-fine pyramid refinement)
 2. SIMD hot paths (AVX2/SSE2 where available, scalar fallback)
 3. Cache-aware tiling in edge/blur kernels
+4. Optimized in-tree FFT phase-correlation (plan/twiddle caching, workspace reuse, rectangular FFT)
 
 These changes target better throughput without changing the external CLI.
 

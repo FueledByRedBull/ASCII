@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <unordered_map>
 #include <vector>
 
 #ifdef HAS_OPENMP
@@ -28,35 +29,77 @@ float quadratic_peak_offset(float left, float center, float right) {
     return std::clamp(0.5f * (left - right) / denom, -1.0f, 1.0f);
 }
 
+struct FFTPlan {
+    int n = 0;
+    std::vector<int> bitrev;
+    std::vector<std::vector<std::complex<float>>> twiddles_fwd;
+    std::vector<std::vector<std::complex<float>>> twiddles_inv;
+};
+
+const FFTPlan& get_fft_plan(int n) {
+    static std::unordered_map<int, FFTPlan> cache;
+    auto it = cache.find(n);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    FFTPlan plan;
+    plan.n = n;
+    plan.bitrev.resize(n);
+
+    int bits = 0;
+    while ((1 << bits) < n) {
+        ++bits;
+    }
+    for (int i = 0; i < n; ++i) {
+        int r = 0;
+        for (int b = 0; b < bits; ++b) {
+            r = (r << 1) | ((i >> b) & 1);
+        }
+        plan.bitrev[i] = r;
+    }
+
+    constexpr float kTwoPi = 6.28318530717958647692f;
+    for (int len = 2; len <= n; len <<= 1) {
+        int half = len >> 1;
+        std::vector<std::complex<float>> fwd(half);
+        std::vector<std::complex<float>> inv(half);
+        for (int j = 0; j < half; ++j) {
+            float angle = -kTwoPi * static_cast<float>(j) / static_cast<float>(len);
+            fwd[j] = std::complex<float>(std::cos(angle), std::sin(angle));
+            inv[j] = std::conj(fwd[j]);
+        }
+        plan.twiddles_fwd.push_back(std::move(fwd));
+        plan.twiddles_inv.push_back(std::move(inv));
+    }
+
+    auto [inserted_it, _] = cache.emplace(n, std::move(plan));
+    return inserted_it->second;
+}
+
 void fft_1d(std::complex<float>* data, int n, bool inverse) {
     if (n <= 1) {
         return;
     }
 
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) {
-            j ^= bit;
-        }
-        j ^= bit;
+    const FFTPlan& plan = get_fft_plan(n);
+    for (int i = 0; i < n; ++i) {
+        int j = plan.bitrev[i];
         if (i < j) {
             std::swap(data[i], data[j]);
         }
     }
 
-    const float pi = 3.14159265358979323846f;
-    for (int len = 2; len <= n; len <<= 1) {
-        float angle = (inverse ? 2.0f : -2.0f) * pi / static_cast<float>(len);
-        std::complex<float> wlen(std::cos(angle), std::sin(angle));
+    int stage = 0;
+    for (int len = 2; len <= n; len <<= 1, ++stage) {
+        const int half = len >> 1;
+        const auto& tw = inverse ? plan.twiddles_inv[stage] : plan.twiddles_fwd[stage];
         for (int i = 0; i < n; i += len) {
-            std::complex<float> w(1.0f, 0.0f);
-            int half = len >> 1;
             for (int j = 0; j < half; ++j) {
                 std::complex<float> u = data[i + j];
-                std::complex<float> v = data[i + j + half] * w;
+                std::complex<float> v = data[i + j + half] * tw[j];
                 data[i + j] = u + v;
                 data[i + j + half] = u - v;
-                w *= wlen;
             }
         }
     }
@@ -69,55 +112,101 @@ void fft_1d(std::complex<float>* data, int n, bool inverse) {
     }
 }
 
-void fft_2d(std::complex<float>* data, int w, int h, bool inverse) {
+void fft_2d(std::complex<float>* data, int w, int h, bool inverse,
+            std::vector<std::complex<float>>& column_scratch) {
     for (int y = 0; y < h; ++y) {
         fft_1d(data + static_cast<size_t>(y) * w, w, inverse);
     }
 
-    std::vector<std::complex<float>> col(h);
+    if (static_cast<int>(column_scratch.size()) < h) {
+        column_scratch.resize(h);
+    }
+    std::complex<float>* col = column_scratch.data();
     for (int x = 0; x < w; ++x) {
         for (int y = 0; y < h; ++y) {
             col[y] = data[static_cast<size_t>(y) * w + x];
         }
-        fft_1d(col.data(), h, inverse);
+        fft_1d(col, h, inverse);
         for (int y = 0; y < h; ++y) {
             data[static_cast<size_t>(y) * w + x] = col[y];
         }
     }
 }
 
-void load_zero_mean_hann(const FloatImage& img, std::vector<std::complex<float>>& out, int n) {
+const std::vector<float>& hann_window(int n) {
+    static std::unordered_map<int, std::vector<float>> cache;
+    auto it = cache.find(n);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    std::vector<float> weights(std::max(1, n), 1.0f);
+    if (n > 1) {
+        constexpr float kTwoPi = 6.28318530717958647692f;
+        const float denom = static_cast<float>(n - 1);
+        for (int i = 0; i < n; ++i) {
+            weights[i] = 0.5f * (1.0f - std::cos(kTwoPi * static_cast<float>(i) / denom));
+        }
+    }
+
+    auto [inserted_it, _] = cache.emplace(n, std::move(weights));
+    return inserted_it->second;
+}
+
+struct PhaseCorrelationWorkspace {
+    int fft_w = 0;
+    int fft_h = 0;
+    std::vector<std::complex<float>> prev_fft;
+    std::vector<std::complex<float>> curr_fft;
+    std::vector<std::complex<float>> cross_power;
+    std::vector<std::complex<float>> column;
+};
+
+PhaseCorrelationWorkspace& get_phase_workspace(int fft_w, int fft_h) {
+    static thread_local PhaseCorrelationWorkspace ws;
+    if (ws.fft_w != fft_w || ws.fft_h != fft_h) {
+        ws.fft_w = fft_w;
+        ws.fft_h = fft_h;
+        const size_t fft_size = static_cast<size_t>(fft_w) * fft_h;
+        ws.prev_fft.assign(fft_size, std::complex<float>(0.0f, 0.0f));
+        ws.curr_fft.assign(fft_size, std::complex<float>(0.0f, 0.0f));
+        ws.cross_power.assign(fft_size, std::complex<float>(0.0f, 0.0f));
+        ws.column.assign(std::max(fft_w, fft_h), std::complex<float>(0.0f, 0.0f));
+    }
+    return ws;
+}
+
+void load_zero_mean_hann(const FloatImage& img, std::complex<float>* out, int fft_w) {
     const int w = img.width();
     const int h = img.height();
     if (w <= 0 || h <= 0) {
         return;
     }
 
+    const float* src = img.data();
     double sum = 0.0;
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            sum += img.get(x, y);
-        }
+    for (int i = 0; i < w * h; ++i) {
+        sum += src[i];
     }
     const float mean = static_cast<float>(sum / static_cast<double>(w * h));
-    const float pi = 3.14159265358979323846f;
 
-    const float wx_denom = static_cast<float>(std::max(1, w - 1));
-    const float wy_denom = static_cast<float>(std::max(1, h - 1));
+    const auto& wx = hann_window(w);
+    const auto& wy = hann_window(h);
     for (int y = 0; y < h; ++y) {
-        float wy = 0.5f * (1.0f - std::cos(2.0f * pi * static_cast<float>(y) / wy_denom));
+        const float* src_row = src + static_cast<size_t>(y) * w;
+        std::complex<float>* dst_row = out + static_cast<size_t>(y) * fft_w;
+        const float wyv = wy[y];
         for (int x = 0; x < w; ++x) {
-            float wx = 0.5f * (1.0f - std::cos(2.0f * pi * static_cast<float>(x) / wx_denom));
-            float v = (img.get(x, y) - mean) * wx * wy;
-            out[static_cast<size_t>(y) * n + x] = std::complex<float>(v, 0.0f);
+            float v = (src_row[x] - mean) * wx[x] * wyv;
+            dst_row[x] = std::complex<float>(v, 0.0f);
         }
     }
 }
 
-float corr_magnitude(const std::vector<std::complex<float>>& corr, int n, int ix, int iy) {
-    ix = (ix % n + n) % n;
-    iy = (iy % n + n) % n;
-    return std::abs(corr[static_cast<size_t>(iy) * n + ix]);
+float corr_magnitude(const std::vector<std::complex<float>>& corr, int fft_w, int fft_h, int ix, int iy) {
+    ix = (ix % fft_w + fft_w) % fft_w;
+    iy = (iy % fft_h + fft_h) % fft_h;
+    return std::abs(corr[static_cast<size_t>(iy) * fft_w + ix]);
 }
 
 int wrap_signed_shift(int s, int n) {
@@ -125,27 +214,6 @@ int wrap_signed_shift(int s, int n) {
     while (s > half) s -= n;
     while (s < -half) s += n;
     return s;
-}
-
-FloatImage downsample_half(const FloatImage& src) {
-    const int src_w = src.width();
-    const int src_h = src.height();
-    const int dst_w = std::max(1, src_w / 2);
-    const int dst_h = std::max(1, src_h / 2);
-    FloatImage dst(dst_w, dst_h, 0.0f);
-
-    for (int y = 0; y < dst_h; ++y) {
-        for (int x = 0; x < dst_w; ++x) {
-            const int sx = x * 2;
-            const int sy = y * 2;
-            float sum = src.get(sx, sy) +
-                        src.get(std::min(sx + 1, src_w - 1), sy) +
-                        src.get(sx, std::min(sy + 1, src_h - 1)) +
-                        src.get(std::min(sx + 1, src_w - 1), std::min(sy + 1, src_h - 1));
-            dst.set(x, y, 0.25f * sum);
-        }
-    }
-    return dst;
 }
 
 FloatImage upsample_flow_field(const FloatImage& src, int dst_w, int dst_h, float scale) {
@@ -203,30 +271,33 @@ MotionVector estimate_phase_correlation_shift(
         return mv;
     }
 
-    const int n = next_power_of_two(std::max(w, h));
-    if (n < 2) {
+    const int fft_w = next_power_of_two(w);
+    const int fft_h = next_power_of_two(h);
+    if (fft_w < 2 || fft_h < 2) {
         return mv;
     }
 
-    std::vector<std::complex<float>> f(static_cast<size_t>(n) * n, std::complex<float>(0.0f, 0.0f));
-    std::vector<std::complex<float>> g(static_cast<size_t>(n) * n, std::complex<float>(0.0f, 0.0f));
-    load_zero_mean_hann(prev, f, n);
-    load_zero_mean_hann(curr, g, n);
+    PhaseCorrelationWorkspace& ws = get_phase_workspace(fft_w, fft_h);
+    std::fill(ws.prev_fft.begin(), ws.prev_fft.end(), std::complex<float>(0.0f, 0.0f));
+    std::fill(ws.curr_fft.begin(), ws.curr_fft.end(), std::complex<float>(0.0f, 0.0f));
+    std::fill(ws.cross_power.begin(), ws.cross_power.end(), std::complex<float>(0.0f, 0.0f));
+    load_zero_mean_hann(prev, ws.prev_fft.data(), fft_w);
+    load_zero_mean_hann(curr, ws.curr_fft.data(), fft_w);
 
-    fft_2d(f.data(), n, n, false);
-    fft_2d(g.data(), n, n, false);
+    fft_2d(ws.prev_fft.data(), fft_w, fft_h, false, ws.column);
+    fft_2d(ws.curr_fft.data(), fft_w, fft_h, false, ws.column);
 
-    std::vector<std::complex<float>> r(static_cast<size_t>(n) * n, std::complex<float>(0.0f, 0.0f));
-    for (size_t i = 0; i < r.size(); ++i) {
-        std::complex<float> cross = f[i] * std::conj(g[i]);
+    for (size_t i = 0; i < ws.cross_power.size(); ++i) {
+        std::complex<float> cross = ws.prev_fft[i] * std::conj(ws.curr_fft[i]);
         float mag = std::abs(cross);
         if (mag > 1e-12f) {
-            r[i] = cross / mag;
+            ws.cross_power[i] = cross / mag;
         }
     }
-    fft_2d(r.data(), n, n, true);
+    fft_2d(ws.cross_power.data(), fft_w, fft_h, true, ws.column);
 
-    const int search = std::clamp(radius, 1, std::max(1, n / 2 - 1));
+    const int search_x = std::clamp(radius, 1, std::max(1, fft_w / 2 - 1));
+    const int search_y = std::clamp(radius, 1, std::max(1, fft_h / 2 - 1));
     const int center_ix = static_cast<int>(std::lround(center_dx));
     const int center_iy = static_cast<int>(std::lround(center_dy));
     float best = -1.0f;
@@ -235,13 +306,13 @@ MotionVector estimate_phase_correlation_shift(
     int best_dy = 0;
     double sum = 0.0;
     int samples = 0;
-    for (int dy = -search; dy <= search; ++dy) {
-        for (int dx = -search; dx <= search; ++dx) {
-            int cand_dx = wrap_signed_shift(center_ix + dx, n);
-            int cand_dy = wrap_signed_shift(center_iy + dy, n);
-            const int ix = (cand_dx >= 0) ? cand_dx : (n + cand_dx);
-            const int iy = (cand_dy >= 0) ? cand_dy : (n + cand_dy);
-            float v = std::abs(r[static_cast<size_t>(iy) * n + ix]);
+    for (int dy = -search_y; dy <= search_y; ++dy) {
+        for (int dx = -search_x; dx <= search_x; ++dx) {
+            int cand_dx = wrap_signed_shift(center_ix + dx, fft_w);
+            int cand_dy = wrap_signed_shift(center_iy + dy, fft_h);
+            const int ix = (cand_dx >= 0) ? cand_dx : (fft_w + cand_dx);
+            const int iy = (cand_dy >= 0) ? cand_dy : (fft_h + cand_dy);
+            float v = std::abs(ws.cross_power[static_cast<size_t>(iy) * fft_w + ix]);
             sum += v;
             samples++;
             if (v > best) {
@@ -259,14 +330,14 @@ MotionVector estimate_phase_correlation_shift(
         return mv;
     }
 
-    const int best_ix = (best_dx >= 0) ? best_dx : (n + best_dx);
-    const int best_iy = (best_dy >= 0) ? best_dy : (n + best_dy);
+    const int best_ix = (best_dx >= 0) ? best_dx : (fft_w + best_dx);
+    const int best_iy = (best_dy >= 0) ? best_dy : (fft_h + best_dy);
 
-    float c = corr_magnitude(r, n, best_ix, best_iy);
-    float l = corr_magnitude(r, n, best_ix - 1, best_iy);
-    float rr = corr_magnitude(r, n, best_ix + 1, best_iy);
-    float u = corr_magnitude(r, n, best_ix, best_iy - 1);
-    float d = corr_magnitude(r, n, best_ix, best_iy + 1);
+    float c = corr_magnitude(ws.cross_power, fft_w, fft_h, best_ix, best_iy);
+    float l = corr_magnitude(ws.cross_power, fft_w, fft_h, best_ix - 1, best_iy);
+    float rr = corr_magnitude(ws.cross_power, fft_w, fft_h, best_ix + 1, best_iy);
+    float u = corr_magnitude(ws.cross_power, fft_w, fft_h, best_ix, best_iy - 1);
+    float d = corr_magnitude(ws.cross_power, fft_w, fft_h, best_ix, best_iy + 1);
 
     float sub_dx = quadratic_peak_offset(l, c, rr);
     float sub_dy = quadratic_peak_offset(u, c, d);
@@ -283,36 +354,23 @@ MotionVector estimate_phase_correlation_shift(
     return mv;
 }
 
-MotionVector estimate_phase_correlation_hierarchical(const FloatImage& prev,
-                                                     const FloatImage& curr,
-                                                     int radius,
-                                                     int max_levels) {
+MotionVector estimate_phase_correlation_hierarchical(const FloatImage* prev_levels,
+                                                     const FloatImage* curr_levels,
+                                                     int levels_available,
+                                                     int radius) {
     MotionVector mv{};
-    if (prev.empty() || curr.empty() || prev.width() != curr.width() || prev.height() != curr.height()) {
+    if (!prev_levels || !curr_levels || levels_available <= 0) {
         return mv;
-    }
-
-    std::vector<FloatImage> prev_levels;
-    std::vector<FloatImage> curr_levels;
-    prev_levels.push_back(prev);
-    curr_levels.push_back(curr);
-
-    const int levels_target = std::clamp(max_levels, 1, 4);
-    for (int l = 1; l < levels_target; ++l) {
-        const FloatImage& p = prev_levels.back();
-        const FloatImage& c = curr_levels.back();
-        if (p.width() < 32 || p.height() < 32 || c.width() < 32 || c.height() < 32) {
-            break;
-        }
-        prev_levels.push_back(downsample_half(p));
-        curr_levels.push_back(downsample_half(c));
     }
 
     float pred_dx = 0.0f;
     float pred_dy = 0.0f;
     MotionVector last{};
-    const int top = static_cast<int>(prev_levels.size()) - 1;
+    const int top = levels_available - 1;
     for (int l = top; l >= 0; --l) {
+        if (prev_levels[l].empty() || curr_levels[l].empty()) {
+            continue;
+        }
         if (l != top) {
             pred_dx *= 2.0f;
             pred_dy *= 2.0f;
@@ -321,8 +379,8 @@ MotionVector estimate_phase_correlation_hierarchical(const FloatImage& prev,
         local_radius = std::min(local_radius, std::max(2, radius));
 
         MotionVector level_mv = estimate_phase_correlation_shift(
-            prev_levels[static_cast<size_t>(l)],
-            curr_levels[static_cast<size_t>(l)],
+            prev_levels[l],
+            curr_levels[l],
             local_radius,
             pred_dx,
             pred_dy);
@@ -605,7 +663,7 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
     MotionVector phase_mv{};
     if (config_.use_phase_correlation) {
         phase_mv = estimate_phase_correlation_hierarchical(
-            prev, curr, config_.phase_search_radius, levels_available);
+            prev_pyramid_, curr_pyramid_, levels_available, config_.phase_search_radius);
     }
     
     for (int y = 0; y < height_; ++y) {
