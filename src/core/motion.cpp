@@ -200,17 +200,42 @@ void fft_2d(std::complex<float>* data, int w, int h, bool inverse,
         fft_1d(data + static_cast<size_t>(y) * w, w, inverse);
     }
 
-    if (static_cast<int>(column_scratch.size()) < h) {
-        column_scratch.resize(h);
+    const size_t scratch_size = static_cast<size_t>(w) * h;
+    if (column_scratch.size() < scratch_size) {
+        column_scratch.resize(scratch_size);
     }
-    std::complex<float>* col = column_scratch.data();
-    for (int x = 0; x < w; ++x) {
-        for (int y = 0; y < h; ++y) {
-            col[y] = data[static_cast<size_t>(y) * w + x];
+
+    std::complex<float>* transposed = column_scratch.data();
+
+    // Cache-friendly blocked transpose: columns become contiguous rows.
+    constexpr int kTile = 32;
+    for (int ty = 0; ty < h; ty += kTile) {
+        int y_end = std::min(ty + kTile, h);
+        for (int tx = 0; tx < w; tx += kTile) {
+            int x_end = std::min(tx + kTile, w);
+            for (int y = ty; y < y_end; ++y) {
+                const std::complex<float>* src_row = data + static_cast<size_t>(y) * w;
+                for (int x = tx; x < x_end; ++x) {
+                    transposed[static_cast<size_t>(x) * h + y] = src_row[x];
+                }
+            }
         }
-        fft_1d(col, h, inverse);
-        for (int y = 0; y < h; ++y) {
-            data[static_cast<size_t>(y) * w + x] = col[y];
+    }
+
+    for (int x = 0; x < w; ++x) {
+        fft_1d(transposed + static_cast<size_t>(x) * h, h, inverse);
+    }
+
+    for (int tx = 0; tx < w; tx += kTile) {
+        int x_end = std::min(tx + kTile, w);
+        for (int ty = 0; ty < h; ty += kTile) {
+            int y_end = std::min(ty + kTile, h);
+            for (int x = tx; x < x_end; ++x) {
+                const std::complex<float>* src_col = transposed + static_cast<size_t>(x) * h;
+                for (int y = ty; y < y_end; ++y) {
+                    data[static_cast<size_t>(y) * w + x] = src_col[y];
+                }
+            }
         }
     }
 }
@@ -241,7 +266,7 @@ struct PhaseCorrelationWorkspace {
     std::vector<std::complex<float>> prev_fft;
     std::vector<std::complex<float>> curr_fft;
     std::vector<std::complex<float>> cross_power;
-    std::vector<std::complex<float>> column;
+    std::vector<std::complex<float>> scratch;
 };
 
 PhaseCorrelationWorkspace& get_phase_workspace(int fft_w, int fft_h) {
@@ -253,7 +278,7 @@ PhaseCorrelationWorkspace& get_phase_workspace(int fft_w, int fft_h) {
         ws.prev_fft.assign(fft_size, std::complex<float>(0.0f, 0.0f));
         ws.curr_fft.assign(fft_size, std::complex<float>(0.0f, 0.0f));
         ws.cross_power.assign(fft_size, std::complex<float>(0.0f, 0.0f));
-        ws.column.assign(std::max(fft_w, fft_h), std::complex<float>(0.0f, 0.0f));
+        ws.scratch.assign(fft_size, std::complex<float>(0.0f, 0.0f));
     }
     return ws;
 }
@@ -366,8 +391,8 @@ MotionVector estimate_phase_correlation_shift(
     load_zero_mean_hann(prev, ws.prev_fft.data(), fft_w);
     load_zero_mean_hann(curr, ws.curr_fft.data(), fft_w);
 
-    fft_2d(ws.prev_fft.data(), fft_w, fft_h, false, ws.column);
-    fft_2d(ws.curr_fft.data(), fft_w, fft_h, false, ws.column);
+    fft_2d(ws.prev_fft.data(), fft_w, fft_h, false, ws.scratch);
+    fft_2d(ws.curr_fft.data(), fft_w, fft_h, false, ws.scratch);
 
     for (size_t i = 0; i < ws.cross_power.size(); ++i) {
         std::complex<float> cross = ws.prev_fft[i] * std::conj(ws.curr_fft[i]);
@@ -376,7 +401,7 @@ MotionVector estimate_phase_correlation_shift(
             ws.cross_power[i] = cross / mag;
         }
     }
-    fft_2d(ws.cross_power.data(), fft_w, fft_h, true, ws.column);
+    fft_2d(ws.cross_power.data(), fft_w, fft_h, true, ws.scratch);
 
     const int search_x = std::clamp(radius, 1, std::max(1, fft_w / 2 - 1));
     const int search_y = std::clamp(radius, 1, std::max(1, fft_h / 2 - 1));

@@ -15,6 +15,76 @@ namespace {
 
 constexpr int kFreqBins = 8;
 constexpr int kTextureBins = 8;
+constexpr float kPi = 3.14159265358979323846f;
+
+struct DCTBasis {
+    static constexpr int W = 8;
+    static constexpr int H = 16;
+    float cos_w[W][W] = {};
+    float cos_h[H][H] = {};
+    float alpha_w[W] = {};
+    float alpha_h[H] = {};
+};
+
+const DCTBasis& dct_basis() {
+    static const DCTBasis basis = [] {
+        DCTBasis b{};
+        for (int u = 0; u < DCTBasis::W; ++u) {
+            b.alpha_w[u] = (u == 0) ? std::sqrt(1.0f / DCTBasis::W) : std::sqrt(2.0f / DCTBasis::W);
+            for (int x = 0; x < DCTBasis::W; ++x) {
+                b.cos_w[u][x] = std::cos((kPi * (2.0f * x + 1.0f) * u) / (2.0f * DCTBasis::W));
+            }
+        }
+        for (int v = 0; v < DCTBasis::H; ++v) {
+            b.alpha_h[v] = (v == 0) ? std::sqrt(1.0f / DCTBasis::H) : std::sqrt(2.0f / DCTBasis::H);
+            for (int y = 0; y < DCTBasis::H; ++y) {
+                b.cos_h[v][y] = std::cos((kPi * (2.0f * y + 1.0f) * v) / (2.0f * DCTBasis::H));
+            }
+        }
+        return b;
+    }();
+    return basis;
+}
+
+struct GaborBank {
+    static constexpr int Radius = 2;
+    static constexpr int Size = 2 * Radius + 1;
+    static constexpr int Orientations = 4;
+    static constexpr int Frequencies = 2;
+    float kernel[Frequencies][Orientations][Size][Size] = {};
+};
+
+const GaborBank& gabor_bank() {
+    static const GaborBank bank = [] {
+        GaborBank g{};
+        constexpr float kSigma = 1.3f;
+        constexpr float kGamma = 0.6f;
+        constexpr std::array<float, GaborBank::Orientations> kAngles = {
+            0.0f, 0.25f * kPi, 0.5f * kPi, 0.75f * kPi
+        };
+        constexpr std::array<float, GaborBank::Frequencies> kLambdas = {3.2f, 6.4f};
+
+        for (int fi = 0; fi < GaborBank::Frequencies; ++fi) {
+            const float lambda = kLambdas[fi];
+            for (int oi = 0; oi < GaborBank::Orientations; ++oi) {
+                const float theta = kAngles[oi];
+                const float ct = std::cos(theta);
+                const float st = std::sin(theta);
+                for (int ky = -GaborBank::Radius; ky <= GaborBank::Radius; ++ky) {
+                    for (int kx = -GaborBank::Radius; kx <= GaborBank::Radius; ++kx) {
+                        const float xr = kx * ct + ky * st;
+                        const float yr = -kx * st + ky * ct;
+                        const float gauss = std::exp(-(xr * xr + (kGamma * kGamma) * yr * yr) / (2.0f * kSigma * kSigma));
+                        const float carrier = std::cos((2.0f * kPi * xr) / lambda);
+                        g.kernel[fi][oi][ky + GaborBank::Radius][kx + GaborBank::Radius] = gauss * carrier;
+                    }
+                }
+            }
+        }
+        return g;
+    }();
+    return bank;
+}
 
 void compute_cell_frequency_signature(const FloatImage& img,
                                       int x0, int y0, int x1, int y1,
@@ -23,9 +93,9 @@ void compute_cell_frequency_signature(const FloatImage& img,
     int w = std::max(1, x1 - x0);
     int h = std::max(1, y1 - y0);
 
-    constexpr int W = 8;
-    constexpr int H = 16;
-    constexpr float kPi = 3.14159265358979323846f;
+    constexpr int W = DCTBasis::W;
+    constexpr int H = DCTBasis::H;
+    const DCTBasis& basis = dct_basis();
     float sample[H][W] = {};
     for (int sy = 0; sy < H; ++sy) {
         for (int sx = 0; sx < W; ++sx) {
@@ -37,20 +107,25 @@ void compute_cell_frequency_signature(const FloatImage& img,
         }
     }
 
+    float row_dct[H][W] = {};
+    for (int yy = 0; yy < H; ++yy) {
+        for (int u = 0; u < W; ++u) {
+            float sum = 0.0f;
+            for (int xx = 0; xx < W; ++xx) {
+                sum += sample[yy][xx] * basis.cos_w[u][xx];
+            }
+            row_dct[yy][u] = sum;
+        }
+    }
+
     float dct[H][W] = {};
     for (int v = 0; v < H; ++v) {
         for (int u = 0; u < W; ++u) {
             float sum = 0.0f;
             for (int yy = 0; yy < H; ++yy) {
-                for (int xx = 0; xx < W; ++xx) {
-                    float cx = std::cos((kPi * (2.0f * xx + 1.0f) * u) / (2.0f * W));
-                    float cy = std::cos((kPi * (2.0f * yy + 1.0f) * v) / (2.0f * H));
-                    sum += sample[yy][xx] * cx * cy;
-                }
+                sum += row_dct[yy][u] * basis.cos_h[v][yy];
             }
-            float au = (u == 0) ? std::sqrt(1.0f / W) : std::sqrt(2.0f / W);
-            float av = (v == 0) ? std::sqrt(1.0f / H) : std::sqrt(2.0f / H);
-            dct[v][u] = au * av * sum;
+            dct[v][u] = basis.alpha_w[u] * basis.alpha_h[v] * sum;
         }
     }
 
@@ -78,42 +153,32 @@ void compute_cell_texture_signature(const FloatImage& img,
     int h = std::max(1, y1 - y0);
     if (w < 5 || h < 5) return;
 
-    constexpr float kPi = 3.14159265358979323846f;
-    constexpr int kRadius = 2;
-    constexpr float kSigma = 1.3f;
-    constexpr float kGamma = 0.6f;
-    constexpr std::array<float, 4> kAngles = {
-        0.0f, 0.25f * kPi, 0.5f * kPi, 0.75f * kPi
-    };
-    constexpr std::array<float, 2> kLambdas = {3.2f, 6.4f};
+    constexpr int kRadius = GaborBank::Radius;
+    const GaborBank& bank = gabor_bank();
+    const float* src = img.data();
+    const int stride = img.width();
 
-    for (int fi = 0; fi < static_cast<int>(kLambdas.size()); ++fi) {
-        float lambda = kLambdas[fi];
-        for (int oi = 0; oi < static_cast<int>(kAngles.size()); ++oi) {
-            float theta = kAngles[oi];
-            float ct = std::cos(theta);
-            float st = std::sin(theta);
+    for (int fi = 0; fi < GaborBank::Frequencies; ++fi) {
+        for (int oi = 0; oi < GaborBank::Orientations; ++oi) {
             float energy = 0.0f;
             int samples = 0;
 
             for (int y = y0 + kRadius; y < y1 - kRadius; ++y) {
                 for (int x = x0 + kRadius; x < x1 - kRadius; ++x) {
                     float resp = 0.0f;
+                    const float* row_base = src + static_cast<size_t>(y) * stride + x;
                     for (int ky = -kRadius; ky <= kRadius; ++ky) {
+                        const float* src_row = row_base + ky * stride;
+                        const float* kernel_row = bank.kernel[fi][oi][ky + kRadius];
                         for (int kx = -kRadius; kx <= kRadius; ++kx) {
-                            float xr = kx * ct + ky * st;
-                            float yr = -kx * st + ky * ct;
-                            float gauss = std::exp(-(xr * xr + (kGamma * kGamma) * yr * yr) / (2.0f * kSigma * kSigma));
-                            float carrier = std::cos((2.0f * kPi * xr) / lambda);
-                            float kernel = gauss * carrier;
-                            resp += kernel * img.get(x + kx, y + ky);
+                            resp += kernel_row[kx + kRadius] * src_row[kx];
                         }
                     }
                     energy += std::abs(resp);
                     samples++;
                 }
             }
-            out[fi * 4 + oi] = samples > 0 ? (energy / samples) : 0.0f;
+            out[fi * GaborBank::Orientations + oi] = samples > 0 ? (energy / samples) : 0.0f;
         }
     }
 

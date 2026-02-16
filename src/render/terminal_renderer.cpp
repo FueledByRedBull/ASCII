@@ -15,6 +15,8 @@ void TerminalRenderer::set_grid_size(int cols, int rows) {
 
 void TerminalRenderer::render(const std::vector<ASCIICell>& cells) {
     std::ostringstream out;
+    int cursor_x = -1;
+    int cursor_y = -1;
     
     int y = 0;
     while (y < rows_) {
@@ -34,10 +36,16 @@ void TerminalRenderer::render(const std::vector<ASCIICell>& cells) {
                 x++;
                 continue;
             }
-            
-            char cursor_buf[32];
-            snprintf(cursor_buf, sizeof(cursor_buf), "\033[%d;%dH", y + 1, x + 1);
-            out << cursor_buf;
+
+            const int target_x = x + 1;
+            const int target_y = y + 1;
+            if (cursor_x != target_x || cursor_y != target_y) {
+                char cursor_buf[32];
+                snprintf(cursor_buf, sizeof(cursor_buf), "\033[%d;%dH", target_y, target_x);
+                out << cursor_buf;
+                cursor_x = target_x;
+                cursor_y = target_y;
+            }
             
             if (color_mode_ != ColorMode::None) {
                 out << Terminal::color_code(color_mode_, cell.fg_r, cell.fg_g, cell.fg_b, true);
@@ -76,6 +84,9 @@ void TerminalRenderer::render(const std::vector<ASCIICell>& cells) {
                     out << codepoint_to_utf8(cells[ridx].codepoint);
                 }
             }
+
+            cursor_x = run_end + 2;
+            cursor_y = target_y;
             
             x = run_end + 1;
         }
