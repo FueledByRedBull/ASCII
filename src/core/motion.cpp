@@ -5,6 +5,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__AVX2__) || defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <immintrin.h>
+#endif
+
 #ifdef HAS_OPENMP
 #include <omp.h>
 #endif
@@ -77,6 +81,31 @@ const FFTPlan& get_fft_plan(int n) {
     return inserted_it->second;
 }
 
+#if defined(__AVX2__)
+inline __m256 complex_mul4_interleaved_avx(__m256 a, __m256 b) {
+    const __m256 ac_bd = _mm256_mul_ps(a, b);
+    const __m256 b_swap = _mm256_permute_ps(b, 0xB1);
+    const __m256 ad_bc = _mm256_mul_ps(a, b_swap);
+
+    const __m256 real_dup = _mm256_hsub_ps(ac_bd, ac_bd);
+    const __m256 imag_dup = _mm256_hadd_ps(ad_bc, ad_bc);
+
+    const __m128 real_lo = _mm256_castps256_ps128(real_dup);
+    const __m128 real_hi = _mm256_extractf128_ps(real_dup, 1);
+    const __m128 imag_lo = _mm256_castps256_ps128(imag_dup);
+    const __m128 imag_hi = _mm256_extractf128_ps(imag_dup, 1);
+
+    const __m128 real = _mm_movelh_ps(real_lo, real_hi);  // [r0 r1 r2 r3]
+    const __m128 imag = _mm_movelh_ps(imag_lo, imag_hi);  // [i0 i1 i2 i3]
+
+    const __m128 out_lo = _mm_unpacklo_ps(real, imag);    // [r0 i0 r1 i1]
+    const __m128 out_hi = _mm_unpackhi_ps(real, imag);    // [r2 i2 r3 i3]
+    __m256 out = _mm256_castps128_ps256(out_lo);
+    out = _mm256_insertf128_ps(out, out_hi, 1);
+    return out;
+}
+#endif
+
 void fft_1d(std::complex<float>* data, int n, bool inverse) {
     if (n <= 1) {
         return;
@@ -95,9 +124,45 @@ void fft_1d(std::complex<float>* data, int n, bool inverse) {
         const int half = len >> 1;
         const auto& tw = inverse ? plan.twiddles_inv[stage] : plan.twiddles_fwd[stage];
         for (int i = 0; i < n; i += len) {
-            for (int j = 0; j < half; ++j) {
-                std::complex<float> u = data[i + j];
-                std::complex<float> v = data[i + j + half] * tw[j];
+            int j = 0;
+
+#if defined(__AVX2__)
+            // 4 butterflies at once (8 floats / 4 complex numbers).
+            for (; j + 3 < half; j += 4) {
+                std::complex<float>* u_ptr = data + i + j;
+                std::complex<float>* v_src_ptr = data + i + j + half;
+                const std::complex<float>* w_ptr = tw.data() + j;
+
+                const __m256 u = _mm256_loadu_ps(reinterpret_cast<const float*>(u_ptr));
+                const __m256 v_src = _mm256_loadu_ps(reinterpret_cast<const float*>(v_src_ptr));
+                const __m256 w = _mm256_loadu_ps(reinterpret_cast<const float*>(w_ptr));
+                const __m256 v = complex_mul4_interleaved_avx(v_src, w);
+
+                _mm256_storeu_ps(reinterpret_cast<float*>(u_ptr), _mm256_add_ps(u, v));
+                _mm256_storeu_ps(reinterpret_cast<float*>(v_src_ptr), _mm256_sub_ps(u, v));
+            }
+#endif
+
+#if !defined(__AVX2__) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+            // 2 butterflies at once (SSE2): scalar complex multiply + SIMD combine.
+            for (; j + 1 < half; j += 2) {
+                std::complex<float>* u_ptr = data + i + j;
+                std::complex<float>* v_src_ptr = data + i + j + half;
+                const std::complex<float>* w_ptr = tw.data() + j;
+
+                const std::complex<float> v0 = v_src_ptr[0] * w_ptr[0];
+                const std::complex<float> v1 = v_src_ptr[1] * w_ptr[1];
+
+                const __m128 u = _mm_loadu_ps(reinterpret_cast<const float*>(u_ptr));
+                const __m128 v = _mm_set_ps(v1.imag(), v1.real(), v0.imag(), v0.real());
+                _mm_storeu_ps(reinterpret_cast<float*>(u_ptr), _mm_add_ps(u, v));
+                _mm_storeu_ps(reinterpret_cast<float*>(v_src_ptr), _mm_sub_ps(u, v));
+            }
+#endif
+
+            for (; j < half; ++j) {
+                const std::complex<float> u = data[i + j];
+                const std::complex<float> v = data[i + j + half] * tw[j];
                 data[i + j] = u + v;
                 data[i + j + half] = u - v;
             }
@@ -105,8 +170,25 @@ void fft_1d(std::complex<float>* data, int n, bool inverse) {
     }
 
     if (inverse) {
-        float inv_n = 1.0f / static_cast<float>(n);
-        for (int i = 0; i < n; ++i) {
+        const float inv_n = 1.0f / static_cast<float>(n);
+        int i = 0;
+#if defined(__AVX2__)
+        const __m256 scale = _mm256_set1_ps(inv_n);
+        for (; i + 3 < n; i += 4) {
+            __m256 v = _mm256_loadu_ps(reinterpret_cast<const float*>(data + i));
+            v = _mm256_mul_ps(v, scale);
+            _mm256_storeu_ps(reinterpret_cast<float*>(data + i), v);
+        }
+#endif
+#if !defined(__AVX2__) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+        const __m128 scale = _mm_set1_ps(inv_n);
+        for (; i + 1 < n; i += 2) {
+            __m128 v = _mm_loadu_ps(reinterpret_cast<const float*>(data + i));
+            v = _mm_mul_ps(v, scale);
+            _mm_storeu_ps(reinterpret_cast<float*>(data + i), v);
+        }
+#endif
+        for (; i < n; ++i) {
             data[i] *= inv_n;
         }
     }
