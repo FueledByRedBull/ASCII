@@ -184,6 +184,26 @@ bool Config::validate(std::string& error) const {
         error = "temporal.transition_penalty must be between 0.0 and 1.0";
         return false;
     }
+    if (temporal.motion_solve_divisor < 1 || temporal.motion_solve_divisor > 8) {
+        error = "temporal.motion_solve_divisor must be between 1 and 8";
+        return false;
+    }
+    if (temporal.motion_max_reuse_frames < 0 || temporal.motion_max_reuse_frames > 32) {
+        error = "temporal.motion_max_reuse_frames must be between 0 and 32";
+        return false;
+    }
+    if (temporal.motion_reuse_scene_threshold < 0.0f || temporal.motion_reuse_scene_threshold > 1.0f) {
+        error = "temporal.motion_reuse_scene_threshold must be between 0.0 and 1.0";
+        return false;
+    }
+    if (temporal.motion_reuse_confidence_decay < 0.0f || temporal.motion_reuse_confidence_decay > 1.0f) {
+        error = "temporal.motion_reuse_confidence_decay must be between 0.0 and 1.0";
+        return false;
+    }
+    if (temporal.motion_still_scene_threshold < 0.0f || temporal.motion_still_scene_threshold > 1.0f) {
+        error = "temporal.motion_still_scene_threshold must be between 0.0 and 1.0";
+        return false;
+    }
     if (temporal.wavelet_strength < 0.0f || temporal.wavelet_strength > 1.0f) {
         error = "temporal.wavelet_strength must be between 0.0 and 1.0";
         return false;
@@ -198,6 +218,14 @@ bool Config::validate(std::string& error) const {
     }
     if (temporal.phase_blend < 0.0f || temporal.phase_blend > 1.0f) {
         error = "temporal.phase_blend must be between 0.0 and 1.0";
+        return false;
+    }
+    if (temporal.motion_phase_interval < 1 || temporal.motion_phase_interval > 64) {
+        error = "temporal.motion_phase_interval must be between 1 and 64";
+        return false;
+    }
+    if (temporal.motion_phase_scene_trigger < 0.0f || temporal.motion_phase_scene_trigger > 1.0f) {
+        error = "temporal.motion_phase_scene_trigger must be between 0.0 and 1.0";
         return false;
     }
     if (selector.weight_brightness < 0.0f || selector.weight_orientation < 0.0f ||
@@ -311,12 +339,19 @@ std::string Config::compute_hash() const {
     h = hash_combine(h, hash_float(temporal.edge_enter_threshold));
     h = hash_combine(h, hash_float(temporal.edge_exit_threshold));
     h = hash_combine(h, hash_int(temporal.motion_cap_pixels));
+    h = hash_combine(h, hash_int(temporal.motion_solve_divisor));
+    h = hash_combine(h, hash_int(temporal.motion_max_reuse_frames));
+    h = hash_combine(h, hash_float(temporal.motion_reuse_scene_threshold));
+    h = hash_combine(h, hash_float(temporal.motion_reuse_confidence_decay));
+    h = hash_combine(h, hash_float(temporal.motion_still_scene_threshold));
     h = hash_combine(h, hash_int(static_cast<int>(temporal.use_wavelet_flicker)));
     h = hash_combine(h, hash_float(temporal.wavelet_strength));
     h = hash_combine(h, hash_int(temporal.wavelet_window));
     h = hash_combine(h, hash_int(static_cast<int>(temporal.use_phase_correlation)));
     h = hash_combine(h, hash_int(temporal.phase_search_radius));
     h = hash_combine(h, hash_float(temporal.phase_blend));
+    h = hash_combine(h, hash_int(temporal.motion_phase_interval));
+    h = hash_combine(h, hash_float(temporal.motion_phase_scene_trigger));
     h = hash_combine(h, hash_string(selector.char_set));
     h = hash_combine(h, hash_string(selector.mode));
     h = hash_combine(h, hash_float(selector.weight_brightness));
@@ -417,12 +452,19 @@ std::optional<Config> Config::load(const std::string& path) {
             if (auto v = temporal["edge_enter_threshold"].value<double>()) cfg.temporal.edge_enter_threshold = static_cast<float>(*v);
             if (auto v = temporal["edge_exit_threshold"].value<double>()) cfg.temporal.edge_exit_threshold = static_cast<float>(*v);
             if (auto v = temporal["motion_cap_pixels"].value<int>()) cfg.temporal.motion_cap_pixels = *v;
+            if (auto v = temporal["motion_solve_divisor"].value<int>()) cfg.temporal.motion_solve_divisor = *v;
+            if (auto v = temporal["motion_max_reuse_frames"].value<int>()) cfg.temporal.motion_max_reuse_frames = *v;
+            if (auto v = temporal["motion_reuse_scene_threshold"].value<double>()) cfg.temporal.motion_reuse_scene_threshold = static_cast<float>(*v);
+            if (auto v = temporal["motion_reuse_confidence_decay"].value<double>()) cfg.temporal.motion_reuse_confidence_decay = static_cast<float>(*v);
+            if (auto v = temporal["motion_still_scene_threshold"].value<double>()) cfg.temporal.motion_still_scene_threshold = static_cast<float>(*v);
             if (auto v = temporal["use_wavelet_flicker"].value<bool>()) cfg.temporal.use_wavelet_flicker = *v;
             if (auto v = temporal["wavelet_strength"].value<double>()) cfg.temporal.wavelet_strength = static_cast<float>(*v);
             if (auto v = temporal["wavelet_window"].value<int>()) cfg.temporal.wavelet_window = *v;
             if (auto v = temporal["use_phase_correlation"].value<bool>()) cfg.temporal.use_phase_correlation = *v;
             if (auto v = temporal["phase_search_radius"].value<int>()) cfg.temporal.phase_search_radius = *v;
             if (auto v = temporal["phase_blend"].value<double>()) cfg.temporal.phase_blend = static_cast<float>(*v);
+            if (auto v = temporal["motion_phase_interval"].value<int>()) cfg.temporal.motion_phase_interval = *v;
+            if (auto v = temporal["motion_phase_scene_trigger"].value<double>()) cfg.temporal.motion_phase_scene_trigger = static_cast<float>(*v);
         }
         
         if (auto selector = tbl["selector"]) {
@@ -555,6 +597,16 @@ Config merge_config(Config base, const Config& override) {
         result.temporal.edge_exit_threshold = override.temporal.edge_exit_threshold;
     if (override.temporal.motion_cap_pixels != Config::defaults().temporal.motion_cap_pixels)
         result.temporal.motion_cap_pixels = override.temporal.motion_cap_pixels;
+    if (override.temporal.motion_solve_divisor != Config::defaults().temporal.motion_solve_divisor)
+        result.temporal.motion_solve_divisor = override.temporal.motion_solve_divisor;
+    if (override.temporal.motion_max_reuse_frames != Config::defaults().temporal.motion_max_reuse_frames)
+        result.temporal.motion_max_reuse_frames = override.temporal.motion_max_reuse_frames;
+    if (override.temporal.motion_reuse_scene_threshold != Config::defaults().temporal.motion_reuse_scene_threshold)
+        result.temporal.motion_reuse_scene_threshold = override.temporal.motion_reuse_scene_threshold;
+    if (override.temporal.motion_reuse_confidence_decay != Config::defaults().temporal.motion_reuse_confidence_decay)
+        result.temporal.motion_reuse_confidence_decay = override.temporal.motion_reuse_confidence_decay;
+    if (override.temporal.motion_still_scene_threshold != Config::defaults().temporal.motion_still_scene_threshold)
+        result.temporal.motion_still_scene_threshold = override.temporal.motion_still_scene_threshold;
     result.temporal.use_wavelet_flicker = override.temporal.use_wavelet_flicker;
     if (override.temporal.wavelet_strength != Config::defaults().temporal.wavelet_strength)
         result.temporal.wavelet_strength = override.temporal.wavelet_strength;
@@ -565,6 +617,10 @@ Config merge_config(Config base, const Config& override) {
         result.temporal.phase_search_radius = override.temporal.phase_search_radius;
     if (override.temporal.phase_blend != Config::defaults().temporal.phase_blend)
         result.temporal.phase_blend = override.temporal.phase_blend;
+    if (override.temporal.motion_phase_interval != Config::defaults().temporal.motion_phase_interval)
+        result.temporal.motion_phase_interval = override.temporal.motion_phase_interval;
+    if (override.temporal.motion_phase_scene_trigger != Config::defaults().temporal.motion_phase_scene_trigger)
+        result.temporal.motion_phase_scene_trigger = override.temporal.motion_phase_scene_trigger;
     
     if (!override.selector.char_set.empty()) result.selector.char_set = override.selector.char_set;
     if (!override.selector.mode.empty()) result.selector.mode = override.selector.mode;
@@ -647,10 +703,24 @@ Config apply_cli_overrides(Config config, const Args& args) {
     
     if (args.temporal_alpha != Config::defaults().temporal.alpha)
         config.temporal.alpha = args.temporal_alpha;
+    if (args.motion_solve_divisor > 0)
+        config.temporal.motion_solve_divisor = args.motion_solve_divisor;
+    if (args.motion_max_reuse_frames >= 0)
+        config.temporal.motion_max_reuse_frames = args.motion_max_reuse_frames;
+    if (args.motion_reuse_scene_threshold >= 0.0f)
+        config.temporal.motion_reuse_scene_threshold = args.motion_reuse_scene_threshold;
+    if (args.motion_reuse_confidence_decay >= 0.0f)
+        config.temporal.motion_reuse_confidence_decay = args.motion_reuse_confidence_decay;
+    if (args.motion_phase_interval > 0)
+        config.temporal.motion_phase_interval = args.motion_phase_interval;
+    if (args.motion_phase_scene_trigger >= 0.0f)
+        config.temporal.motion_phase_scene_trigger = args.motion_phase_scene_trigger;
+    if (args.motion_still_scene_threshold >= 0.0f)
+        config.temporal.motion_still_scene_threshold = args.motion_still_scene_threshold;
     
     if (!args.scale_mode.empty()) config.grid.scale_mode = args.scale_mode;
     
-    if (args.color_mode != Config::defaults().color.mode)
+    if (args.color_mode_set)
         config.color.mode = args.color_mode;
     
     config.selector.use_simple_orientation = args.use_simple_orientation;
@@ -659,6 +729,25 @@ Config apply_cli_overrides(Config config, const Args& args) {
     config.no_audio = args.no_audio;
     config.debug.profile_live = args.profile_live;
     config.debug.strict_memory = args.strict_memory;
+    if (args.fast_mode) {
+        config.selector.mode = "simple";
+        config.selector.use_simple_orientation = true;
+        config.selector.enable_frequency_matching = false;
+        config.selector.enable_gabor_texture = false;
+
+        config.edge.multi_scale = false;
+        config.edge.adaptive_scale_selection = false;
+        config.edge.use_anisotropic_diffusion = false;
+
+        config.temporal.use_phase_correlation = false;
+        config.temporal.use_wavelet_flicker = false;
+        config.temporal.motion_cap_pixels = 0;
+
+        config.grid.quad_tree_adaptive = false;
+
+        config.color.use_bilateral_grid = false;
+        config.color.block_spectral_palette = 0;
+    }
 
     return config;
 }

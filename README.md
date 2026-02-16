@@ -18,6 +18,7 @@ Recent performance-oriented updates include:
 2. SIMD hot paths (AVX2/SSE2 where available, scalar fallback)
 3. Cache-aware tiling in edge/blur kernels
 4. Optimized in-tree FFT phase-correlation (plan/twiddle caching, workspace reuse, rectangular FFT)
+5. Stable-frame cache reuse for pipeline and cell stats
 
 These changes target better throughput without changing the external CLI.
 
@@ -153,12 +154,31 @@ Write replay:
 - `--color none|16|256|truecolor|blockart`
 - `--fps N --cols N --rows N`
 - `--edge-thresh X --blur X --temporal X`
+- `--motion-solve-div N --motion-reuse N --motion-still-thresh X`
+- `--phase-interval N --phase-scene-trigger X`
 - `--scale fit|fill|stretch`
 - `--font <PATH>`
 - `--no-audio`
 - `--debug grayscale|edges|orientation`
 - `--profile-live`
 - `--strict-memory`
+- `--fast` (disables costly analysis features for speed-focused preview)
+
+### Performance Output
+
+At program exit the engine prints a summary to `stderr`:
+
+- `[PERF]` total frames, wall time, effective FPS, processing FPS
+- `[PERF_STAGES]` absolute stage times (pipeline, motion, select, render, encode, misc)
+- `[PERF_STAGES_PCT]` stage percentages of processing time
+
+### Speed Tuning Example
+
+For higher FPS with good quality balance on terminal playback:
+
+```powershell
+.\build-noopencv\ascii-engine.exe ".\media\clip.mp4" --cols 96 --rows 32 --motion-solve-div 4 --motion-reuse 5 --phase-interval 8 --motion-still-thresh 0.006
+```
 
 ### Interactive Controls
 

@@ -294,7 +294,6 @@ void CellStatsAggregator::compute_orientation_histogram(const FloatImage& gx, co
                                                          int x0, int y0, int x1, int y1,
                                                          float* histogram, int bins) const {
     std::fill(histogram, histogram + bins, 0.0f);
-    constexpr float kPi = 3.14159265358979323846f;
     
     for (int y = y0; y < y1; ++y) {
         for (int x = x0; x < x1; ++x) {
@@ -428,8 +427,10 @@ std::vector<CellStats> CellStatsAggregator::compute(const FloatImage& luminance,
             }
             
             if (grad) {
-                compute_orientation_histogram(grad->gx, grad->gy, x0, y0, x1, y1,
-                                              stats.orientation_histogram, config_.orientation_bins);
+                if (config_.enable_orientation_histogram) {
+                    compute_orientation_histogram(grad->gx, grad->gy, x0, y0, x1, y1,
+                                                  stats.orientation_histogram, config_.orientation_bins);
+                }
                 
                 compute_structure_tensor(grad->gx, grad->gy, x0, y0, x1, y1,
                                          stats.structure_coherence, stats.dominant_orientation);
@@ -446,8 +447,12 @@ std::vector<CellStats> CellStatsAggregator::compute(const FloatImage& luminance,
                 stats.cell_orientation = std::atan2(stats.mean_gy, stats.mean_gx);
             }
 
-            compute_cell_frequency_signature(luminance, x0, y0, x1, y1, stats.frequency_signature);
-            compute_cell_texture_signature(luminance, x0, y0, x1, y1, stats.texture_signature);
+            if (config_.enable_frequency_signature) {
+                compute_cell_frequency_signature(luminance, x0, y0, x1, y1, stats.frequency_signature);
+            }
+            if (config_.enable_texture_signature) {
+                compute_cell_texture_signature(luminance, x0, y0, x1, y1, stats.texture_signature);
+            }
             stats.adaptive_level = estimate_adaptive_level(
                 stats.luminance_variance,
                 stats.edge_occupancy,

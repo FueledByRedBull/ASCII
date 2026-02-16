@@ -60,12 +60,19 @@ struct ConfigTemporal {
     float edge_enter_threshold = 0.08f;
     float edge_exit_threshold = 0.04f;
     int motion_cap_pixels = 6;
+    int motion_solve_divisor = 4;
+    int motion_max_reuse_frames = 4;
+    float motion_reuse_scene_threshold = 0.02f;
+    float motion_reuse_confidence_decay = 0.9f;
+    float motion_still_scene_threshold = 0.005f;
     bool use_wavelet_flicker = true;
     float wavelet_strength = 0.45f;
     int wavelet_window = 8;
     bool use_phase_correlation = true;
     int phase_search_radius = 6;
     float phase_blend = 0.28f;
+    int motion_phase_interval = 6;
+    float motion_phase_scene_trigger = 0.05f;
 };
 
 struct ConfigSelector {

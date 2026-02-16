@@ -18,13 +18,25 @@ float CharSelector::compute_loss(const CellStats& cell, const GlyphStats& glyph)
     float brightness_err = std::abs(cell.mean_luminance - glyph.brightness);
     
     float orientation_err = 0.0f;
-    if (!glyph.orientation_hist.empty() && cell.orientation_histogram[0] >= 0) {
-        std::vector<float> cell_hist(glyph.orientation_hist.size(), 0.0f);
-        int bins = static_cast<int>(glyph.orientation_hist.size());
-        for (int i = 0; i < bins && i < 8; ++i) {
-            cell_hist[i] = cell.orientation_histogram[i];
+    if (!glyph.orientation_hist.empty()) {
+        int bins = std::min(static_cast<int>(glyph.orientation_hist.size()), 8);
+        float dot = 0.0f;
+        float norm_cell = 0.0f;
+        float norm_glyph = 0.0f;
+        for (int i = 0; i < bins; ++i) {
+            float cv = cell.orientation_histogram[i];
+            float gv = glyph.orientation_hist[i];
+            dot += cv * gv;
+            norm_cell += cv * cv;
+            norm_glyph += gv * gv;
         }
-        orientation_err = orientation_hist_distance(cell_hist, glyph.orientation_hist);
+        float denom = std::sqrt(norm_cell * norm_glyph);
+        if (denom > 1e-6f) {
+            float similarity = std::clamp(dot / denom, -1.0f, 1.0f);
+            orientation_err = 1.0f - similarity;
+        } else {
+            orientation_err = 1.0f;
+        }
     }
     
     float contrast_err = std::abs(std::sqrt(cell.luminance_variance) - glyph.contrast);
@@ -107,6 +119,25 @@ CharSelector::Selection CharSelector::select_unified(const CellStats& stats, uin
     float best_total_loss = 1e10f;
     float best_data_loss = 1.0f;
     int adaptive = std::clamp(stats.adaptive_level, 0, 3);
+    const float norm = std::max(config_.loss_weights.normalize(), 0.001f);
+    const float inv_norm = 1.0f / norm;
+    const float cell_contrast = std::sqrt(std::max(stats.luminance_variance, 0.0f));
+    const bool safe_prune =
+        config_.loss_weights.brightness >= 0.0f &&
+        config_.loss_weights.contrast >= 0.0f &&
+        config_.loss_weights.orientation >= 0.0f &&
+        config_.loss_weights.frequency >= 0.0f &&
+        config_.loss_weights.texture >= 0.0f;
+
+    auto lower_bound_loss = [&](const GlyphStats& glyph, float transition_cost, float complexity_penalty) -> float {
+        // Conservative bound: only terms we can compute very cheaply here.
+        // Remaining terms (orientation/frequency/texture) are non-negative.
+        float brightness_lb = config_.loss_weights.brightness *
+                              std::abs(stats.mean_luminance - glyph.brightness) * inv_norm;
+        float contrast_lb = config_.loss_weights.contrast *
+                            std::abs(cell_contrast - glyph.contrast) * inv_norm;
+        return brightness_lb + contrast_lb + transition_cost + complexity_penalty;
+    };
     
     if (stats.is_edge_cell && !cache_->get_edge_glyphs().empty()) {
         auto edge_glyphs = cache_->get_edge_glyphs();
@@ -115,9 +146,11 @@ CharSelector::Selection CharSelector::select_unified(const CellStats& stats, uin
             uint32_t cp = edge_glyphs[ei];
             auto* glyph_stats = cache_->get_stats(cp);
             if (!glyph_stats) continue;
-            
-            float data_loss = compute_loss(stats, *glyph_stats);
             float transition_cost = compute_transition_cost(prev_glyph, cp);
+            if (safe_prune && lower_bound_loss(*glyph_stats, transition_cost, 0.0f) >= best_total_loss) {
+                continue;
+            }
+            float data_loss = compute_loss(stats, *glyph_stats);
             float total_loss = data_loss + transition_cost;
             
             if (total_loss < best_total_loss) {
@@ -145,9 +178,12 @@ CharSelector::Selection CharSelector::select_unified(const CellStats& stats, uin
         if (adaptive == 0 && !stats.is_edge_cell && glyph_stats->contrast > 0.35f) {
             complexity_penalty = 0.05f * (glyph_stats->contrast - 0.35f);
         }
+        float transition_cost = compute_transition_cost(prev_glyph, cp);
+        if (safe_prune && lower_bound_loss(*glyph_stats, transition_cost, complexity_penalty) >= best_total_loss) {
+            continue;
+        }
         
         float data_loss = compute_loss(stats, *glyph_stats) + complexity_penalty;
-        float transition_cost = compute_transition_cost(prev_glyph, cp);
         float total_loss = data_loss + transition_cost;
         
         if (total_loss < best_total_loss) {

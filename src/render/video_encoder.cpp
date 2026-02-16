@@ -1,6 +1,8 @@
 #include "video_encoder.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -56,6 +58,34 @@ AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output) {
     }
 
     return codec->pix_fmts[0];
+}
+
+bool contains_ci(const char* s, const char* needle) {
+    if (!s || !needle) {
+        return false;
+    }
+    std::string hay(s);
+    std::string ndl(needle);
+    std::transform(hay.begin(), hay.end(), hay.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::transform(ndl.begin(), ndl.end(), ndl.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return hay.find(ndl) != std::string::npos;
+}
+
+void push_codec_candidate(std::vector<const AVCodec*>& out, const AVCodec* codec) {
+    if (!codec) {
+        return;
+    }
+    for (const AVCodec* existing : out) {
+        if (existing && codec->name && existing->name &&
+            std::strcmp(existing->name, codec->name) == 0) {
+            return;
+        }
+    }
+    out.push_back(codec);
 }
 
 }  // namespace
@@ -167,46 +197,74 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
 }
 
 bool VideoEncoder::init_codec() {
-    const AVCodec* codec = nullptr;
+    std::vector<const AVCodec*> candidates;
     if (output_is_gif_) {
-        codec = avcodec_find_encoder(AV_CODEC_ID_GIF);
+        push_codec_candidate(candidates, avcodec_find_encoder(AV_CODEC_ID_GIF));
     } else {
-        codec = avcodec_find_encoder_by_name(config_.codec.c_str());
+        push_codec_candidate(candidates, avcodec_find_encoder_by_name(config_.codec.c_str()));
+        push_codec_candidate(candidates, avcodec_find_encoder_by_name("libx264"));
+        push_codec_candidate(candidates, avcodec_find_encoder_by_name("libopenh264"));
+        push_codec_candidate(candidates, avcodec_find_encoder_by_name("mpeg4"));
+        push_codec_candidate(candidates, avcodec_find_encoder(AV_CODEC_ID_MPEG4));
+        push_codec_candidate(candidates, avcodec_find_encoder(AV_CODEC_ID_H264));
+    }
+    if (candidates.empty()) {
+        return false;
+    }
+
+    const AVCodec* opened_codec = nullptr;
+    for (const AVCodec* codec : candidates) {
         if (!codec) {
-            codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+            continue;
         }
+#ifdef _WIN32
+        // `h264_mf` can fail under STA PowerShell with:
+        // "COM must not be in STA mode".
+        // Prefer software encoders for robust CLI behavior.
+        if (contains_ci(codec->name, "_mf")) {
+            continue;
+        }
+#endif
+
+        codec_ctx_ = avcodec_alloc_context3(codec);
+        if (!codec_ctx_) {
+            continue;
+        }
+
+        codec_ctx_->width = config_.width;
+        codec_ctx_->height = config_.height;
+        codec_ctx_->time_base = {1, config_.fps};
+        codec_ctx_->framerate = {config_.fps, 1};
+        codec_ctx_->pix_fmt = choose_pixel_format(codec, output_is_gif_);
+        codec_ctx_->gop_size = std::max(1, config_.fps);
+        if (!output_is_gif_) {
+            codec_ctx_->bit_rate = config_.bitrate;
+        }
+
+        if (format_ctx_->oformat->flags & AVFMT_GLOBALHEADER) {
+            codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        }
+
+        if (!output_is_gif_ && codec->name && std::strcmp(codec->name, "libx264") == 0) {
+            av_opt_set(codec_ctx_->priv_data, "preset", config_.preset.c_str(), 0);
+        }
+
+        int ret = avcodec_open2(codec_ctx_, codec, nullptr);
+        if (ret >= 0) {
+            opened_codec = codec;
+            break;
+        }
+        avcodec_free_context(&codec_ctx_);
     }
-    if (!codec) return false;
-    
-    codec_ctx_ = avcodec_alloc_context3(codec);
-    if (!codec_ctx_) return false;
-    
-    codec_ctx_->width = config_.width;
-    codec_ctx_->height = config_.height;
-    codec_ctx_->time_base = {1, config_.fps};
-    codec_ctx_->framerate = {config_.fps, 1};
-    codec_ctx_->pix_fmt = choose_pixel_format(codec, output_is_gif_);
-    codec_ctx_->gop_size = std::max(1, config_.fps);
-    if (!output_is_gif_) {
-        codec_ctx_->bit_rate = config_.bitrate;
+    if (!opened_codec || !codec_ctx_) {
+        return false;
     }
-    
-    if (format_ctx_->oformat->flags & AVFMT_GLOBALHEADER) {
-        codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
-    
-    if (!output_is_gif_ && config_.codec == "libx264") {
-        av_opt_set(codec_ctx_->priv_data, "preset", config_.preset.c_str(), 0);
-    }
-    
-    int ret = avcodec_open2(codec_ctx_, codec, nullptr);
-    if (ret < 0) return false;
     
     stream_ = avformat_new_stream(format_ctx_, nullptr);
     if (!stream_) return false;
     
     stream_->time_base = codec_ctx_->time_base;
-    ret = avcodec_parameters_from_context(stream_->codecpar, codec_ctx_);
+    int ret = avcodec_parameters_from_context(stream_->codecpar, codec_ctx_);
     if (ret < 0) return false;
     
     frame_ = av_frame_alloc();

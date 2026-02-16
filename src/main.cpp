@@ -27,6 +27,8 @@
 #include <atomic>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -174,6 +176,48 @@ void write_ascii_to_file_simple(const std::string& path, const std::vector<float
 }
 }
 
+namespace {
+
+void build_scene_signature(const ascii::FrameBuffer& frame, std::vector<float>& signature) {
+    signature.clear();
+    const int w = frame.width();
+    const int h = frame.height();
+    if (w <= 0 || h <= 0 || frame.empty()) {
+        return;
+    }
+
+    const int stride = std::max(1, std::min(w, h) / 48);
+    const uint8_t* src = frame.data();
+    const int samples_x = (w + stride - 1) / stride;
+    const int samples_y = (h + stride - 1) / stride;
+    signature.reserve(static_cast<size_t>(samples_x) * samples_y);
+
+    for (int y = 0; y < h; y += stride) {
+        const size_t row = static_cast<size_t>(y) * static_cast<size_t>(w) * 4;
+        for (int x = 0; x < w; x += stride) {
+            const size_t idx = row + static_cast<size_t>(x) * 4;
+            // Fast luma in [0,1], BT.709 coefficients.
+            float lum = (0.2126f * src[idx + 0] +
+                         0.7152f * src[idx + 1] +
+                         0.0722f * src[idx + 2]) / 255.0f;
+            signature.push_back(lum);
+        }
+    }
+}
+
+float signature_scene_change(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.empty() || b.empty() || a.size() != b.size()) {
+        return 1.0f;
+    }
+    double sum = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        sum += std::abs(a[i] - b[i]);
+    }
+    return static_cast<float>(sum / static_cast<double>(a.size()));
+}
+
+}  // namespace
+
 int main(int argc, char* argv[]) {
     ascii::Args args = ascii::parse_args(argc, argv);
     
@@ -205,6 +249,11 @@ int main(int argc, char* argv[]) {
     config = ascii::apply_cli_overrides(config, args);
     if (!args.replay_path.empty()) {
         config.output.replay_path = args.replay_path;
+    }
+    if (!config.output.target.empty() &&
+        config.color.mode == ascii::ColorMode::None &&
+        !args.color_mode_set) {
+        config.color.mode = ascii::ColorMode::Truecolor;
     }
 
     if (config.input.source.empty()) {
@@ -274,6 +323,9 @@ int main(int argc, char* argv[]) {
     pipeline_cfg.tile_size = config.edge.tile_size;
     pipeline_cfg.dark_scene_floor = config.edge.dark_scene_floor;
     pipeline_cfg.global_percentile = config.edge.global_percentile;
+    pipeline_cfg.enable_orientation_histogram = !(config.selector.use_simple_orientation || config.selector.mode == "simple");
+    pipeline_cfg.enable_frequency_signature = config.selector.enable_frequency_matching;
+    pipeline_cfg.enable_texture_signature = config.selector.enable_gabor_texture;
     
     ascii::Pipeline pipeline(pipeline_cfg);
     
@@ -291,7 +343,7 @@ int main(int argc, char* argv[]) {
     selector_cfg.edge_threshold = config.edge.high_threshold;
     selector_cfg.use_orientation_matching = (config.selector.mode == "histogram");
     selector_cfg.use_simple_orientation = config.selector.use_simple_orientation || config.selector.mode == "simple";
-    selector_cfg.use_unified_loss = true;
+    selector_cfg.use_unified_loss = !selector_cfg.use_simple_orientation;
     selector_cfg.loss_weights.brightness = config.selector.weight_brightness;
     selector_cfg.loss_weights.orientation = config.selector.weight_orientation;
     selector_cfg.loss_weights.contrast = config.selector.weight_contrast;
@@ -324,9 +376,16 @@ int main(int argc, char* argv[]) {
 
     ascii::MotionEstimator::Config motion_cfg;
     motion_cfg.motion_cap = static_cast<float>(config.temporal.motion_cap_pixels);
+    motion_cfg.solve_divisor = config.temporal.motion_solve_divisor;
+    motion_cfg.max_reuse_frames = config.temporal.motion_max_reuse_frames;
+    motion_cfg.reuse_scene_threshold = config.temporal.motion_reuse_scene_threshold;
+    motion_cfg.reuse_confidence_decay = config.temporal.motion_reuse_confidence_decay;
+    motion_cfg.still_scene_threshold = config.temporal.motion_still_scene_threshold;
     motion_cfg.use_phase_correlation = config.temporal.use_phase_correlation;
     motion_cfg.phase_search_radius = config.temporal.phase_search_radius;
     motion_cfg.phase_blend = config.temporal.phase_blend;
+    motion_cfg.phase_interval = config.temporal.motion_phase_interval;
+    motion_cfg.phase_scene_trigger = config.temporal.motion_phase_scene_trigger;
     ascii::MotionEstimator motion(motion_cfg);
     
     auto source = ascii::create_source(config.input.source);
@@ -391,15 +450,31 @@ int main(int argc, char* argv[]) {
     
     double target_fps = config.fps > 0 ? config.fps : (source_fps > 0.0 ? source_fps : 30.0);
     auto frame_duration = std::chrono::duration<double>(1.0 / target_fps);
+    auto session_start = std::chrono::steady_clock::now();
     
     ascii::FrameBuffer frame;
     bool initialized = false;
     int frame_count = 0;
+    double processing_seconds_total = 0.0;
+    double stage_pipeline_seconds = 0.0;
+    double stage_motion_seconds = 0.0;
+    double stage_select_seconds = 0.0;
+    double stage_render_seconds = 0.0;
+    double stage_encode_seconds = 0.0;
     std::atomic<bool> paused{false};
     std::atomic<bool> running{true};
     float edge_threshold = config.edge.high_threshold;
     ascii::FloatImage prev_luminance;
     bool have_prev_luminance = false;
+    ascii::Pipeline::Result cached_pipeline_result;
+    bool have_cached_pipeline_result = false;
+    bool cached_pipeline_has_color_buffer = false;
+    int pipeline_reuse_frames = 0;
+    std::vector<ascii::CellStats> cached_cell_stats;
+    bool have_cached_cell_stats = false;
+    int cell_stats_reuse_frames = 0;
+    std::vector<float> prev_scene_signature;
+    std::vector<float> curr_scene_signature;
     
     while (running && source->read(frame)) {
         auto start = std::chrono::high_resolution_clock::now();
@@ -425,16 +500,31 @@ int main(int argc, char* argv[]) {
                 auto dc = ditherer.config();
                 dc.enabled = (color_mode == ascii::ColorMode::Ansi16 || color_mode == ascii::ColorMode::Ansi256);
                 ditherer.set_config(dc);
+                have_cached_pipeline_result = false;
+                cached_pipeline_has_color_buffer = false;
+                pipeline_reuse_frames = 0;
+                have_cached_cell_stats = false;
+                cell_stats_reuse_frames = 0;
             } else if (key == '+' || key == '=') {
                 edge_threshold = std::min(1.0f, edge_threshold + 0.05f);
                 pipeline_cfg.edge_low = edge_threshold * 0.5f;
                 pipeline_cfg.edge_high = edge_threshold;
                 pipeline.set_config(pipeline_cfg);
+                have_cached_pipeline_result = false;
+                cached_pipeline_has_color_buffer = false;
+                pipeline_reuse_frames = 0;
+                have_cached_cell_stats = false;
+                cell_stats_reuse_frames = 0;
             } else if (key == '-') {
                 edge_threshold = std::max(0.0f, edge_threshold - 0.05f);
                 pipeline_cfg.edge_low = edge_threshold * 0.5f;
                 pipeline_cfg.edge_high = edge_threshold;
                 pipeline.set_config(pipeline_cfg);
+                have_cached_pipeline_result = false;
+                cached_pipeline_has_color_buffer = false;
+                pipeline_reuse_frames = 0;
+                have_cached_cell_stats = false;
+                cell_stats_reuse_frames = 0;
             }
         }
         
@@ -443,19 +533,98 @@ int main(int argc, char* argv[]) {
             continue;
         }
         
-        auto result = pipeline.process(frame);
+        auto stage_start = std::chrono::high_resolution_clock::now();
+        ascii::Pipeline::Result computed_result;
+        const ascii::Pipeline::Result* result_ptr = nullptr;
+        curr_scene_signature.clear();
+        build_scene_signature(frame, curr_scene_signature);
+        float scene_change = 1.0f;
+        if (!prev_scene_signature.empty() && prev_scene_signature.size() == curr_scene_signature.size()) {
+            scene_change = signature_scene_change(prev_scene_signature, curr_scene_signature);
+        }
 
+        const bool allow_mixed_block_mode = config.grid.quad_tree_adaptive &&
+                                            color_mode != ascii::ColorMode::BlockArt;
+        const bool need_color_buffer = (color_mode == ascii::ColorMode::BlockArt) ||
+                                       allow_mixed_block_mode;
+        const bool need_color_stats = need_color_buffer ||
+                                      color_mode != ascii::ColorMode::None ||
+                                      config.color.use_bilateral_grid;
+
+        bool reused_pipeline = false;
+        const int pipeline_reuse_limit = std::max(0, config.temporal.motion_max_reuse_frames);
+        const float pipeline_still_thresh = std::max(0.0f, config.temporal.motion_still_scene_threshold);
+
+        if (have_cached_pipeline_result &&
+            !prev_scene_signature.empty() &&
+            pipeline_reuse_limit > 0) {
+            const bool cached_color_ok = !need_color_buffer || cached_pipeline_has_color_buffer;
+            if (scene_change < pipeline_still_thresh &&
+                pipeline_reuse_frames < pipeline_reuse_limit &&
+                cached_color_ok) {
+                reused_pipeline = true;
+                result_ptr = &cached_pipeline_result;
+                ++pipeline_reuse_frames;
+                if (have_cached_cell_stats) {
+                    cell_stats_reuse_frames = std::min(cell_stats_reuse_frames + 1, pipeline_reuse_limit);
+                }
+            }
+        }
+
+        if (!reused_pipeline) {
+            const int cell_stats_reuse_limit = std::max(0, config.temporal.motion_max_reuse_frames);
+            const float cell_stats_reuse_thresh =
+                std::max(0.0f, config.temporal.motion_still_scene_threshold * 0.8f);
+            const bool reuse_cell_stats =
+                have_cached_cell_stats &&
+                !prev_scene_signature.empty() &&
+                cell_stats_reuse_limit > 0 &&
+                scene_change < cell_stats_reuse_thresh &&
+                cell_stats_reuse_frames < cell_stats_reuse_limit;
+
+            ascii::Pipeline::ProcessOptions process_options;
+            process_options.need_color_buffer = need_color_buffer;
+            process_options.need_color_stats = need_color_stats;
+            if (reuse_cell_stats) {
+                process_options.reuse_cell_stats = &cached_cell_stats;
+            }
+
+            computed_result = pipeline.process(frame, process_options);
+            cached_pipeline_result = computed_result;
+            have_cached_pipeline_result = true;
+            cached_pipeline_has_color_buffer = need_color_buffer;
+            pipeline_reuse_frames = 0;
+            result_ptr = &cached_pipeline_result;
+
+            if (reuse_cell_stats) {
+                ++cell_stats_reuse_frames;
+            } else {
+                cached_cell_stats = cached_pipeline_result.cell_stats;
+                have_cached_cell_stats = true;
+                cell_stats_reuse_frames = 0;
+            }
+        }
+        prev_scene_signature = curr_scene_signature;
+
+        const ascii::Pipeline::Result& result = *result_ptr;
+        stage_pipeline_seconds += std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - stage_start).count();
+
+        stage_start = std::chrono::high_resolution_clock::now();
         if (config.color.use_bilateral_grid) {
             bilateral_grid.build(result.cell_stats, result.grid_cols, result.grid_rows);
         }
 
-        if (have_prev_luminance &&
+        if (config.temporal.motion_cap_pixels > 0 &&
+            have_prev_luminance &&
             prev_luminance.width() == result.luminance.width() &&
             prev_luminance.height() == result.luminance.height()) {
             motion.compute_flow(prev_luminance, result.luminance);
         } else {
             motion.reset();
         }
+        stage_motion_seconds += std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - stage_start).count();
 
         ditherer.begin_frame(result.grid_cols, result.grid_rows);
         
@@ -517,6 +686,7 @@ int main(int argc, char* argv[]) {
             continue;
         }
         
+        stage_start = std::chrono::high_resolution_clock::now();
         if (!initialized) {
             smoother.initialize(result.grid_cols, result.grid_rows);
             initialized = true;
@@ -725,8 +895,11 @@ int main(int argc, char* argv[]) {
                 cells[i].bg_b = block_cells[i].bg_b;
             }
         }
+        stage_select_seconds += std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - stage_start).count();
         
         if (has_output) {
+            auto encode_start = std::chrono::high_resolution_clock::now();
             std::vector<uint32_t> cps(cells.size());
             for (size_t i = 0; i < cells.size(); ++i) {
                 cps[i] = cells[i].codepoint;
@@ -734,6 +907,8 @@ int main(int argc, char* argv[]) {
             
             auto bitmap = bitmap_renderer.render(cps, result.grid_cols, result.grid_rows);
             video_encoder.write_frame(bitmap);
+            stage_encode_seconds += std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - encode_start).count();
         }
 
         if (replay_enabled) {
@@ -766,14 +941,18 @@ int main(int argc, char* argv[]) {
         }
         
         if (!has_output) {
+            auto render_start = std::chrono::high_resolution_clock::now();
             term_renderer.render(cells);
             terminal.flush();
             if (is_single_image) {
                 terminal.write("\n");
             }
+            stage_render_seconds += std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - render_start).count();
         }
         
         auto elapsed = std::chrono::high_resolution_clock::now() - start;
+        processing_seconds_total += std::chrono::duration<double>(elapsed).count();
         if (config.debug.profile_live) {
             double ms = std::chrono::duration<double, std::milli>(elapsed).count();
             std::cerr << "{\"frame\":" << frame_count
@@ -805,6 +984,46 @@ int main(int argc, char* argv[]) {
     video_encoder.close();
     replay_writer.close();
     audio.close();
+
+    auto session_end = std::chrono::steady_clock::now();
+    double wall_seconds = std::chrono::duration<double>(session_end - session_start).count();
+    if (frame_count > 0 && wall_seconds > 0.0) {
+        double effective_fps = static_cast<double>(frame_count) / wall_seconds;
+        double processing_fps = static_cast<double>(frame_count) / std::max(processing_seconds_total, 1e-9);
+        double known_stage_seconds = stage_pipeline_seconds + stage_motion_seconds +
+                                     stage_select_seconds + stage_render_seconds +
+                                     stage_encode_seconds;
+        double stage_misc_seconds = std::max(0.0, processing_seconds_total - known_stage_seconds);
+        auto stage_pct = [&](double seconds) -> double {
+            return (processing_seconds_total > 0.0)
+                ? (100.0 * seconds / processing_seconds_total)
+                : 0.0;
+        };
+        std::cerr << std::fixed << std::setprecision(2)
+                  << "[PERF] frames=" << frame_count
+                  << ", wall_s=" << wall_seconds
+                  << ", effective_fps=" << effective_fps
+                  << ", processing_fps=" << processing_fps
+                  << "\n";
+        std::cerr << std::fixed << std::setprecision(2)
+                  << "[PERF_STAGES] pipeline_s=" << stage_pipeline_seconds
+                  << ", motion_s=" << stage_motion_seconds
+                  << ", select_s=" << stage_select_seconds
+                  << ", render_s=" << stage_render_seconds
+                  << ", encode_s=" << stage_encode_seconds
+                  << ", misc_s=" << stage_misc_seconds
+                  << "\n";
+        std::cerr << std::fixed << std::setprecision(1)
+                  << "[PERF_STAGES_PCT] pipeline=" << stage_pct(stage_pipeline_seconds) << "%"
+                  << ", motion=" << stage_pct(stage_motion_seconds) << "%"
+                  << ", select=" << stage_pct(stage_select_seconds) << "%"
+                  << ", render=" << stage_pct(stage_render_seconds) << "%"
+                  << ", encode=" << stage_pct(stage_encode_seconds) << "%"
+                  << ", misc=" << stage_pct(stage_misc_seconds) << "%"
+                  << "\n";
+    } else {
+        std::cerr << "[PERF] no frames processed.\n";
+    }
     
     return 0;
 }

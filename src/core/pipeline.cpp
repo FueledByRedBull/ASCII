@@ -2,6 +2,7 @@
 #include "core/color_space.hpp"
 #include <algorithm>
 #include <cstring>
+#include <cmath>
 
 #ifdef ASCII_USE_OPENCV
 #include <opencv2/opencv.hpp>
@@ -41,6 +42,9 @@ Pipeline::Pipeline(const Config& config) : config_(config) {
     CellStatsAggregator::Config cell_cfg;
     cell_cfg.cell_width = config.cell_width;
     cell_cfg.cell_height = config.cell_height;
+    cell_cfg.enable_orientation_histogram = config.enable_orientation_histogram;
+    cell_cfg.enable_frequency_signature = config.enable_frequency_signature;
+    cell_cfg.enable_texture_signature = config.enable_texture_signature;
     cell_cfg.quad_tree_adaptive = config.quad_tree_adaptive;
     cell_cfg.quad_tree_max_depth = config.quad_tree_max_depth;
     cell_cfg.quad_tree_variance_threshold = config.quad_tree_variance_threshold;
@@ -74,6 +78,9 @@ void Pipeline::set_config(const Config& config) {
     CellStatsAggregator::Config cell_cfg;
     cell_cfg.cell_width = config.cell_width;
     cell_cfg.cell_height = config.cell_height;
+    cell_cfg.enable_orientation_histogram = config.enable_orientation_histogram;
+    cell_cfg.enable_frequency_signature = config.enable_frequency_signature;
+    cell_cfg.enable_texture_signature = config.enable_texture_signature;
     cell_cfg.quad_tree_adaptive = config.quad_tree_adaptive;
     cell_cfg.quad_tree_max_depth = config.quad_tree_max_depth;
     cell_cfg.quad_tree_variance_threshold = config.quad_tree_variance_threshold;
@@ -83,6 +90,7 @@ void Pipeline::set_config(const Config& config) {
 void Pipeline::init_luminance_lut() {
     for (int i = 0; i < 256; ++i) {
         const float lin = ColorSpace::srgb_to_linear(static_cast<uint8_t>(i));
+        linear_lut_[i] = lin;
         lum_r_lut_[i] = 0.2126f * lin;
         lum_g_lut_[i] = 0.7152f * lin;
         lum_b_lut_[i] = 0.0722f * lin;
@@ -251,82 +259,210 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
     } else {
         output.fill(Color(0, 0, 0, 255));
     }
-    
-    float x_ratio = static_cast<float>(input.width()) / plan.scale_w;
-    float y_ratio = static_cast<float>(input.height()) / plan.scale_h;
-    
+
+    const int src_w = input.width();
+    const int src_h = input.height();
+    const uint8_t* src = input.data();
+    uint8_t* dst = output.data();
+    const float x_ratio = static_cast<float>(src_w) / plan.scale_w;
+    const float y_ratio = static_cast<float>(src_h) / plan.scale_h;
+
     for (int y = 0; y < plan.scale_h; ++y) {
         int dst_y = y + plan.offset_y;
         if (dst_y < 0 || dst_y >= plan.target_h) continue;
-        float src_y = y * y_ratio;
+        const float src_y = y * y_ratio;
         int y0 = static_cast<int>(src_y);
-        int y1 = std::min(y0 + 1, input.height() - 1);
-        float fy = src_y - y0;
-        
+        int y1 = std::min(y0 + 1, src_h - 1);
+        const float fy = src_y - y0;
+        const float wy0 = 1.0f - fy;
+
+        const size_t row0 = static_cast<size_t>(y0) * src_w * 4;
+        const size_t row1 = static_cast<size_t>(y1) * src_w * 4;
+        const size_t dst_row = static_cast<size_t>(dst_y) * target_w * 4;
+
         for (int x = 0; x < plan.scale_w; ++x) {
             int dst_x = x + plan.offset_x;
             if (dst_x < 0 || dst_x >= plan.target_w) continue;
-            float src_x = x * x_ratio;
+            const float src_x = x * x_ratio;
             int x0 = static_cast<int>(src_x);
-            int x1 = std::min(x0 + 1, input.width() - 1);
-            float fx = src_x - x0;
-            
-            auto bilinear = [&](int c) -> uint8_t {
-                Color p00 = input.get_pixel(x0, y0);
-                Color p10 = input.get_pixel(x1, y0);
-                Color p01 = input.get_pixel(x0, y1);
-                Color p11 = input.get_pixel(x1, y1);
-                
-                const float channels[4][4] = {
-                    {static_cast<float>(p00.r), static_cast<float>(p10.r), static_cast<float>(p01.r), static_cast<float>(p11.r)},
-                    {static_cast<float>(p00.g), static_cast<float>(p10.g), static_cast<float>(p01.g), static_cast<float>(p11.g)},
-                    {static_cast<float>(p00.b), static_cast<float>(p10.b), static_cast<float>(p01.b), static_cast<float>(p11.b)},
-                    {static_cast<float>(p00.a), static_cast<float>(p10.a), static_cast<float>(p01.a), static_cast<float>(p11.a)}
-                };
-                
-                float v0 = channels[c][0] * (1 - fx) + channels[c][1] * fx;
-                float v1 = channels[c][2] * (1 - fx) + channels[c][3] * fx;
-                return static_cast<uint8_t>(std::clamp(v0 * (1 - fy) + v1 * fy, 0.0f, 255.0f));
-            };
-            
-            uint8_t r = bilinear(0);
-            uint8_t g = bilinear(1);
-            uint8_t b = bilinear(2);
-            uint8_t a = bilinear(3);
-            
-            output.set_pixel(dst_x, dst_y, Color(r, g, b, a));
+            int x1 = std::min(x0 + 1, src_w - 1);
+            const float fx = src_x - x0;
+            const float wx0 = 1.0f - fx;
+
+            const size_t i00 = row0 + static_cast<size_t>(x0) * 4;
+            const size_t i10 = row0 + static_cast<size_t>(x1) * 4;
+            const size_t i01 = row1 + static_cast<size_t>(x0) * 4;
+            const size_t i11 = row1 + static_cast<size_t>(x1) * 4;
+            const size_t odx = dst_row + static_cast<size_t>(dst_x) * 4;
+
+            for (int c = 0; c < 4; ++c) {
+                const float p00 = static_cast<float>(src[i00 + static_cast<size_t>(c)]);
+                const float p10 = static_cast<float>(src[i10 + static_cast<size_t>(c)]);
+                const float p01 = static_cast<float>(src[i01 + static_cast<size_t>(c)]);
+                const float p11 = static_cast<float>(src[i11 + static_cast<size_t>(c)]);
+                const float v0 = p00 * wx0 + p10 * fx;
+                const float v1 = p01 * wx0 + p11 * fx;
+                dst[odx + static_cast<size_t>(c)] =
+                    static_cast<uint8_t>(std::clamp(v0 * wy0 + v1 * fy, 0.0f, 255.0f));
+            }
         }
     }
 #endif
 }
 
-Pipeline::Result Pipeline::process(const FrameBuffer& input) {
+void Pipeline::compute_cell_mean_colors(const FrameBuffer& input,
+                                        int target_w, int target_h,
+                                        int grid_cols, int grid_rows,
+                                        std::vector<std::array<float, 3>>& means) const {
+    const int cell_count = grid_cols * grid_rows;
+    means.assign(static_cast<size_t>(std::max(0, cell_count)), {0.0f, 0.0f, 0.0f});
+    if (cell_count <= 0) {
+        return;
+    }
+
+    std::vector<int> counts(static_cast<size_t>(cell_count), 0);
+    ResizePlan plan = compute_resize_plan(input.width(), input.height());
+    const int src_w = input.width();
+    const int src_h = input.height();
+    const uint8_t* src = input.data();
+    const float x_ratio = static_cast<float>(src_w) / plan.scale_w;
+    const float y_ratio = static_cast<float>(src_h) / plan.scale_h;
+
+    for (int y = 0; y < plan.scale_h; ++y) {
+        const int dst_y = y + plan.offset_y;
+        if (dst_y < 0 || dst_y >= target_h) continue;
+        const int cell_row = dst_y / config_.cell_height;
+        if (cell_row < 0 || cell_row >= grid_rows) continue;
+
+        const float src_y = y * y_ratio;
+        const int y0 = static_cast<int>(src_y);
+        const int y1 = std::min(y0 + 1, src_h - 1);
+        const float fy = src_y - y0;
+        const float wy0 = 1.0f - fy;
+        const size_t row0 = static_cast<size_t>(y0) * src_w * 4;
+        const size_t row1 = static_cast<size_t>(y1) * src_w * 4;
+
+        for (int x = 0; x < plan.scale_w; ++x) {
+            const int dst_x = x + plan.offset_x;
+            if (dst_x < 0 || dst_x >= target_w) continue;
+            const int cell_col = dst_x / config_.cell_width;
+            if (cell_col < 0 || cell_col >= grid_cols) continue;
+
+            const float src_x = x * x_ratio;
+            const int x0 = static_cast<int>(src_x);
+            const int x1 = std::min(x0 + 1, src_w - 1);
+            const float fx = src_x - x0;
+            const float wx0 = 1.0f - fx;
+
+            const size_t i00 = row0 + static_cast<size_t>(x0) * 4;
+            const size_t i10 = row0 + static_cast<size_t>(x1) * 4;
+            const size_t i01 = row1 + static_cast<size_t>(x0) * 4;
+            const size_t i11 = row1 + static_cast<size_t>(x1) * 4;
+
+            const size_t cell_idx = static_cast<size_t>(cell_row) * grid_cols + cell_col;
+            for (int c = 0; c < 3; ++c) {
+                const float p00 = static_cast<float>(src[i00 + static_cast<size_t>(c)]);
+                const float p10 = static_cast<float>(src[i10 + static_cast<size_t>(c)]);
+                const float p01 = static_cast<float>(src[i01 + static_cast<size_t>(c)]);
+                const float p11 = static_cast<float>(src[i11 + static_cast<size_t>(c)]);
+                const float v0 = p00 * wx0 + p10 * fx;
+                const float v1 = p01 * wx0 + p11 * fx;
+                const uint8_t srgb = static_cast<uint8_t>(
+                    std::clamp(v0 * wy0 + v1 * fy, 0.0f, 255.0f));
+                means[cell_idx][c] += linear_lut_[srgb];
+            }
+            counts[cell_idx] += 1;
+        }
+    }
+
+    for (size_t i = 0; i < means.size(); ++i) {
+        const int n = counts[i];
+        if (n > 0) {
+            const float inv = 1.0f / static_cast<float>(n);
+            means[i][0] *= inv;
+            means[i][1] *= inv;
+            means[i][2] *= inv;
+        }
+    }
+}
+
+Pipeline::Result Pipeline::process(const FrameBuffer& input, const ProcessOptions& options) {
     Result result;
 
     to_grayscale(input, gray_buffer_);
     resize_for_cells(gray_buffer_, result.luminance);
-
-    resize_color_for_cells(input, result.luminance.width(), result.luminance.height(), result.color_buffer);
 
     // Drive edge-mask generation through the detector's configured path
     // (multi-scale + adaptive thresholds), then compute gx/gy for cell stats.
     result.edges = edge_detector_.detect(result.luminance);
 
     if (config_.multi_scale) {
-        MultiScaleGradientData ms_grad = edge_detector_.compute_multi_scale_gradients(result.luminance);
-        result.gradients.gx = std::move(ms_grad.gx);
-        result.gradients.gy = std::move(ms_grad.gy);
-        result.gradients.magnitude = std::move(ms_grad.magnitude);
-        result.gradients.orientation = std::move(ms_grad.orientation);
+        // Reuse detector output to avoid recomputing multi-scale gradients.
+        // gx/gy are reconstructed from magnitude+orientation.
+        const int w = result.luminance.width();
+        const int h = result.luminance.height();
+        result.gradients.gx = FloatImage(w, h, 0.0f);
+        result.gradients.gy = FloatImage(w, h, 0.0f);
+
+        const float* mag = result.edges.magnitude.data();
+        const float* ori = result.edges.orientation.data();
+        float* gx = result.gradients.gx.data();
+        float* gy = result.gradients.gy.data();
+        const int n = w * h;
+
+#ifdef HAS_OPENMP
+        #pragma omp parallel for
+#endif
+        for (int i = 0; i < n; ++i) {
+            float m = mag[i];
+            float a = ori[i];
+            gx[i] = m * std::cos(a);
+            gy[i] = m * std::sin(a);
+        }
     } else {
         result.gradients = edge_detector_.compute_gradients(result.luminance);
     }
     
     result.grid_cols = cell_aggregator_.grid_cols(result.luminance.width());
     result.grid_rows = cell_aggregator_.grid_rows(result.luminance.height());
-    
-    result.cell_stats = cell_aggregator_.compute(result.luminance, result.edges, 
-                                                  &result.color_buffer, &result.gradients);
+
+    if (options.need_color_buffer) {
+        resize_color_for_cells(
+            input, result.luminance.width(), result.luminance.height(), result.color_buffer);
+    }
+
+    const int expected_cells = result.grid_cols * result.grid_rows;
+    const bool reuse_stats = options.reuse_cell_stats != nullptr &&
+                             static_cast<int>(options.reuse_cell_stats->size()) == expected_cells;
+    if (reuse_stats) {
+        result.cell_stats = *options.reuse_cell_stats;
+        return result;
+    }
+
+    if (options.need_color_buffer) {
+        const FrameBuffer* color_ptr = options.need_color_stats ? &result.color_buffer : nullptr;
+        result.cell_stats = cell_aggregator_.compute(
+            result.luminance, result.edges, color_ptr, &result.gradients);
+    } else {
+        result.cell_stats = cell_aggregator_.compute(
+            result.luminance, result.edges, nullptr, &result.gradients);
+
+        if (options.need_color_stats) {
+            std::vector<std::array<float, 3>> means;
+            compute_cell_mean_colors(input,
+                                     result.luminance.width(),
+                                     result.luminance.height(),
+                                     result.grid_cols,
+                                     result.grid_rows,
+                                     means);
+            const size_t n = std::min(result.cell_stats.size(), means.size());
+            for (size_t i = 0; i < n; ++i) {
+                result.cell_stats[i].mean_r = means[i][0];
+                result.cell_stats[i].mean_g = means[i][1];
+                result.cell_stats[i].mean_b = means[i][2];
+            }
+        }
+    }
     
     return result;
 }

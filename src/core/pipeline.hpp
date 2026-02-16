@@ -41,6 +41,9 @@ public:
         int tile_size = 16;
         float dark_scene_floor = 0.02f;
         float global_percentile = 0.7f;
+        bool enable_orientation_histogram = true;
+        bool enable_frequency_signature = true;
+        bool enable_texture_signature = true;
     };
     
     Pipeline() : Pipeline(Config{}) {}
@@ -58,8 +61,14 @@ public:
         FrameBuffer color_buffer;
         GradientData gradients;
     };
+
+    struct ProcessOptions {
+        bool need_color_buffer = true;
+        bool need_color_stats = true;
+        const std::vector<CellStats>* reuse_cell_stats = nullptr;
+    };
     
-    Result process(const FrameBuffer& input);
+    Result process(const FrameBuffer& input, const ProcessOptions& options = ProcessOptions{});
     
 private:
     struct ResizePlan {
@@ -75,6 +84,7 @@ private:
     EdgeDetector edge_detector_;
     CellStatsAggregator cell_aggregator_;
     FloatImage gray_buffer_;
+    std::array<float, 256> linear_lut_{};
     std::array<float, 256> lum_r_lut_{};
     std::array<float, 256> lum_g_lut_{};
     std::array<float, 256> lum_b_lut_{};
@@ -84,6 +94,10 @@ private:
     ResizePlan compute_resize_plan(int src_w, int src_h) const;
     void resize_for_cells(const FloatImage& input, FloatImage& output) const;
     void resize_color_for_cells(const FrameBuffer& input, int target_w, int target_h, FrameBuffer& output) const;
+    void compute_cell_mean_colors(const FrameBuffer& input,
+                                  int target_w, int target_h,
+                                  int grid_cols, int grid_rows,
+                                  std::vector<std::array<float, 3>>& means) const;
 };
 
 }

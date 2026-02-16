@@ -29,8 +29,12 @@ private:
     int cols_ = 80;
     int rows_ = 24;
     std::vector<ASCIICell> prev_buffer_;
-    
-    std::string codepoint_to_utf8(uint32_t cp) const;
+    std::vector<char> out_buffer_;
+    std::string write_buffer_;
+
+    void append_utf8(uint32_t cp);
+    void append_cursor_move(int row, int col);
+    void append_string(const std::string& s);
 };
 
 }

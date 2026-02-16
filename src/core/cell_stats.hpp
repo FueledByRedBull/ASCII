@@ -32,6 +32,9 @@ public:
         int cell_height = 16;
         float edge_threshold = 0.1f;
         int orientation_bins = 8;
+        bool enable_orientation_histogram = true;
+        bool enable_frequency_signature = true;
+        bool enable_texture_signature = true;
         bool quad_tree_adaptive = false;
         int quad_tree_max_depth = 2;
         float quad_tree_variance_threshold = 0.01f;

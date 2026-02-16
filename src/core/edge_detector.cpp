@@ -109,10 +109,13 @@ MultiScaleGradientData EdgeDetector::compute_multi_scale_gradients(const FloatIm
     // Lindeberg-style normalized Laplacian scale selection over a small geometric scale stack.
     const float sigma0 = std::max(0.1f, config_.scale_sigma_0);
     const float sigmaN = std::max(sigma0 + 1e-4f, config_.scale_sigma_1);
-    constexpr int kScaleLevels = 5;
+    const int pixel_count = w * h;
+    const int kScaleLevels =
+        (pixel_count >= 1280 * 720) ? 5 :
+        (pixel_count >= 960 * 540) ? 3 : 2;
 
     std::vector<float> sigmas(kScaleLevels, sigma0);
-    if constexpr (kScaleLevels > 1) {
+    if (kScaleLevels > 1) {
         const float ratio = sigmaN / sigma0;
         for (int s = 0; s < kScaleLevels; ++s) {
             float t = static_cast<float>(s) / static_cast<float>(kScaleLevels - 1);
@@ -562,9 +565,29 @@ FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
         kernel[i] = std::exp(-x * x / (2 * sigma * sigma));
         sum += kernel[i];
     }
-    for (float& k : kernel) k /= sum;
-    
-    FloatImage temp(w, h);
+    if (sum > 1e-12f) {
+        for (float& k : kernel) {
+            k /= sum;
+        }
+    }
+
+#if defined(__AVX2__)
+    std::vector<__m256> kernel_avx(static_cast<size_t>(ksize));
+    for (int i = 0; i < ksize; ++i) {
+        kernel_avx[static_cast<size_t>(i)] = _mm256_set1_ps(kernel[static_cast<size_t>(i)]);
+    }
+#endif
+
+#if !defined(__AVX2__) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+    std::vector<__m128> kernel_sse(static_cast<size_t>(ksize));
+    for (int i = 0; i < ksize; ++i) {
+        kernel_sse[static_cast<size_t>(i)] = _mm_set1_ps(kernel[static_cast<size_t>(i)]);
+    }
+#endif
+
+    // Separable Gaussian: horizontal pass then vertical pass.
+    // Border handling uses clamped replication to preserve energy.
+    FloatImage temp(w, h, 0.0f);
     const float* in_data = input.data();
     float* temp_data = temp.data();
 #ifdef HAS_OPENMP
@@ -572,49 +595,111 @@ FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
 #endif
     for (int y = 0; y < h; ++y) {
         const float* in_row = in_data + static_cast<size_t>(y) * w;
-        float* temp_row = temp_data + static_cast<size_t>(y) * w;
-        for (int tx = 0; tx < w; tx += kCacheTile) {
-            int x_end = std::min(tx + kCacheTile, w);
-            for (int x = tx; x < x_end; ++x) {
-                float val = 0.0f;
-                float wsum = 0.0f;
-                for (int k = 0; k < ksize; ++k) {
-                    int nx = x + k - radius;
-                    if (nx >= 0 && nx < w) {
-                        val += in_row[nx] * kernel[k];
-                        wsum += kernel[k];
-                    }
-                }
-                temp_row[x] = val / std::max(wsum, 1e-12f);
+        float* out_row = temp_data + static_cast<size_t>(y) * w;
+
+        int x = 0;
+        const int interior_begin = std::min(std::max(radius, 0), w);
+        const int interior_end = std::max(interior_begin, w - radius);
+
+        // Left border (clamped)
+        for (; x < interior_begin; ++x) {
+            float acc = 0.0f;
+            for (int k = -radius; k <= radius; ++k) {
+                int nx = std::clamp(x + k, 0, w - 1);
+                acc += in_row[nx] * kernel[k + radius];
             }
+            out_row[x] = acc;
+        }
+
+#if defined(__AVX2__)
+        for (; x + 7 < interior_end; x += 8) {
+            __m256 acc = _mm256_setzero_ps();
+            for (int k = -radius; k <= radius; ++k) {
+                __m256 s = _mm256_loadu_ps(in_row + x + k);
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(s, kernel_avx[static_cast<size_t>(k + radius)]));
+            }
+            _mm256_storeu_ps(out_row + x, acc);
+        }
+#endif
+
+#if !defined(__AVX2__) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+        for (; x + 3 < interior_end; x += 4) {
+            __m128 acc = _mm_setzero_ps();
+            for (int k = -radius; k <= radius; ++k) {
+                __m128 s = _mm_loadu_ps(in_row + x + k);
+                acc = _mm_add_ps(acc, _mm_mul_ps(s, kernel_sse[static_cast<size_t>(k + radius)]));
+            }
+            _mm_storeu_ps(out_row + x, acc);
+        }
+#endif
+
+        // Scalar interior remainder (no clamping needed)
+        for (; x < interior_end; ++x) {
+            float acc = 0.0f;
+            for (int k = -radius; k <= radius; ++k) {
+                acc += in_row[x + k] * kernel[k + radius];
+            }
+            out_row[x] = acc;
+        }
+
+        // Right border (clamped)
+        for (; x < w; ++x) {
+            float acc = 0.0f;
+            for (int k = -radius; k <= radius; ++k) {
+                int nx = std::clamp(x + k, 0, w - 1);
+                acc += in_row[nx] * kernel[k + radius];
+            }
+            out_row[x] = acc;
         }
     }
-    
-    FloatImage result(w, h);
+
+    FloatImage result(w, h, 0.0f);
     const float* temp_ro = temp.data();
     float* out_data = result.data();
+    std::vector<const float*> row_ptrs(static_cast<size_t>(ksize), nullptr);
 #ifdef HAS_OPENMP
-    #pragma omp parallel for
+    #pragma omp parallel for firstprivate(row_ptrs)
 #endif
     for (int y = 0; y < h; ++y) {
+        for (int k = -radius; k <= radius; ++k) {
+            int ny = std::clamp(y + k, 0, h - 1);
+            row_ptrs[k + radius] = temp_ro + static_cast<size_t>(ny) * w;
+        }
+
         float* out_row = out_data + static_cast<size_t>(y) * w;
-        for (int tx = 0; tx < w; tx += kCacheTile) {
-            int x_end = std::min(tx + kCacheTile, w);
-            for (int x = tx; x < x_end; ++x) {
-                float val = 0.0f;
-                float wsum = 0.0f;
-                for (int k = 0; k < ksize; ++k) {
-                    int ny = y + k - radius;
-                    if (ny >= 0 && ny < h) {
-                        val += temp_ro[static_cast<size_t>(ny) * w + x] * kernel[k];
-                        wsum += kernel[k];
-                    }
-                }
-                out_row[x] = val / std::max(wsum, 1e-12f);
+        int x = 0;
+
+#if defined(__AVX2__)
+        for (; x + 7 < w; x += 8) {
+            __m256 acc = _mm256_setzero_ps();
+            for (int ki = 0; ki < ksize; ++ki) {
+                __m256 s = _mm256_loadu_ps(row_ptrs[ki] + x);
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(s, kernel_avx[static_cast<size_t>(ki)]));
             }
+            _mm256_storeu_ps(out_row + x, acc);
+        }
+#endif
+
+#if !defined(__AVX2__) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+        for (; x + 3 < w; x += 4) {
+            __m128 acc = _mm_setzero_ps();
+            for (int ki = 0; ki < ksize; ++ki) {
+                __m128 s = _mm_loadu_ps(row_ptrs[ki] + x);
+                acc = _mm_add_ps(acc, _mm_mul_ps(s, kernel_sse[static_cast<size_t>(ki)]));
+            }
+            _mm_storeu_ps(out_row + x, acc);
+        }
+#endif
+
+        for (; x < w; ++x) {
+            float acc = 0.0f;
+            for (int ki = 0; ki < ksize; ++ki) {
+                acc += row_ptrs[ki][x] * kernel[ki];
+            }
+            out_row[x] = acc;
         }
     }
-    
+
     return result;
 }
 

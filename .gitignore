@@ -12,6 +12,7 @@
 /rules.ninja
 /compile_commands.json
 /install_manifest.txt
+/output/
 
 # Ninja / CMake internals
 /.ninja_deps

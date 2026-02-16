@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -361,6 +362,190 @@ FloatImage upsample_flow_field(const FloatImage& src, int dst_w, int dst_h, floa
     return dst;
 }
 
+FloatImage downsample_area_average(const FloatImage& src, int dst_w, int dst_h) {
+    dst_w = std::max(1, dst_w);
+    dst_h = std::max(1, dst_h);
+    FloatImage dst(dst_w, dst_h, 0.0f);
+    if (src.empty()) {
+        return dst;
+    }
+
+    const int src_w = src.width();
+    const int src_h = src.height();
+    const float* s = src.data();
+    float* d = dst.data();
+
+    for (int y = 0; y < dst_h; ++y) {
+        int y0 = (y * src_h) / dst_h;
+        int y1 = ((y + 1) * src_h) / dst_h;
+        y1 = std::max(y0 + 1, y1);
+        y1 = std::min(y1, src_h);
+
+        for (int x = 0; x < dst_w; ++x) {
+            int x0 = (x * src_w) / dst_w;
+            int x1 = ((x + 1) * src_w) / dst_w;
+            x1 = std::max(x0 + 1, x1);
+            x1 = std::min(x1, src_w);
+
+            double sum = 0.0;
+            int count = 0;
+            for (int yy = y0; yy < y1; ++yy) {
+                const float* row = s + static_cast<size_t>(yy) * src_w;
+                for (int xx = x0; xx < x1; ++xx) {
+                    sum += row[xx];
+                    ++count;
+                }
+            }
+            d[static_cast<size_t>(y) * dst_w + x] =
+                (count > 0) ? static_cast<float>(sum / count) : 0.0f;
+        }
+    }
+    return dst;
+}
+
+float estimate_scene_change_score(const FloatImage& prev, const FloatImage& curr) {
+    if (prev.empty() || curr.empty() ||
+        prev.width() != curr.width() || prev.height() != curr.height()) {
+        return 1.0f;
+    }
+
+    const int w = prev.width();
+    const int h = prev.height();
+    const float* a = prev.data();
+    const float* b = curr.data();
+
+    int stride = std::max(1, std::min(w, h) / 64);
+    double sum_abs = 0.0;
+    int count = 0;
+    for (int y = 0; y < h; y += stride) {
+        size_t row = static_cast<size_t>(y) * w;
+        for (int x = 0; x < w; x += stride) {
+            float d = std::abs(a[row + x] - b[row + x]);
+            sum_abs += d;
+            ++count;
+        }
+    }
+    return (count > 0) ? static_cast<float>(sum_abs / count) : 1.0f;
+}
+
+void decay_flow_confidence(std::vector<MotionVector>& flow, float decay) {
+    decay = std::clamp(decay, 0.0f, 1.0f);
+    if (decay >= 0.9999f) {
+        return;
+    }
+    for (auto& mv : flow) {
+        mv.confidence *= decay;
+    }
+}
+
+void compute_sparse_block_matching_flow(const FloatImage& prev,
+                                        const FloatImage& curr,
+                                        int search_radius,
+                                        int block_radius,
+                                        int step,
+                                        float motion_cap,
+                                        FloatImage& flow_x,
+                                        FloatImage& flow_y) {
+    const int w = prev.width();
+    const int h = prev.height();
+    flow_x = FloatImage(w, h, 0.0f);
+    flow_y = FloatImage(w, h, 0.0f);
+    if (w <= 0 || h <= 0 || w != curr.width() || h != curr.height()) {
+        return;
+    }
+
+    search_radius = std::max(1, search_radius);
+    block_radius = std::max(1, block_radius);
+    step = std::max(1, step);
+    motion_cap = std::max(0.0f, motion_cap);
+
+    const int margin = search_radius + block_radius;
+    if (w <= 2 * margin || h <= 2 * margin) {
+        return;
+    }
+
+    const float* a = prev.data();
+    const float* b = curr.data();
+    float* fx = flow_x.data();
+    float* fy = flow_y.data();
+
+    for (int y = margin; y < h - margin; y += step) {
+        const int y0 = std::max(0, y - step / 2);
+        const int y1 = std::min(h, y + step / 2 + 1);
+        for (int x = margin; x < w - margin; x += step) {
+            float best_cost = std::numeric_limits<float>::infinity();
+            int best_dx = 0;
+            int best_dy = 0;
+
+            for (int dy = -search_radius; dy <= search_radius; ++dy) {
+                for (int dx = -search_radius; dx <= search_radius; ++dx) {
+                    float sad = 0.0f;
+                    for (int ky = -block_radius; ky <= block_radius; ++ky) {
+                        const float* row_a = a + static_cast<size_t>(y + ky) * w;
+                        const float* row_b = b + static_cast<size_t>(y + dy + ky) * w;
+                        for (int kx = -block_radius; kx <= block_radius; ++kx) {
+                            sad += std::abs(row_a[x + kx] - row_b[x + dx + kx]);
+                        }
+                        if (sad >= best_cost) {
+                            break;
+                        }
+                    }
+                    if (sad < best_cost) {
+                        best_cost = sad;
+                        best_dx = dx;
+                        best_dy = dy;
+                    }
+                }
+            }
+
+            const float best_fx = std::clamp(static_cast<float>(best_dx), -motion_cap, motion_cap);
+            const float best_fy = std::clamp(static_cast<float>(best_dy), -motion_cap, motion_cap);
+            const int x0 = std::max(0, x - step / 2);
+            const int x1 = std::min(w, x + step / 2 + 1);
+            for (int yy = y0; yy < y1; ++yy) {
+                float* row_fx = fx + static_cast<size_t>(yy) * w;
+                float* row_fy = fy + static_cast<size_t>(yy) * w;
+                for (int xx = x0; xx < x1; ++xx) {
+                    row_fx[xx] = best_fx;
+                    row_fy[xx] = best_fy;
+                }
+            }
+        }
+    }
+
+    const int min_x = margin;
+    const int max_x = std::max(min_x, w - margin - 1);
+    const int min_y = margin;
+    const int max_y = std::max(min_y, h - margin - 1);
+    for (int y = 0; y < h; ++y) {
+        if (y >= min_y && y <= max_y) {
+            continue;
+        }
+        const int cy = std::clamp(y, min_y, max_y);
+        float* row_fx = fx + static_cast<size_t>(y) * w;
+        float* row_fy = fy + static_cast<size_t>(y) * w;
+        const float* src_fx = fx + static_cast<size_t>(cy) * w;
+        const float* src_fy = fy + static_cast<size_t>(cy) * w;
+        for (int x = 0; x < w; ++x) {
+            int cx = std::clamp(x, min_x, max_x);
+            row_fx[x] = src_fx[cx];
+            row_fy[x] = src_fy[cx];
+        }
+    }
+    for (int y = min_y; y <= max_y; ++y) {
+        float* row_fx = fx + static_cast<size_t>(y) * w;
+        float* row_fy = fy + static_cast<size_t>(y) * w;
+        for (int x = 0; x < min_x; ++x) {
+            row_fx[x] = row_fx[min_x];
+            row_fy[x] = row_fy[min_x];
+        }
+        for (int x = max_x + 1; x < w; ++x) {
+            row_fx[x] = row_fx[max_x];
+            row_fy[x] = row_fy[max_x];
+        }
+    }
+}
+
 MotionVector estimate_phase_correlation_shift(
     const FloatImage& prev,
     const FloatImage& curr,
@@ -514,6 +699,10 @@ void MotionEstimator::reset() {
     flow_.clear();
     width_ = 0;
     height_ = 0;
+    frame_counter_ = 0;
+    reused_frames_ = 0;
+    last_phase_mv_ = MotionVector{};
+    has_last_phase_ = false;
     for (int i = 0; i < 4; ++i) {
         prev_pyramid_[i] = FloatImage();
         curr_pyramid_[i] = FloatImage();
@@ -691,11 +880,54 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
     
     width_ = prev.width();
     height_ = prev.height();
-    flow_.assign(width_ * height_, MotionVector{});
-    
+    const int full_count = width_ * height_;
+    if (static_cast<int>(flow_.size()) != full_count) {
+        flow_.assign(full_count, MotionVector{});
+    }
+
+    const float scene_change = estimate_scene_change_score(prev, curr);
+    if (config_.still_scene_threshold > 0.0f &&
+        scene_change < config_.still_scene_threshold) {
+        std::fill(flow_.begin(), flow_.end(), MotionVector{});
+        reused_frames_ = 0;
+        has_last_phase_ = false;
+        ++frame_counter_;
+        return;
+    }
+
+    const bool can_reuse =
+        frame_counter_ > 0 &&
+        config_.max_reuse_frames > 0 &&
+        reused_frames_ < config_.max_reuse_frames &&
+        scene_change < config_.reuse_scene_threshold;
+    if (can_reuse) {
+        decay_flow_confidence(flow_, config_.reuse_confidence_decay);
+        ++reused_frames_;
+        ++frame_counter_;
+        return;
+    }
+    reused_frames_ = 0;
+
+    int solve_div = std::clamp(config_.solve_divisor, 1, 8);
+    FloatImage prev_work = prev;
+    FloatImage curr_work = curr;
+    float flow_scale_to_full = 1.0f;
+    if (solve_div > 1) {
+        const int dst_w = std::max(1, width_ / solve_div);
+        const int dst_h = std::max(1, height_ / solve_div);
+        if (dst_w >= 16 && dst_h >= 16) {
+            prev_work = downsample_area_average(prev, dst_w, dst_h);
+            curr_work = downsample_area_average(curr, dst_w, dst_h);
+            flow_scale_to_full = 0.5f * (
+                static_cast<float>(width_) / static_cast<float>(prev_work.width()) +
+                static_cast<float>(height_) / static_cast<float>(prev_work.height())
+            );
+        }
+    }
+
     int requested_levels = std::clamp(config_.pyramid_levels, 1, 4);
-    build_pyramid(prev, prev_pyramid_, requested_levels);
-    build_pyramid(curr, curr_pyramid_, requested_levels);
+    build_pyramid(prev_work, prev_pyramid_, requested_levels);
+    build_pyramid(curr_work, curr_pyramid_, requested_levels);
 
     int levels_available = 1;
     for (int l = 1; l < requested_levels; ++l) {
@@ -706,78 +938,120 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
     }
     
     FloatImage flow_x, flow_y;
+    if (config_.use_sparse_block_matching) {
+        const float work_scale = std::max(1e-6f, flow_scale_to_full);
+        const float work_motion_cap = std::max(1.0f, config_.motion_cap / work_scale);
+        int search_radius = static_cast<int>(std::ceil(work_motion_cap));
+        int max_search = std::max(1, std::min(prev_work.width(), prev_work.height()) / 6);
+        search_radius = std::clamp(search_radius, 1, max_search);
+        const int block_radius = std::clamp(config_.block_match_radius, 1, 8);
+        const int step = std::clamp(config_.block_match_step, 1, 16);
+        compute_sparse_block_matching_flow(
+            prev_work, curr_work,
+            search_radius,
+            block_radius,
+            step,
+            work_motion_cap,
+            flow_x,
+            flow_y
+        );
+    } else {
+        // Coarse-to-fine estimation: significantly cheaper than repeated full-resolution solves.
+        for (int l = levels_available - 1; l >= 0; --l) {
+            const FloatImage& p = prev_pyramid_[l];
+            const FloatImage& c = curr_pyramid_[l];
+            if (p.empty() || c.empty()) {
+                continue;
+            }
 
-    // Coarse-to-fine estimation: significantly cheaper than repeated full-resolution solves.
-    for (int l = levels_available - 1; l >= 0; --l) {
-        const FloatImage& p = prev_pyramid_[l];
-        const FloatImage& c = curr_pyramid_[l];
-        if (p.empty() || c.empty()) {
-            continue;
+            FloatImage level_fx, level_fy;
+            compute_farneback_level(p, c, level_fx, level_fy);
+
+            if (flow_x.empty()) {
+                flow_x = std::move(level_fx);
+                flow_y = std::move(level_fy);
+                continue;
+            }
+
+            float scale_x = static_cast<float>(p.width()) / static_cast<float>(std::max(1, flow_x.width()));
+            float scale_y = static_cast<float>(p.height()) / static_cast<float>(std::max(1, flow_y.height()));
+            float scale = 0.5f * (scale_x + scale_y);
+            FloatImage up_x = upsample_flow_field(flow_x, p.width(), p.height(), scale);
+            FloatImage up_y = upsample_flow_field(flow_y, p.width(), p.height(), scale);
+            const float refine_weight = (l == 0) ? 0.65f : 0.50f;
+            const float keep_weight = 1.0f - refine_weight;
+            const int n = p.width() * p.height();
+            float* up_x_data = up_x.data();
+            float* up_y_data = up_y.data();
+            const float* level_x_data = level_fx.data();
+            const float* level_y_data = level_fy.data();
+            for (int i = 0; i < n; ++i) {
+                up_x_data[i] = keep_weight * up_x_data[i] + refine_weight * level_x_data[i];
+                up_y_data[i] = keep_weight * up_y_data[i] + refine_weight * level_y_data[i];
+            }
+
+            flow_x = std::move(up_x);
+            flow_y = std::move(up_y);
         }
 
-        FloatImage level_fx, level_fy;
-        compute_farneback_level(p, c, level_fx, level_fy);
-
-        if (flow_x.empty()) {
-            flow_x = std::move(level_fx);
-            flow_y = std::move(level_fy);
-            continue;
+        if (flow_x.empty() || flow_y.empty()) {
+            flow_x = FloatImage(prev_work.width(), prev_work.height(), 0.0f);
+            flow_y = FloatImage(prev_work.width(), prev_work.height(), 0.0f);
         }
 
-        float scale_x = static_cast<float>(p.width()) / static_cast<float>(std::max(1, flow_x.width()));
-        float scale_y = static_cast<float>(p.height()) / static_cast<float>(std::max(1, flow_y.height()));
-        float scale = 0.5f * (scale_x + scale_y);
-        FloatImage up_x = upsample_flow_field(flow_x, p.width(), p.height(), scale);
-        FloatImage up_y = upsample_flow_field(flow_y, p.width(), p.height(), scale);
-        const float refine_weight = (l == 0) ? 0.65f : 0.50f;
-        const float keep_weight = 1.0f - refine_weight;
-        const int n = p.width() * p.height();
-        float* up_x_data = up_x.data();
-        float* up_y_data = up_y.data();
-        const float* level_x_data = level_fx.data();
-        const float* level_y_data = level_fy.data();
-        for (int i = 0; i < n; ++i) {
-            up_x_data[i] = keep_weight * up_x_data[i] + refine_weight * level_x_data[i];
-            up_y_data[i] = keep_weight * up_y_data[i] + refine_weight * level_y_data[i];
+        int extra_iters = std::max(0, config_.iterations - levels_available);
+        for (int iter = 0; iter < extra_iters; ++iter) {
+            FloatImage fx, fy;
+            compute_farneback_level(prev_work, curr_work, fx, fy);
+            const float blend = 0.35f;
+            const float keep = 1.0f - blend;
+            const int n = prev_work.width() * prev_work.height();
+            float* flow_x_data = flow_x.data();
+            float* flow_y_data = flow_y.data();
+            const float* fx_data = fx.data();
+            const float* fy_data = fy.data();
+            for (int i = 0; i < n; ++i) {
+                flow_x_data[i] = keep * flow_x_data[i] + blend * fx_data[i];
+                flow_y_data[i] = keep * flow_y_data[i] + blend * fy_data[i];
+            }
         }
-
-        flow_x = std::move(up_x);
-        flow_y = std::move(up_y);
     }
 
     if (flow_x.empty() || flow_y.empty()) {
-        flow_x = FloatImage(width_, height_, 0.0f);
-        flow_y = FloatImage(width_, height_, 0.0f);
-    }
-
-    int extra_iters = std::max(0, config_.iterations - levels_available);
-    for (int iter = 0; iter < extra_iters; ++iter) {
-        FloatImage fx, fy;
-        compute_farneback_level(prev, curr, fx, fy);
-        const float blend = 0.35f;
-        const float keep = 1.0f - blend;
-        const int n = width_ * height_;
-        float* flow_x_data = flow_x.data();
-        float* flow_y_data = flow_y.data();
-        const float* fx_data = fx.data();
-        const float* fy_data = fy.data();
-        for (int i = 0; i < n; ++i) {
-            flow_x_data[i] = keep * flow_x_data[i] + blend * fx_data[i];
-            flow_y_data[i] = keep * flow_y_data[i] + blend * fy_data[i];
-        }
+        flow_x = FloatImage(prev_work.width(), prev_work.height(), 0.0f);
+        flow_y = FloatImage(prev_work.width(), prev_work.height(), 0.0f);
     }
 
     MotionVector phase_mv{};
     if (config_.use_phase_correlation) {
-        phase_mv = estimate_phase_correlation_hierarchical(
-            prev_pyramid_, curr_pyramid_, levels_available, config_.phase_search_radius);
+        const int phase_interval = std::max(1, config_.phase_interval);
+        const bool refresh_phase =
+            !has_last_phase_ ||
+            (frame_counter_ % phase_interval == 0) ||
+            (scene_change >= config_.phase_scene_trigger);
+        if (refresh_phase) {
+            phase_mv = estimate_phase_correlation_hierarchical(
+                prev_pyramid_, curr_pyramid_, levels_available, config_.phase_search_radius);
+            last_phase_mv_ = phase_mv;
+            has_last_phase_ = true;
+        } else {
+            phase_mv = last_phase_mv_;
+        }
+    } else {
+        has_last_phase_ = false;
+    }
+
+    if (flow_x.width() != width_ || flow_x.height() != height_) {
+        const float scale = std::max(1e-6f, flow_scale_to_full);
+        flow_x = upsample_flow_field(flow_x, width_, height_, scale);
+        flow_y = upsample_flow_field(flow_y, width_, height_, scale);
     }
     
     for (int y = 0; y < height_; ++y) {
         for (int x = 0; x < width_; ++x) {
             int idx = y * width_ + x;
-            float dx = flow_x.get(x, y);
-            float dy = flow_y.get(x, y);
+            float dx = flow_x.get_clamped(x, y);
+            float dy = flow_y.get_clamped(x, y);
             if (config_.use_phase_correlation) {
                 float gated = std::clamp((phase_mv.confidence - 0.2f) / 0.8f, 0.0f, 1.0f);
                 float blend = std::clamp(config_.phase_blend * gated * gated, 0.0f, 1.0f);
@@ -794,6 +1068,8 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
             }
         }
     }
+
+    ++frame_counter_;
 }
 
 const MotionVector& MotionEstimator::get_motion(int x, int y) const {

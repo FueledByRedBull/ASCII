@@ -92,7 +92,10 @@ Args parse_args(int argc, char* argv[]) {
             }
         }
         else if (strcmp(arg, "--color") == 0) {
-            if (i + 1 < argc) args.color_mode = parse_color_mode(argv[++i]);
+            if (i + 1 < argc) {
+                args.color_mode = parse_color_mode(argv[++i]);
+                args.color_mode_set = true;
+            }
         }
         else if (strcmp(arg, "--edge-thresh") == 0) {
             if (i + 1 < argc) args.edge_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, 0.1f);
@@ -102,6 +105,27 @@ Args parse_args(int argc, char* argv[]) {
         }
         else if (strcmp(arg, "--temporal") == 0) {
             if (i + 1 < argc) args.temporal_alpha = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, 0.3f);
+        }
+        else if (strcmp(arg, "--motion-solve-div") == 0) {
+            if (i + 1 < argc) args.motion_solve_divisor = clamp_int(std::atoi(argv[++i]), 1, 8, 0);
+        }
+        else if (strcmp(arg, "--motion-reuse") == 0) {
+            if (i + 1 < argc) args.motion_max_reuse_frames = clamp_int(std::atoi(argv[++i]), 0, 32, -1);
+        }
+        else if (strcmp(arg, "--motion-reuse-thresh") == 0) {
+            if (i + 1 < argc) args.motion_reuse_scene_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
+        }
+        else if (strcmp(arg, "--motion-reuse-decay") == 0) {
+            if (i + 1 < argc) args.motion_reuse_confidence_decay = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
+        }
+        else if (strcmp(arg, "--phase-interval") == 0) {
+            if (i + 1 < argc) args.motion_phase_interval = clamp_int(std::atoi(argv[++i]), 1, 64, 0);
+        }
+        else if (strcmp(arg, "--phase-scene-trigger") == 0) {
+            if (i + 1 < argc) args.motion_phase_scene_trigger = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
+        }
+        else if (strcmp(arg, "--motion-still-thresh") == 0) {
+            if (i + 1 < argc) args.motion_still_scene_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
         }
         else if (strcmp(arg, "--scale") == 0) {
             if (i + 1 < argc) {
@@ -143,6 +167,9 @@ Args parse_args(int argc, char* argv[]) {
         else if (strcmp(arg, "--strict-memory") == 0) {
             args.strict_memory = true;
         }
+        else if (strcmp(arg, "--fast") == 0) {
+            args.fast_mode = true;
+        }
         else if (arg[0] != '-') {
             args.input = arg;
             if (!validate_path(args.input)) {
@@ -171,6 +198,13 @@ void print_help(const char* prog) {
     printf("      --edge-thresh <N>   Edge detection threshold (0.0-1.0)\n");
     printf("      --blur <N>          Blur sigma (default: 1.0, range: 0.1-10.0)\n");
     printf("      --temporal <N>      Temporal smoothing alpha (0.0-1.0)\n");
+    printf("      --motion-solve-div <N>  Motion solve downscale divisor (1-8)\n");
+    printf("      --motion-reuse <N>  Reuse motion field for up to N stable frames\n");
+    printf("      --motion-reuse-thresh <N>  Scene-change threshold for motion reuse (0-1)\n");
+    printf("      --motion-reuse-decay <N>   Confidence decay applied on reused motion (0-1)\n");
+    printf("      --phase-interval <N>       Recompute phase-correlation every N frames\n");
+    printf("      --phase-scene-trigger <N>  Force phase refresh above scene-change threshold (0-1)\n");
+    printf("      --motion-still-thresh <N>  Zero motion when scene-change is below threshold (0-1)\n");
     printf("      --scale <MODE>      Scaling: fit, fill, stretch\n");
     printf("      --font <PATH>       Font file to use (auto-detects system font if not set)\n");
     printf("      --no-audio          Disable audio playback\n");
@@ -180,6 +214,7 @@ void print_help(const char* prog) {
     printf("      --debug <MODE>      Debug view: grayscale, edges, orientation\n");
     printf("      --profile-live      Output per-frame profiling as JSONL to stderr\n");
     printf("      --strict-memory     Fail if memory budget exceeded\n");
+    printf("      --fast              Fast preview mode (disables expensive analysis modules)\n");
     printf("  -h, --help              Show this help\n");
     printf("\nINTERACTIVE CONTROLS (during playback):\n");
     printf("  SPACE                   Pause/resume\n");
