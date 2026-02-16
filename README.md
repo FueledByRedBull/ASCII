@@ -1,101 +1,79 @@
 # ASCII Engine
 
-A non-ML, deterministic C++20 ASCII rendering engine for terminal playback and offline export.
+ASCII Engine is a deterministic, non-ML C++20 renderer that converts video/image input into ANSI/ASCII output for terminal playback and export.
 
-This project implements the scope in `PLAN.md` / `IMPLEMENTATION.md`: edge-aware glyph mapping, temporal stabilization, perceptual color mapping, and separate text/block-art rendering paths.
+## What It Does
 
-## Current Highlights
+- Converts video/images/webcam frames into ASCII in real time.
+- Supports `none`, `16`, `256`, `truecolor`, and `blockart` color modes.
+- Uses edge-aware glyph selection with temporal stabilization.
+- Supports replay capture (`.areplay`) for deterministic inspection.
+- Exports to terminal, text (`.txt`), and encoded video output.
 
-- Input sources:
-  - video files
-  - single images
-  - image sequences (wildcards)
-  - raw pipe input (`pipe:WxH:rgb[:fps]`)
-  - webcam (OpenCV-enabled builds)
-- Output modes:
-  - live terminal playback
-  - text frame export (`.txt`)
-  - encoded video output
-  - deterministic replay files (`.areplay`)
-- Color modes:
-  - `none`, `16`, `256`, `truecolor`, `blockart`
-- Content presets:
-  - `natural`, `anime`, `ui`
-- Core algorithms implemented in runtime:
-  - linear-light processing + perceptual color distance (OKLab)
-  - adaptive edge thresholds with global/local/hybrid modes
-  - multi-scale edge analysis with normalized Laplacian scale selection
-  - structure tensor + orientation/coherence stats per cell
-  - unified glyph selection loss (brightness/orientation/contrast/frequency/texture)
-  - frequency-domain glyph matching (8x16 DCT signatures)
-  - texture-aware glyph selection (multi-frequency Gabor responses)
-  - motion-aware temporal smoothing (phase-correlation assisted flow blending)
-  - temporal wavelet flicker suppression (multi-level Haar shrinkage)
-  - anisotropic diffusion (edge-preserving smoothing)
-  - bilateral-grid-based color smoothing
-  - quad-tree adaptive cell detail levels
-  - block-art spectral palette quantization
-  - halftone/blue-noise style dithering path
-
-## Repository Layout
+## Project Layout
 
 ```text
 src/
-  core/        # pipeline, frame sources, edge, temporal, motion, config, replay
-  glyph/       # font loading, glyph cache, char sets
-  mapping/     # glyph selector, color mapper, bilateral grid
-  render/      # terminal, block-art, bitmap, video encoder, dither
-  terminal/    # terminal capability and ANSI output
-  audio/       # audio decode/playback
-  cli/         # argument parsing and help
+  core/        pipeline, config, frame sources, motion, temporal, replay
+  glyph/       font loading, glyph cache, char sets
+  mapping/     glyph and color mapping
+  render/      terminal/block/bitmap rendering + encoder + dithering
+  terminal/    terminal capabilities/output
+  audio/       audio playback/sync
+  cli/         CLI parsing
 
-tests/         # unit/integration-style executable targets
-assets/        # project assets
-docs: PLAN.md, IMPLEMENTATION.md, ROADMAP.md, QUESTIONS.md, AUDIT.md
+tests/          test targets
+vendor/         vendored single-header dependencies
+assets/         project assets
 ```
 
 ## Requirements
 
-## Windows (recommended path in this repo)
+### Windows
 
-- Visual Studio 2022 Build Tools or Community (Desktop C++ workload)
+- Visual Studio 2022 (Build Tools or Community) with C++ desktop tools
 - CMake
 - Ninja
 - Git
 
-Dependencies are installed via local vcpkg by script:
+Dependencies installed by script:
+
 - SDL2
 - FFmpeg
 - zstd
 
-## Linux/macOS
+### Linux/macOS
 
 - C++20 compiler
 - CMake
-- SDL2, FFmpeg, zstd development packages
-- Optional: OpenCV 4.x (if building with `ASCII_USE_OPENCV=ON`)
+- SDL2 + FFmpeg + zstd development packages
+- Optional OpenCV 4.x (if enabling `ASCII_USE_OPENCV=ON`)
 
 ## Build
 
-## Windows quick build (no OpenCV)
+### Windows quick start (recommended)
 
-From repository root:
+From repo root:
 
 ```bat
 setup_windows_deps.cmd
 build_noopencv_check.cmd
 ```
 
-This builds `ascii-engine.exe` in `build-noopencv`.
+Output binary:
 
-## Generic CMake build
+```text
+build-noopencv\ascii-engine.exe
+```
+
+### Generic CMake
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DASCII_USE_OPENCV=OFF
 cmake --build build --target ascii-engine -j
 ```
 
-If OpenCV is available:
+With OpenCV:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DASCII_USE_OPENCV=ON
@@ -104,124 +82,116 @@ cmake --build build --target ascii-engine -j
 
 ## Usage
 
-Show CLI help:
+Show help:
 
-```bash
-ascii-engine --help
+```powershell
+.\build-noopencv\ascii-engine.exe --help
 ```
 
-Run video:
+Run a video:
 
-```bash
-ascii-engine input.mp4
+```powershell
+.\build-noopencv\ascii-engine.exe ".\media\clip.mp4"
 ```
 
-Run image:
+Run a single image:
 
-```bash
-ascii-engine image.png --cols 120 --rows 40 --profile ui
+```powershell
+.\build-noopencv\ascii-engine.exe ".\images\shot.png" --profile ui --cols 120 --rows 40
 ```
 
-Webcam:
+Use webcam:
 
-```bash
-ascii-engine webcam --fps 30
+```powershell
+.\build-noopencv\ascii-engine.exe webcam --fps 30
 ```
 
-Video output:
+Export encoded video:
 
-```bash
-ascii-engine input.mp4 -o out.mp4
+```powershell
+.\build-noopencv\ascii-engine.exe ".\media\clip.mp4" -o out.mp4
 ```
 
-Text frame export:
+Export text output:
 
-```bash
-ascii-engine input.mp4 -o out.txt
+```powershell
+.\build-noopencv\ascii-engine.exe ".\media\clip.mp4" -o out.txt
 ```
 
-Replay export:
+Write replay:
 
-```bash
-ascii-engine input.mp4 --replay run.areplay
+```powershell
+.\build-noopencv\ascii-engine.exe ".\media\clip.mp4" --replay run.areplay
 ```
 
-### Useful Flags
+### Common Flags
 
 - `--profile natural|anime|ui`
 - `--char-set basic|blocks|line-art`
 - `--color none|16|256|truecolor|blockart`
-- `--fps N`, `--cols N`, `--rows N`
-- `--edge-thresh X`, `--blur X`, `--temporal X`
+- `--fps N --cols N --rows N`
+- `--edge-thresh X --blur X --temporal X`
 - `--scale fit|fill|stretch`
-- `--font PATH`
+- `--font <PATH>`
 - `--no-audio`
 - `--debug grayscale|edges|orientation`
 - `--profile-live`
 - `--strict-memory`
 
-### Interactive Controls (playback)
+### Interactive Controls
 
 - `Space`: pause/resume
 - `q` or `Esc`: quit
 - `c`: cycle color mode
-- `+` / `-`: raise/lower edge threshold
+- `+` / `-`: adjust edge threshold
 
 ## Config
 
-Default config path:
+Default config file location:
 
 - Linux: `~/.config/ascii-engine/config.toml`
 - macOS: `~/Library/Application Support/ascii-engine/config.toml`
 - Windows: `%APPDATA%\ascii-engine\config.toml`
 
-Effective precedence:
+Precedence:
 
 1. built-in defaults
 2. config file
-3. CLI flags
+3. CLI overrides
 
-Profile behavior (`PRESETS.md`):
-
-- profile defaults are applied before explicit CLI overrides.
+Presets are documented in `PRESETS.md`.
 
 ## Troubleshooting
 
-## `SDL2 not found` during CMake configure
+### `SDL2 not found` at configure time (Windows)
 
-On Windows, run:
+Run:
 
 ```bat
 setup_windows_deps.cmd
 ```
 
-Then rebuild with:
+Then rebuild:
 
 ```bat
 build_noopencv_check.cmd
 ```
 
-## Single image fails to open
+### Image fails to open
 
-Ensure you are running a freshly rebuilt binary after pulling code changes. The image path is detected by extension and decoded through the image pipeline.
+- Rebuild and run the latest executable.
+- Use full path or a valid relative path.
+- Confirm extension is supported (`png/jpg/jpeg/bmp/gif/tiff/webp`).
 
-## Output looks too busy / noisy
+### Output looks too busy
 
-- reduce grid density (`--cols`, `--rows`)
-- use `--profile ui` for screenshots/text-heavy content
-- raise `--edge-thresh` and/or `--blur`
-- use `--color truecolor` or `--color none` for clean readability
+- Lower grid density (`--cols`, `--rows`).
+- Use `--profile ui` for screenshots and UI content.
+- Increase `--edge-thresh` and/or `--blur`.
+- Use `--color truecolor` or `--color none` for cleaner output.
 
-## Development Notes
+## Notes
 
-- Build settings and dependency wiring: `CMakeLists.txt`
-- Windows dependency bootstrap: `setup_windows_deps.cmd`
-- Windows no-OpenCV build helper: `build_noopencv_check.cmd`
-- Preset documentation: `PRESETS.md`
-- Roadmap and implementation contracts:
-  - `PLAN.md`
-  - `IMPLEMENTATION.md`
-  - `ROADMAP.md`
-  - `QUESTIONS.md`
-  - `AUDIT.md`
-
+- Main build config: `CMakeLists.txt`
+- Windows scripts: `setup_windows_deps.cmd`, `build_noopencv_check.cmd`
+- Presets: `PRESETS.md`
