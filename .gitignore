@@ -1,0 +1,54 @@
+# Build directories and generated files
+/build/
+/build-noopencv/
+/build-vs/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Makefile
+/build.ninja
+/rules.ninja
+/compile_commands.json
+/install_manifest.txt
+
+# Ninja / CMake internals
+/.ninja_deps
+/.ninja_log
+/.cmake/
+
+# Local caches and dependency checkouts
+/.cache/
+/.tools/
+
+# IDE and editor files
+/.vs/
+/.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.tmp
+*.bak
+
+# Binary and object outputs
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exp
+*.ilk
+*.pdb
+*.exe
+
+# Project runtime artifacts
+*.log
+*.areplay
+/output.txt
+/test_critical_fixes
+/images/
