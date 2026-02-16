@@ -59,11 +59,23 @@ if errorlevel 1 (
     goto :done
 )
 
+if exist "build-noopencv\ascii-engine.exe" (
+    echo [INFO] Releasing old ascii-engine.exe lock if present...
+    taskkill /F /IM ascii-engine.exe >nul 2>&1
+    timeout /t 1 /nobreak >nul
+)
+
 cmake --build build-noopencv --target ascii-engine -j 4
 if errorlevel 1 (
-    echo [ERROR] Build failed.
-    set "EXITCODE=!errorlevel!"
-    goto :done
+    echo [WARN] Build failed. Retrying once after lock cleanup...
+    taskkill /F /IM ascii-engine.exe >nul 2>&1
+    timeout /t 1 /nobreak >nul
+    cmake --build build-noopencv --target ascii-engine -j 4
+    if errorlevel 1 (
+        echo [ERROR] Build failed.
+        set "EXITCODE=!errorlevel!"
+        goto :done
+    )
 )
 
 echo [OK] Build completed successfully.

@@ -18,6 +18,7 @@ else()
 endif()
 
 option(ASCII_USE_OPENCV "Enable OpenCV utility paths" ON)
+option(ASCII_ENABLE_AVX2 "Enable AVX2 optimized kernels where supported" OFF)
 
 if(ASCII_USE_OPENCV)
     find_package(OpenCV 4.0 REQUIRED)
@@ -143,6 +144,14 @@ if(MSVC)
     target_compile_definitions(ascii-engine PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(ascii-engine PRIVATE -Wall -Wextra)
+endif()
+
+if(ASCII_ENABLE_AVX2)
+    if(MSVC)
+        target_compile_options(ascii-engine PRIVATE /arch:AVX2)
+    else()
+        target_compile_options(ascii-engine PRIVATE -mavx2)
+    endif()
 endif()
 
 if(WIN32)

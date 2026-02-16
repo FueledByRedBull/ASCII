@@ -120,7 +120,78 @@ float corr_magnitude(const std::vector<std::complex<float>>& corr, int n, int ix
     return std::abs(corr[static_cast<size_t>(iy) * n + ix]);
 }
 
-MotionVector estimate_phase_correlation_shift(const FloatImage& prev, const FloatImage& curr, int radius) {
+int wrap_signed_shift(int s, int n) {
+    const int half = n / 2;
+    while (s > half) s -= n;
+    while (s < -half) s += n;
+    return s;
+}
+
+FloatImage downsample_half(const FloatImage& src) {
+    const int src_w = src.width();
+    const int src_h = src.height();
+    const int dst_w = std::max(1, src_w / 2);
+    const int dst_h = std::max(1, src_h / 2);
+    FloatImage dst(dst_w, dst_h, 0.0f);
+
+    for (int y = 0; y < dst_h; ++y) {
+        for (int x = 0; x < dst_w; ++x) {
+            const int sx = x * 2;
+            const int sy = y * 2;
+            float sum = src.get(sx, sy) +
+                        src.get(std::min(sx + 1, src_w - 1), sy) +
+                        src.get(sx, std::min(sy + 1, src_h - 1)) +
+                        src.get(std::min(sx + 1, src_w - 1), std::min(sy + 1, src_h - 1));
+            dst.set(x, y, 0.25f * sum);
+        }
+    }
+    return dst;
+}
+
+FloatImage upsample_flow_field(const FloatImage& src, int dst_w, int dst_h, float scale) {
+    FloatImage dst(dst_w, dst_h, 0.0f);
+    if (src.empty() || dst_w <= 0 || dst_h <= 0) {
+        return dst;
+    }
+
+    const float sx_scale = static_cast<float>(src.width()) / static_cast<float>(std::max(1, dst_w));
+    const float sy_scale = static_cast<float>(src.height()) / static_cast<float>(std::max(1, dst_h));
+
+    for (int y = 0; y < dst_h; ++y) {
+        float sy = (static_cast<float>(y) + 0.5f) * sy_scale - 0.5f;
+        int y0 = static_cast<int>(std::floor(sy));
+        int y1 = y0 + 1;
+        float ty = sy - static_cast<float>(y0);
+        y0 = std::clamp(y0, 0, src.height() - 1);
+        y1 = std::clamp(y1, 0, src.height() - 1);
+
+        for (int x = 0; x < dst_w; ++x) {
+            float sx = (static_cast<float>(x) + 0.5f) * sx_scale - 0.5f;
+            int x0 = static_cast<int>(std::floor(sx));
+            int x1 = x0 + 1;
+            float tx = sx - static_cast<float>(x0);
+            x0 = std::clamp(x0, 0, src.width() - 1);
+            x1 = std::clamp(x1, 0, src.width() - 1);
+
+            float v00 = src.get(x0, y0);
+            float v10 = src.get(x1, y0);
+            float v01 = src.get(x0, y1);
+            float v11 = src.get(x1, y1);
+            float v0 = v00 + (v10 - v00) * tx;
+            float v1 = v01 + (v11 - v01) * tx;
+            dst.set(x, y, (v0 + (v1 - v0) * ty) * scale);
+        }
+    }
+
+    return dst;
+}
+
+MotionVector estimate_phase_correlation_shift(
+    const FloatImage& prev,
+    const FloatImage& curr,
+    int radius,
+    float center_dx = 0.0f,
+    float center_dy = 0.0f) {
     MotionVector mv{};
     if (radius < 1) {
         return mv;
@@ -156,6 +227,8 @@ MotionVector estimate_phase_correlation_shift(const FloatImage& prev, const Floa
     fft_2d(r.data(), n, n, true);
 
     const int search = std::clamp(radius, 1, std::max(1, n / 2 - 1));
+    const int center_ix = static_cast<int>(std::lround(center_dx));
+    const int center_iy = static_cast<int>(std::lround(center_dy));
     float best = -1.0f;
     float second = -1.0f;
     int best_dx = 0;
@@ -164,16 +237,18 @@ MotionVector estimate_phase_correlation_shift(const FloatImage& prev, const Floa
     int samples = 0;
     for (int dy = -search; dy <= search; ++dy) {
         for (int dx = -search; dx <= search; ++dx) {
-            const int ix = (dx >= 0) ? dx : (n + dx);
-            const int iy = (dy >= 0) ? dy : (n + dy);
+            int cand_dx = wrap_signed_shift(center_ix + dx, n);
+            int cand_dy = wrap_signed_shift(center_iy + dy, n);
+            const int ix = (cand_dx >= 0) ? cand_dx : (n + cand_dx);
+            const int iy = (cand_dy >= 0) ? cand_dy : (n + cand_dy);
             float v = std::abs(r[static_cast<size_t>(iy) * n + ix]);
             sum += v;
             samples++;
             if (v > best) {
                 second = best;
                 best = v;
-                best_dx = dx;
-                best_dy = dy;
+                best_dx = cand_dx;
+                best_dy = cand_dy;
             } else if (v > second) {
                 second = v;
             }
@@ -208,6 +283,64 @@ MotionVector estimate_phase_correlation_shift(const FloatImage& prev, const Floa
     return mv;
 }
 
+MotionVector estimate_phase_correlation_hierarchical(const FloatImage& prev,
+                                                     const FloatImage& curr,
+                                                     int radius,
+                                                     int max_levels) {
+    MotionVector mv{};
+    if (prev.empty() || curr.empty() || prev.width() != curr.width() || prev.height() != curr.height()) {
+        return mv;
+    }
+
+    std::vector<FloatImage> prev_levels;
+    std::vector<FloatImage> curr_levels;
+    prev_levels.push_back(prev);
+    curr_levels.push_back(curr);
+
+    const int levels_target = std::clamp(max_levels, 1, 4);
+    for (int l = 1; l < levels_target; ++l) {
+        const FloatImage& p = prev_levels.back();
+        const FloatImage& c = curr_levels.back();
+        if (p.width() < 32 || p.height() < 32 || c.width() < 32 || c.height() < 32) {
+            break;
+        }
+        prev_levels.push_back(downsample_half(p));
+        curr_levels.push_back(downsample_half(c));
+    }
+
+    float pred_dx = 0.0f;
+    float pred_dy = 0.0f;
+    MotionVector last{};
+    const int top = static_cast<int>(prev_levels.size()) - 1;
+    for (int l = top; l >= 0; --l) {
+        if (l != top) {
+            pred_dx *= 2.0f;
+            pred_dy *= 2.0f;
+        }
+        int local_radius = std::max(1, radius >> l);
+        local_radius = std::min(local_radius, std::max(2, radius));
+
+        MotionVector level_mv = estimate_phase_correlation_shift(
+            prev_levels[static_cast<size_t>(l)],
+            curr_levels[static_cast<size_t>(l)],
+            local_radius,
+            pred_dx,
+            pred_dy);
+
+        if (l != top && level_mv.confidence < 0.02f) {
+            level_mv.dx = pred_dx;
+            level_mv.dy = pred_dy;
+            level_mv.confidence = last.confidence * 0.85f;
+        }
+
+        pred_dx = level_mv.dx;
+        pred_dy = level_mv.dy;
+        last = level_mv;
+    }
+
+    return last;
+}
+
 }  // namespace
 
 MotionEstimator::MotionEstimator(const Config& config) : config_(config) {}
@@ -223,16 +356,19 @@ void MotionEstimator::reset() {
 }
 
 void MotionEstimator::build_pyramid(const FloatImage& img, FloatImage* pyramid, int levels) {
+    for (int i = 1; i < 4; ++i) {
+        pyramid[i] = FloatImage();
+    }
     pyramid[0] = img;
     
-    for (int l = 1; l < levels; ++l) {
+    int capped_levels = std::clamp(levels, 1, 4);
+    for (int l = 1; l < capped_levels; ++l) {
         int src_w = pyramid[l-1].width();
         int src_h = pyramid[l-1].height();
         int dst_w = src_w / 2;
         int dst_h = src_h / 2;
         
         if (dst_w < 8 || dst_h < 8) {
-            levels = l;
             break;
         }
         
@@ -392,35 +528,84 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
     height_ = prev.height();
     flow_.assign(width_ * height_, MotionVector{});
     
-    build_pyramid(prev, prev_pyramid_, config_.pyramid_levels);
-    build_pyramid(curr, curr_pyramid_, config_.pyramid_levels);
+    int requested_levels = std::clamp(config_.pyramid_levels, 1, 4);
+    build_pyramid(prev, prev_pyramid_, requested_levels);
+    build_pyramid(curr, curr_pyramid_, requested_levels);
+
+    int levels_available = 1;
+    for (int l = 1; l < requested_levels; ++l) {
+        if (prev_pyramid_[l].empty() || curr_pyramid_[l].empty()) {
+            break;
+        }
+        levels_available = l + 1;
+    }
     
     FloatImage flow_x, flow_y;
-    
-    for (int iter = 0; iter < config_.iterations; ++iter) {
+
+    // Coarse-to-fine estimation: significantly cheaper than repeated full-resolution solves.
+    for (int l = levels_available - 1; l >= 0; --l) {
+        const FloatImage& p = prev_pyramid_[l];
+        const FloatImage& c = curr_pyramid_[l];
+        if (p.empty() || c.empty()) {
+            continue;
+        }
+
+        FloatImage level_fx, level_fy;
+        compute_farneback_level(p, c, level_fx, level_fy);
+
+        if (flow_x.empty()) {
+            flow_x = std::move(level_fx);
+            flow_y = std::move(level_fy);
+            continue;
+        }
+
+        float scale_x = static_cast<float>(p.width()) / static_cast<float>(std::max(1, flow_x.width()));
+        float scale_y = static_cast<float>(p.height()) / static_cast<float>(std::max(1, flow_y.height()));
+        float scale = 0.5f * (scale_x + scale_y);
+        FloatImage up_x = upsample_flow_field(flow_x, p.width(), p.height(), scale);
+        FloatImage up_y = upsample_flow_field(flow_y, p.width(), p.height(), scale);
+        const float refine_weight = (l == 0) ? 0.65f : 0.50f;
+        const float keep_weight = 1.0f - refine_weight;
+        const int n = p.width() * p.height();
+        float* up_x_data = up_x.data();
+        float* up_y_data = up_y.data();
+        const float* level_x_data = level_fx.data();
+        const float* level_y_data = level_fy.data();
+        for (int i = 0; i < n; ++i) {
+            up_x_data[i] = keep_weight * up_x_data[i] + refine_weight * level_x_data[i];
+            up_y_data[i] = keep_weight * up_y_data[i] + refine_weight * level_y_data[i];
+        }
+
+        flow_x = std::move(up_x);
+        flow_y = std::move(up_y);
+    }
+
+    if (flow_x.empty() || flow_y.empty()) {
+        flow_x = FloatImage(width_, height_, 0.0f);
+        flow_y = FloatImage(width_, height_, 0.0f);
+    }
+
+    int extra_iters = std::max(0, config_.iterations - levels_available);
+    for (int iter = 0; iter < extra_iters; ++iter) {
         FloatImage fx, fy;
         compute_farneback_level(prev, curr, fx, fy);
-        
-        if (flow_x.empty()) {
-            flow_x = fx;
-            flow_y = fy;
-        } else {
-            for (int y = 0; y < height_; ++y) {
-                for (int x = 0; x < width_; ++x) {
-                    float old_x = flow_x.get(x, y);
-                    float old_y = flow_y.get(x, y);
-                    float new_x = fx.get(x, y);
-                    float new_y = fy.get(x, y);
-                    flow_x.set(x, y, old_x * 0.5f + new_x * 0.5f);
-                    flow_y.set(x, y, old_y * 0.5f + new_y * 0.5f);
-                }
-            }
+        const float blend = 0.35f;
+        const float keep = 1.0f - blend;
+        const int n = width_ * height_;
+        float* flow_x_data = flow_x.data();
+        float* flow_y_data = flow_y.data();
+        const float* fx_data = fx.data();
+        const float* fy_data = fy.data();
+        for (int i = 0; i < n; ++i) {
+            flow_x_data[i] = keep * flow_x_data[i] + blend * fx_data[i];
+            flow_y_data[i] = keep * flow_y_data[i] + blend * fy_data[i];
         }
     }
 
     MotionVector phase_mv{};
     if (config_.use_phase_correlation) {
-        phase_mv = estimate_phase_correlation_shift(prev, curr, config_.phase_search_radius);
+        phase_mv = estimate_phase_correlation_hierarchical(
+            prev, curr, config_.phase_search_radius, levels_available);
     }
     
     for (int y = 0; y < height_; ++y) {

@@ -3,12 +3,23 @@
 #include <queue>
 #include <cstring>
 #include <numeric>
+#include <cmath>
+
+#if defined(__AVX2__) || defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <immintrin.h>
+#endif
 
 #ifdef HAS_OPENMP
 #include <omp.h>
 #endif
 
 namespace ascii {
+
+namespace {
+
+constexpr int kCacheTile = 64;
+
+}  // namespace
 
 EdgeDetector::EdgeDetector(const Config& config) : config_(config) {}
 
@@ -33,16 +44,47 @@ GradientData EdgeDetector::compute_gradients(const FloatImage& input) {
     int h = blurred.height();
     result.magnitude = FloatImage(w, h);
     result.orientation = FloatImage(w, h);
+    const float* gx_data = result.gx.data();
+    const float* gy_data = result.gy.data();
+    float* mag_data = result.magnitude.data();
+    float* ori_data = result.orientation.data();
     
 #ifdef HAS_OPENMP
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(static)
 #endif
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float gx = result.gx.get(x, y);
-            float gy = result.gy.get(x, y);
-            result.magnitude.set(x, y, std::sqrt(gx*gx + gy*gy));
-            result.orientation.set(x, y, std::atan2(gy, gx));
+    for (int ty = 0; ty < h; ty += kCacheTile) {
+        int y_end = std::min(ty + kCacheTile, h);
+        for (int y = ty; y < y_end; ++y) {
+            int base = y * w;
+            int x = 0;
+
+#if defined(__AVX2__)
+            for (; x + 7 < w; x += 8) {
+                __m256 vx = _mm256_loadu_ps(gx_data + base + x);
+                __m256 vy = _mm256_loadu_ps(gy_data + base + x);
+                __m256 mag = _mm256_sqrt_ps(_mm256_add_ps(_mm256_mul_ps(vx, vx), _mm256_mul_ps(vy, vy)));
+                _mm256_storeu_ps(mag_data + base + x, mag);
+            }
+#endif
+
+#if !defined(__AVX2__) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+            for (; x + 3 < w; x += 4) {
+                __m128 vx = _mm_loadu_ps(gx_data + base + x);
+                __m128 vy = _mm_loadu_ps(gy_data + base + x);
+                __m128 mag = _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(vx, vx), _mm_mul_ps(vy, vy)));
+                _mm_storeu_ps(mag_data + base + x, mag);
+            }
+#endif
+
+            for (; x < w; ++x) {
+                float gxv = gx_data[base + x];
+                float gyv = gy_data[base + x];
+                mag_data[base + x] = std::sqrt(gxv * gxv + gyv * gyv);
+            }
+
+            for (int ox = 0; ox < w; ++ox) {
+                ori_data[base + ox] = std::atan2(gy_data[base + ox], gx_data[base + ox]);
+            }
         }
     }
     
@@ -523,40 +565,53 @@ FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
     for (float& k : kernel) k /= sum;
     
     FloatImage temp(w, h);
+    const float* in_data = input.data();
+    float* temp_data = temp.data();
 #ifdef HAS_OPENMP
     #pragma omp parallel for
 #endif
     for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float val = 0.0f;
-            float wsum = 0.0f;
-            for (int k = 0; k < ksize; ++k) {
-                int nx = x + k - radius;
-                if (nx >= 0 && nx < w) {
-                    val += input.get(nx, y) * kernel[k];
-                    wsum += kernel[k];
+        const float* in_row = in_data + static_cast<size_t>(y) * w;
+        float* temp_row = temp_data + static_cast<size_t>(y) * w;
+        for (int tx = 0; tx < w; tx += kCacheTile) {
+            int x_end = std::min(tx + kCacheTile, w);
+            for (int x = tx; x < x_end; ++x) {
+                float val = 0.0f;
+                float wsum = 0.0f;
+                for (int k = 0; k < ksize; ++k) {
+                    int nx = x + k - radius;
+                    if (nx >= 0 && nx < w) {
+                        val += in_row[nx] * kernel[k];
+                        wsum += kernel[k];
+                    }
                 }
+                temp_row[x] = val / std::max(wsum, 1e-12f);
             }
-            temp.set(x, y, val / wsum);
         }
     }
     
     FloatImage result(w, h);
+    const float* temp_ro = temp.data();
+    float* out_data = result.data();
 #ifdef HAS_OPENMP
     #pragma omp parallel for
 #endif
     for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float val = 0.0f;
-            float wsum = 0.0f;
-            for (int k = 0; k < ksize; ++k) {
-                int ny = y + k - radius;
-                if (ny >= 0 && ny < h) {
-                    val += temp.get(x, ny) * kernel[k];
-                    wsum += kernel[k];
+        float* out_row = out_data + static_cast<size_t>(y) * w;
+        for (int tx = 0; tx < w; tx += kCacheTile) {
+            int x_end = std::min(tx + kCacheTile, w);
+            for (int x = tx; x < x_end; ++x) {
+                float val = 0.0f;
+                float wsum = 0.0f;
+                for (int k = 0; k < ksize; ++k) {
+                    int ny = y + k - radius;
+                    if (ny >= 0 && ny < h) {
+                        val += temp_ro[static_cast<size_t>(ny) * w + x] * kernel[k];
+                        wsum += kernel[k];
+                    }
                 }
+                out_row[x] = val / std::max(wsum, 1e-12f);
             }
-            result.set(x, y, val / wsum);
         }
     }
     
@@ -569,34 +624,94 @@ void EdgeDetector::sobel(const FloatImage& input, FloatImage& gx, FloatImage& gy
     
     gx = FloatImage(w, h);
     gy = FloatImage(w, h);
-    
-    constexpr float kx[3][3] = {
-        {-1, 0, 1},
-        {-2, 0, 2},
-        {-1, 0, 1}
-    };
-    
-    constexpr float ky[3][3] = {
-        {-1, -2, -1},
-        {0, 0, 0},
-        {1, 2, 1}
-    };
-    
+
+    if (w < 3 || h < 3) {
+        return;
+    }
+
+    const float* src = input.data();
+    float* gx_data = gx.data();
+    float* gy_data = gy.data();
+
 #ifdef HAS_OPENMP
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(static)
 #endif
-    for (int y = 1; y < h - 1; ++y) {
-        for (int x = 1; x < w - 1; ++x) {
-            float sx = 0.0f, sy = 0.0f;
-            for (int ky_idx = 0; ky_idx < 3; ++ky_idx) {
-                for (int kx_idx = 0; kx_idx < 3; ++kx_idx) {
-                    float val = input.get(x + kx_idx - 1, y + ky_idx - 1);
-                    sx += val * kx[ky_idx][kx_idx];
-                    sy += val * ky[ky_idx][kx_idx];
+    for (int ty = 1; ty < h - 1; ty += kCacheTile) {
+        int y_end = std::min(ty + kCacheTile, h - 1);
+        for (int y = ty; y < y_end; ++y) {
+            const float* row0 = src + static_cast<size_t>(y - 1) * w;
+            const float* row1 = src + static_cast<size_t>(y) * w;
+            const float* row2 = src + static_cast<size_t>(y + 1) * w;
+            float* gx_row = gx_data + static_cast<size_t>(y) * w;
+            float* gy_row = gy_data + static_cast<size_t>(y) * w;
+
+            int x = 1;
+
+#if defined(__AVX2__)
+                const __m256 v_two = _mm256_set1_ps(2.0f);
+                const __m256 v_quarter = _mm256_set1_ps(0.25f);
+                for (; x + 7 < w - 1; x += 8) {
+                    __m256 tl = _mm256_loadu_ps(row0 + x - 1);
+                    __m256 tc = _mm256_loadu_ps(row0 + x);
+                    __m256 tr = _mm256_loadu_ps(row0 + x + 1);
+                    __m256 ml = _mm256_loadu_ps(row1 + x - 1);
+                    __m256 mr = _mm256_loadu_ps(row1 + x + 1);
+                    __m256 bl = _mm256_loadu_ps(row2 + x - 1);
+                    __m256 bc = _mm256_loadu_ps(row2 + x);
+                    __m256 br = _mm256_loadu_ps(row2 + x + 1);
+
+                    __m256 sx = _mm256_add_ps(
+                        _mm256_add_ps(_mm256_sub_ps(tr, tl), _mm256_mul_ps(v_two, _mm256_sub_ps(mr, ml))),
+                        _mm256_sub_ps(br, bl));
+                    __m256 sy = _mm256_add_ps(
+                        _mm256_add_ps(_mm256_sub_ps(bl, tl), _mm256_mul_ps(v_two, _mm256_sub_ps(bc, tc))),
+                        _mm256_sub_ps(br, tr));
+
+                    _mm256_storeu_ps(gx_row + x, _mm256_mul_ps(sx, v_quarter));
+                    _mm256_storeu_ps(gy_row + x, _mm256_mul_ps(sy, v_quarter));
                 }
+#endif
+
+#if !defined(__AVX2__) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+                const __m128 v_two = _mm_set1_ps(2.0f);
+                const __m128 v_quarter = _mm_set1_ps(0.25f);
+                for (; x + 3 < w - 1; x += 4) {
+                    __m128 tl = _mm_loadu_ps(row0 + x - 1);
+                    __m128 tc = _mm_loadu_ps(row0 + x);
+                    __m128 tr = _mm_loadu_ps(row0 + x + 1);
+                    __m128 ml = _mm_loadu_ps(row1 + x - 1);
+                    __m128 mr = _mm_loadu_ps(row1 + x + 1);
+                    __m128 bl = _mm_loadu_ps(row2 + x - 1);
+                    __m128 bc = _mm_loadu_ps(row2 + x);
+                    __m128 br = _mm_loadu_ps(row2 + x + 1);
+
+                    __m128 sx = _mm_add_ps(
+                        _mm_add_ps(_mm_sub_ps(tr, tl), _mm_mul_ps(v_two, _mm_sub_ps(mr, ml))),
+                        _mm_sub_ps(br, bl));
+                    __m128 sy = _mm_add_ps(
+                        _mm_add_ps(_mm_sub_ps(bl, tl), _mm_mul_ps(v_two, _mm_sub_ps(bc, tc))),
+                        _mm_sub_ps(br, tr));
+
+                    _mm_storeu_ps(gx_row + x, _mm_mul_ps(sx, v_quarter));
+                    _mm_storeu_ps(gy_row + x, _mm_mul_ps(sy, v_quarter));
+                }
+#endif
+
+            for (; x < w - 1; ++x) {
+                float tl = row0[x - 1];
+                float tc = row0[x];
+                float tr = row0[x + 1];
+                float ml = row1[x - 1];
+                float mr = row1[x + 1];
+                float bl = row2[x - 1];
+                float bc = row2[x];
+                float br = row2[x + 1];
+
+                float sx = (tr - tl) + 2.0f * (mr - ml) + (br - bl);
+                float sy = (bl - tl) + 2.0f * (bc - tc) + (br - tr);
+                gx_row[x] = sx * 0.25f;
+                gy_row[x] = sy * 0.25f;
             }
-            gx.set(x, y, sx / 4.0f);
-            gy.set(x, y, sy / 4.0f);
         }
     }
 }
