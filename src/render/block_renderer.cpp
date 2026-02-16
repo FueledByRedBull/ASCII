@@ -17,6 +17,73 @@ void BlockRenderer::set_grid_size(int cols, int rows) {
     rows_ = rows;
 }
 
+BlockRenderer::CellData BlockRenderer::analyze_cell(const FloatImage& luminance,
+                                                    const FrameBuffer& color_buffer,
+                                                    int cell_x,
+                                                    int cell_y,
+                                                    int cell_width,
+                                                    int cell_height,
+                                                    const CellStats& stats) const {
+    CellData data;
+    data.mean_r = stats.mean_r;
+    data.mean_g = stats.mean_g;
+    data.mean_b = stats.mean_b;
+    data.mean_luminance = stats.mean_luminance;
+    data.is_edge_cell = stats.is_edge_cell;
+
+    const int px0 = cell_x * cell_width;
+    const int py0 = cell_y * cell_height;
+    const int px1 = std::min(px0 + cell_width, luminance.width());
+    const int py1 = std::min(py0 + cell_height, luminance.height());
+    const int pmx = (px0 + px1) / 2;
+    const int pmy = (py0 + py1) / 2;
+
+    auto accumulate_quad = [&](int sx0, int sy0, int sx1, int sy1,
+                               float& out_lum, float& out_r, float& out_g, float& out_b) {
+        double sum_l = 0.0;
+        double sum_r = 0.0;
+        double sum_g = 0.0;
+        double sum_b = 0.0;
+        int count = 0;
+
+        for (int yy = sy0; yy < sy1; ++yy) {
+            for (int xx = sx0; xx < sx1; ++xx) {
+                sum_l += luminance.get(xx, yy);
+                Color c = color_buffer.get_pixel(xx, yy);
+                LinearColor lc = ColorSpace::srgb_to_linear(c.r, c.g, c.b);
+                sum_r += lc.r;
+                sum_g += lc.g;
+                sum_b += lc.b;
+                ++count;
+            }
+        }
+
+        if (count > 0) {
+            const float inv = 1.0f / static_cast<float>(count);
+            out_lum = static_cast<float>(sum_l) * inv;
+            out_r = static_cast<float>(sum_r) * inv;
+            out_g = static_cast<float>(sum_g) * inv;
+            out_b = static_cast<float>(sum_b) * inv;
+        } else {
+            out_lum = data.mean_luminance;
+            out_r = data.mean_r;
+            out_g = data.mean_g;
+            out_b = data.mean_b;
+        }
+    };
+
+    accumulate_quad(px0, py0, pmx, pmy,
+                    data.top_left_lum, data.top_left_r, data.top_left_g, data.top_left_b);
+    accumulate_quad(pmx, py0, px1, pmy,
+                    data.top_right_lum, data.top_right_r, data.top_right_g, data.top_right_b);
+    accumulate_quad(px0, pmy, pmx, py1,
+                    data.bottom_left_lum, data.bottom_left_r, data.bottom_left_g, data.bottom_left_b);
+    accumulate_quad(pmx, pmy, px1, py1,
+                    data.bottom_right_lum, data.bottom_right_r, data.bottom_right_g, data.bottom_right_b);
+
+    return data;
+}
+
 BlockRenderer::ColorPair BlockRenderer::find_best_color_pair(const CellData& data, float coverage) const {
     ColorPair result;
     

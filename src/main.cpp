@@ -475,6 +475,14 @@ int main(int argc, char* argv[]) {
     int cell_stats_reuse_frames = 0;
     std::vector<float> prev_scene_signature;
     std::vector<float> curr_scene_signature;
+
+    auto invalidate_pipeline_cache = [&]() {
+        have_cached_pipeline_result = false;
+        cached_pipeline_has_color_buffer = false;
+        pipeline_reuse_frames = 0;
+        have_cached_cell_stats = false;
+        cell_stats_reuse_frames = 0;
+    };
     
     while (running && source->read(frame)) {
         auto start = std::chrono::high_resolution_clock::now();
@@ -500,31 +508,19 @@ int main(int argc, char* argv[]) {
                 auto dc = ditherer.config();
                 dc.enabled = (color_mode == ascii::ColorMode::Ansi16 || color_mode == ascii::ColorMode::Ansi256);
                 ditherer.set_config(dc);
-                have_cached_pipeline_result = false;
-                cached_pipeline_has_color_buffer = false;
-                pipeline_reuse_frames = 0;
-                have_cached_cell_stats = false;
-                cell_stats_reuse_frames = 0;
+                invalidate_pipeline_cache();
             } else if (key == '+' || key == '=') {
                 edge_threshold = std::min(1.0f, edge_threshold + 0.05f);
                 pipeline_cfg.edge_low = edge_threshold * 0.5f;
                 pipeline_cfg.edge_high = edge_threshold;
                 pipeline.set_config(pipeline_cfg);
-                have_cached_pipeline_result = false;
-                cached_pipeline_has_color_buffer = false;
-                pipeline_reuse_frames = 0;
-                have_cached_cell_stats = false;
-                cell_stats_reuse_frames = 0;
+                invalidate_pipeline_cache();
             } else if (key == '-') {
                 edge_threshold = std::max(0.0f, edge_threshold - 0.05f);
                 pipeline_cfg.edge_low = edge_threshold * 0.5f;
                 pipeline_cfg.edge_high = edge_threshold;
                 pipeline.set_config(pipeline_cfg);
-                have_cached_pipeline_result = false;
-                cached_pipeline_has_color_buffer = false;
-                pipeline_reuse_frames = 0;
-                have_cached_cell_stats = false;
-                cell_stats_reuse_frames = 0;
+                invalidate_pipeline_cache();
             }
         }
         
@@ -750,59 +746,14 @@ int main(int argc, char* argv[]) {
                                   (allow_mixed_block && effective_stats.adaptive_level >= 2);
 
             if (use_block_cell) {
-                ascii::BlockRenderer::CellData block_data;
-                block_data.mean_r = effective_stats.mean_r;
-                block_data.mean_g = effective_stats.mean_g;
-                block_data.mean_b = effective_stats.mean_b;
-                block_data.mean_luminance = smoothed_lum;
-                block_data.is_edge_cell = effective_stats.is_edge_cell;
-
-                int px0 = cell_x * config.grid.cell_width;
-                int py0 = cell_y * config.grid.cell_height;
-                int px1 = std::min(px0 + config.grid.cell_width, result.luminance.width());
-                int py1 = std::min(py0 + config.grid.cell_height, result.luminance.height());
-                int pmx = (px0 + px1) / 2;
-                int pmy = (py0 + py1) / 2;
-
-                auto accumulate_quad = [&](int sx0, int sy0, int sx1, int sy1,
-                                           float& out_lum, float& out_r, float& out_g, float& out_b) {
-                    double sum_l = 0.0;
-                    double sum_r = 0.0;
-                    double sum_g = 0.0;
-                    double sum_b = 0.0;
-                    int cnt = 0;
-                    for (int yy = sy0; yy < sy1; ++yy) {
-                        for (int xx = sx0; xx < sx1; ++xx) {
-                            sum_l += result.luminance.get(xx, yy);
-                            ascii::Color c = result.color_buffer.get_pixel(xx, yy);
-                            ascii::LinearColor lc = ascii::ColorSpace::srgb_to_linear(c.r, c.g, c.b);
-                            sum_r += lc.r;
-                            sum_g += lc.g;
-                            sum_b += lc.b;
-                            cnt++;
-                        }
-                    }
-                    if (cnt > 0) {
-                        out_lum = static_cast<float>(sum_l / cnt);
-                        out_r = static_cast<float>(sum_r / cnt);
-                        out_g = static_cast<float>(sum_g / cnt);
-                        out_b = static_cast<float>(sum_b / cnt);
-                    } else {
-                        out_lum = smoothed_lum;
-                        out_r = effective_stats.mean_r;
-                        out_g = effective_stats.mean_g;
-                        out_b = effective_stats.mean_b;
-                    }
-                };
-
-                accumulate_quad(px0, py0, pmx, pmy,
-                                block_data.top_left_lum, block_data.top_left_r, block_data.top_left_g, block_data.top_left_b);
-                accumulate_quad(pmx, py0, px1, pmy,
-                                block_data.top_right_lum, block_data.top_right_r, block_data.top_right_g, block_data.top_right_b);
-                accumulate_quad(px0, pmy, pmx, py1,
-                                block_data.bottom_left_lum, block_data.bottom_left_r, block_data.bottom_left_g, block_data.bottom_left_b);
-                accumulate_quad(pmx, pmy, px1, py1,
-                                block_data.bottom_right_lum, block_data.bottom_right_r, block_data.bottom_right_g, block_data.bottom_right_b);
+                ascii::BlockRenderer::CellData block_data = block_renderer.analyze_cell(
+                    result.luminance,
+                    result.color_buffer,
+                    cell_x,
+                    cell_y,
+                    config.grid.cell_width,
+                    config.grid.cell_height,
+                    effective_stats);
                 
                 auto block_result = block_renderer.render_cell(block_data);
                 float block_score = std::clamp(1.0f - std::abs(block_data.top_left_lum - block_data.bottom_right_lum), 0.0f, 1.0f);

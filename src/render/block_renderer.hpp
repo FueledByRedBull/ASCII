@@ -49,6 +49,14 @@ public:
         
         bool is_edge_cell = false;
     };
+
+    CellData analyze_cell(const FloatImage& luminance,
+                          const FrameBuffer& color_buffer,
+                          int cell_x,
+                          int cell_y,
+                          int cell_width,
+                          int cell_height,
+                          const CellStats& stats) const;
     
     BlockCell render_cell(const CellData& data) const;
     

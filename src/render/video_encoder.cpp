@@ -32,9 +32,28 @@ bool ends_with_ci(const std::string& value, const std::string& suffix) {
 }
 
 AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output) {
-    if (!codec || !codec->pix_fmts) {
-        return gif_output ? AV_PIX_FMT_RGB8 : AV_PIX_FMT_YUV420P;
+    const AVPixelFormat fallback = gif_output ? AV_PIX_FMT_RGB8 : AV_PIX_FMT_YUV420P;
+    if (!codec) {
+        return fallback;
     }
+
+    const void* raw_formats = nullptr;
+    int num_formats = 0;
+    const int ret = avcodec_get_supported_config(
+        nullptr, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &raw_formats, &num_formats);
+    if (ret < 0 || !raw_formats || num_formats <= 0) {
+        return fallback;
+    }
+
+    const auto* pix_fmts = static_cast<const AVPixelFormat*>(raw_formats);
+    auto has_format = [&](AVPixelFormat fmt) -> bool {
+        for (int i = 0; i < num_formats; ++i) {
+            if (pix_fmts[i] == fmt) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     if (gif_output) {
         const AVPixelFormat preferred[] = {
@@ -43,21 +62,15 @@ AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output) {
             AV_PIX_FMT_PAL8
         };
         for (AVPixelFormat pf : preferred) {
-            for (const AVPixelFormat* p = codec->pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
-                if (*p == pf) {
-                    return pf;
-                }
+            if (has_format(pf)) {
+                return pf;
             }
         }
-    } else {
-        for (const AVPixelFormat* p = codec->pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
-            if (*p == AV_PIX_FMT_YUV420P) {
-                return AV_PIX_FMT_YUV420P;
-            }
-        }
+    } else if (has_format(AV_PIX_FMT_YUV420P)) {
+        return AV_PIX_FMT_YUV420P;
     }
 
-    return codec->pix_fmts[0];
+    return pix_fmts[0];
 }
 
 bool contains_ci(const char* s, const char* needle) {
