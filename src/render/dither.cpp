@@ -1,136 +1,26 @@
 #include "dither.hpp"
+#include "blue_noise_64.hpp"
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 
 namespace ascii {
-
-namespace {
-
-std::array<float, 64 * 64> generate_blue_noise_64() {
-    constexpr int N = 64;
-    constexpr int TOTAL = N * N;
-    constexpr int R = 6;
-    constexpr float sigma = 1.5f;
-
-    struct KernelTap {
-        int dx;
-        int dy;
-        float w;
-    };
-
-    std::vector<KernelTap> kernel;
-    kernel.reserve((2 * R + 1) * (2 * R + 1));
-    for (int dy = -R; dy <= R; ++dy) {
-        for (int dx = -R; dx <= R; ++dx) {
-            float d2 = static_cast<float>(dx * dx + dy * dy);
-            float w = std::exp(-d2 / (2.0f * sigma * sigma));
-            kernel.push_back({dx, dy, w});
-        }
-    }
-
-    std::array<uint8_t, TOTAL> binary{};
-    std::array<float, TOTAL> energy{};
-    std::array<float, TOTAL> ranks{};
-    energy.fill(0.0f);
-    ranks.fill(0.0f);
-
-    auto wrap = [](int v) {
-        int r = v % N;
-        return (r < 0) ? (r + N) : r;
-    };
-
-    auto add_point_energy = [&](std::array<float, TOTAL>& emap, int px, int py, float sign) {
-        for (const auto& tap : kernel) {
-            int x = wrap(px + tap.dx);
-            int y = wrap(py + tap.dy);
-            emap[static_cast<size_t>(y) * N + x] += sign * tap.w;
-        }
-    };
-
-    uint32_t rng = 0x12345678u;
-    auto next_rand = [&]() -> uint32_t {
-        rng ^= rng << 13;
-        rng ^= rng >> 17;
-        rng ^= rng << 5;
-        return rng;
-    };
-
-    const int initial_ones = TOTAL / 10;
-    int seeded = 0;
-    while (seeded < initial_ones) {
-        int pos = static_cast<int>(next_rand() % TOTAL);
-        if (binary[static_cast<size_t>(pos)] == 0) {
-            binary[static_cast<size_t>(pos)] = 1;
-            add_point_energy(energy, pos % N, pos / N, 1.0f);
-            seeded++;
-        }
-    }
-
-    auto choose_extreme = [&](const std::array<uint8_t, TOTAL>& bits,
-                              const std::array<float, TOTAL>& emap,
-                              bool choose_on,
-                              bool choose_max) -> int {
-        int best_i = -1;
-        float best_v = choose_max ? -1e30f : 1e30f;
-        for (int i = 0; i < TOTAL; ++i) {
-            bool is_on = bits[static_cast<size_t>(i)] != 0;
-            if (is_on != choose_on) {
-                continue;
-            }
-            float e = emap[static_cast<size_t>(i)];
-            if ((choose_max && e > best_v) || (!choose_max && e < best_v)) {
-                best_v = e;
-                best_i = i;
-            }
-        }
-        return best_i;
-    };
-
-    auto temp_binary = binary;
-    auto temp_energy = energy;
-    for (int rank = initial_ones - 1; rank >= 0; --rank) {
-        int idx = choose_extreme(temp_binary, temp_energy, true, true);
-        if (idx < 0) {
-            break;
-        }
-        temp_binary[static_cast<size_t>(idx)] = 0;
-        ranks[static_cast<size_t>(idx)] = static_cast<float>(rank);
-        add_point_energy(temp_energy, idx % N, idx / N, -1.0f);
-    }
-
-    temp_binary = binary;
-    temp_energy = energy;
-    for (int rank = initial_ones; rank < TOTAL; ++rank) {
-        int idx = choose_extreme(temp_binary, temp_energy, false, false);
-        if (idx < 0) {
-            break;
-        }
-        temp_binary[static_cast<size_t>(idx)] = 1;
-        ranks[static_cast<size_t>(idx)] = static_cast<float>(rank);
-        add_point_energy(temp_energy, idx % N, idx / N, 1.0f);
-    }
-
-    const float inv = 1.0f / static_cast<float>(TOTAL - 1);
-    for (auto& v : ranks) {
-        v *= inv;
-    }
-    return ranks;
-}
-
-}  // namespace
 
 DitherBuffer::DitherBuffer(int width, int height) {
     resize(width, height);
 }
 
 void DitherBuffer::resize(int width, int height) {
+    if (width == width_ && height == height_) {
+        return;
+    }
     width_ = width;
     height_ = height;
-    error_r_.assign(static_cast<size_t>(width) * height, 0.0f);
-    error_g_.assign(static_cast<size_t>(width) * height, 0.0f);
-    error_b_.assign(static_cast<size_t>(width) * height, 0.0f);
+    stride_ = width + 2;
+    const size_t padded = static_cast<size_t>(height + 2) * stride_;
+    error_r_.assign(padded, 0.0f);
+    error_g_.assign(padded, 0.0f);
+    error_b_.assign(padded, 0.0f);
 }
 
 void DitherBuffer::reset() {
@@ -140,23 +30,19 @@ void DitherBuffer::reset() {
 }
 
 float DitherBuffer::get_error_r(int x, int y) const {
-    if (x < 0 || x >= width_ || y < 0 || y >= height_) return 0.0f;
-    return error_r_[y * width_ + x];
+    return error_r_[index(x, y)];
 }
 
 float DitherBuffer::get_error_g(int x, int y) const {
-    if (x < 0 || x >= width_ || y < 0 || y >= height_) return 0.0f;
-    return error_g_[y * width_ + x];
+    return error_g_[index(x, y)];
 }
 
 float DitherBuffer::get_error_b(int x, int y) const {
-    if (x < 0 || x >= width_ || y < 0 || y >= height_) return 0.0f;
-    return error_b_[y * width_ + x];
+    return error_b_[index(x, y)];
 }
 
 void DitherBuffer::add_error(int x, int y, float er, float eg, float eb) {
-    if (x < 0 || x >= width_ || y < 0 || y >= height_) return;
-    size_t idx = y * width_ + x;
+    size_t idx = index(x, y);
     error_r_[idx] = clamp_error(error_r_[idx] + er);
     error_g_[idx] = clamp_error(error_g_[idx] + eg);
     error_b_[idx] = clamp_error(error_b_[idx] + eb);
@@ -175,10 +61,10 @@ void DitherBuffer::distribute_error_serpentine(int x, int y, bool left_to_right,
 Ditherer::Ditherer(const Config& config) : config_(config) {}
 
 float Ditherer::blue_noise(int x, int y) {
-    static const std::array<float, 64 * 64> kBlueNoise64 = generate_blue_noise_64();
     int ix = ((x % 64) + 64) % 64;
     int iy = ((y % 64) + 64) % 64;
-    return kBlueNoise64[static_cast<size_t>(iy) * 64 + ix];
+    constexpr float kInvMaxRank = 1.0f / 4095.0f;
+    return static_cast<float>(kBlueNoiseRank64[static_cast<size_t>(iy) * 64 + ix]) * kInvMaxRank;
 }
 
 void Ditherer::begin_frame(int width, int height) {

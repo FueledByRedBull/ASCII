@@ -15,6 +15,7 @@ namespace ascii {
 
 Pipeline::Pipeline(const Config& config) : config_(config) {
     ColorSpace::init();
+    init_luminance_lut();
     
     EdgeDetector::Config edge_cfg;
     edge_cfg.blur_sigma = config.blur_sigma;
@@ -79,23 +80,31 @@ void Pipeline::set_config(const Config& config) {
     cell_aggregator_.set_config(cell_cfg);
 }
 
-FloatImage Pipeline::to_grayscale(const FrameBuffer& input) const {
-    FloatImage result(input.width(), input.height());
-    
+void Pipeline::init_luminance_lut() {
+    for (int i = 0; i < 256; ++i) {
+        const float lin = ColorSpace::srgb_to_linear(static_cast<uint8_t>(i));
+        lum_r_lut_[i] = 0.2126f * lin;
+        lum_g_lut_[i] = 0.7152f * lin;
+        lum_b_lut_[i] = 0.0722f * lin;
+    }
+}
+
+void Pipeline::to_grayscale(const FrameBuffer& input, FloatImage& output) const {
+    if (output.width() != input.width() || output.height() != input.height()) {
+        output = FloatImage(input.width(), input.height());
+    }
+
     const int total_pixels = input.width() * input.height();
     const uint8_t* src = input.data();
-    float* dst = result.data();
+    float* dst = output.data();
     
 #ifdef HAS_OPENMP
     #pragma omp parallel for
 #endif
     for (int i = 0; i < total_pixels; ++i) {
         int idx = i * 4;
-        LinearColor linear = ColorSpace::srgb_to_linear(src[idx], src[idx + 1], src[idx + 2]);
-        dst[i] = linear.luminance();
+        dst[i] = lum_r_lut_[src[idx]] + lum_g_lut_[src[idx + 1]] + lum_b_lut_[src[idx + 2]];
     }
-    
-    return result;
 }
 
 Pipeline::ResizePlan Pipeline::compute_resize_plan(int src_w, int src_h) const {
@@ -138,7 +147,7 @@ Pipeline::ResizePlan Pipeline::compute_resize_plan(int src_w, int src_h) const {
     return plan;
 }
 
-FloatImage Pipeline::resize_for_cells(const FloatImage& input) const {
+void Pipeline::resize_for_cells(const FloatImage& input, FloatImage& output) const {
     ResizePlan plan = compute_resize_plan(input.width(), input.height());
     
 #ifdef ASCII_USE_OPENCV
@@ -149,7 +158,11 @@ FloatImage Pipeline::resize_for_cells(const FloatImage& input) const {
     cv::Size scale_size(plan.scale_w, plan.scale_h);
     cv::resize(input_mat, scaled_mat, scale_size, 0, 0, cv::INTER_LINEAR);
     
-    FloatImage result(plan.target_w, plan.target_h, 0.0f);
+    if (output.width() != plan.target_w || output.height() != plan.target_h) {
+        output = FloatImage(plan.target_w, plan.target_h, 0.0f);
+    } else {
+        output.fill(0.0f);
+    }
     
     for (int y = 0; y < plan.scale_h; ++y) {
         int dst_y = y + plan.offset_y;
@@ -157,13 +170,15 @@ FloatImage Pipeline::resize_for_cells(const FloatImage& input) const {
         for (int x = 0; x < plan.scale_w; ++x) {
             int dst_x = x + plan.offset_x;
             if (dst_x < 0 || dst_x >= plan.target_w) continue;
-            result.set(dst_x, dst_y, scaled_mat.at<float>(y, x));
+            output.set(dst_x, dst_y, scaled_mat.at<float>(y, x));
         }
     }
-    
-    return result;
 #else
-    FloatImage result(plan.target_w, plan.target_h, 0.0f);
+    if (output.width() != plan.target_w || output.height() != plan.target_h) {
+        output = FloatImage(plan.target_w, plan.target_h, 0.0f);
+    } else {
+        output.fill(0.0f);
+    }
     
     float x_ratio = static_cast<float>(input.width()) / plan.scale_w;
     float y_ratio = static_cast<float>(input.height()) / plan.scale_h;
@@ -193,18 +208,17 @@ FloatImage Pipeline::resize_for_cells(const FloatImage& input) const {
             float v1 = v01 * (1 - fx) + v11 * fx;
             float v = v0 * (1 - fy) + v1 * fy;
             
-            result.set(dst_x, dst_y, v);
+            output.set(dst_x, dst_y, v);
         }
     }
-    
-    return result;
 #endif
 }
 
-FrameBuffer Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, int target_h) const {
+void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, int target_h, FrameBuffer& output) const {
     ResizePlan plan = compute_resize_plan(input.width(), input.height());
     if (input.width() == plan.target_w && input.height() == plan.target_h && config_.scale_mode == "stretch") {
-        return input;
+        output = input;
+        return;
     }
     
 #ifdef ASCII_USE_OPENCV
@@ -215,7 +229,11 @@ FrameBuffer Pipeline::resize_color_for_cells(const FrameBuffer& input, int targe
     cv::Size scale_size(plan.scale_w, plan.scale_h);
     cv::resize(input_mat, scaled_mat, scale_size, 0, 0, cv::INTER_LINEAR);
     
-    FrameBuffer result(target_w, target_h, Color(0, 0, 0, 255));
+    if (output.width() != target_w || output.height() != target_h) {
+        output = FrameBuffer(target_w, target_h, Color(0, 0, 0, 255));
+    } else {
+        output.fill(Color(0, 0, 0, 255));
+    }
     
     for (int y = 0; y < plan.scale_h; ++y) {
         int dst_y = y + plan.offset_y;
@@ -224,13 +242,15 @@ FrameBuffer Pipeline::resize_color_for_cells(const FrameBuffer& input, int targe
             int dst_x = x + plan.offset_x;
             if (dst_x < 0 || dst_x >= plan.target_w) continue;
             cv::Vec4b pixel = scaled_mat.at<cv::Vec4b>(y, x);
-            result.set_pixel(dst_x, dst_y, Color(pixel[0], pixel[1], pixel[2], pixel[3]));
+            output.set_pixel(dst_x, dst_y, Color(pixel[0], pixel[1], pixel[2], pixel[3]));
         }
     }
-    
-    return result;
 #else
-    FrameBuffer result(target_w, target_h, Color(0, 0, 0, 255));
+    if (output.width() != target_w || output.height() != target_h) {
+        output = FrameBuffer(target_w, target_h, Color(0, 0, 0, 255));
+    } else {
+        output.fill(Color(0, 0, 0, 255));
+    }
     
     float x_ratio = static_cast<float>(input.width()) / plan.scale_w;
     float y_ratio = static_cast<float>(input.height()) / plan.scale_h;
@@ -274,21 +294,19 @@ FrameBuffer Pipeline::resize_color_for_cells(const FrameBuffer& input, int targe
             uint8_t b = bilinear(2);
             uint8_t a = bilinear(3);
             
-            result.set_pixel(dst_x, dst_y, Color(r, g, b, a));
+            output.set_pixel(dst_x, dst_y, Color(r, g, b, a));
         }
     }
-    
-    return result;
 #endif
 }
 
 Pipeline::Result Pipeline::process(const FrameBuffer& input) {
     Result result;
-    
-    FloatImage gray = to_grayscale(input);
-    result.luminance = resize_for_cells(gray);
-    
-    result.color_buffer = resize_color_for_cells(input, result.luminance.width(), result.luminance.height());
+
+    to_grayscale(input, gray_buffer_);
+    resize_for_cells(gray_buffer_, result.luminance);
+
+    resize_color_for_cells(input, result.luminance.width(), result.luminance.height(), result.color_buffer);
 
     // Drive edge-mask generation through the detector's configured path
     // (multi-scale + adaptive thresholds), then compute gx/gy for cell stats.

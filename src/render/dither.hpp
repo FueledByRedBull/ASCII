@@ -32,11 +32,16 @@ private:
     std::vector<float> error_b_;
     int width_ = 0;
     int height_ = 0;
+    int stride_ = 0;
     
     static constexpr float ERROR_CLAMP = 0.12f;
     
     float clamp_error(float e) const {
         return std::clamp(e, -ERROR_CLAMP, ERROR_CLAMP);
+    }
+
+    size_t index(int x, int y) const {
+        return static_cast<size_t>(y + 1) * stride_ + static_cast<size_t>(x + 1);
     }
 };
 

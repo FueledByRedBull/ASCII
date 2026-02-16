@@ -3,6 +3,7 @@
 #include "core/types.hpp"
 #include "cell_stats.hpp"
 #include "edge_detector.hpp"
+#include <array>
 #include <functional>
 #include <string>
 
@@ -73,11 +74,16 @@ private:
     Config config_;
     EdgeDetector edge_detector_;
     CellStatsAggregator cell_aggregator_;
+    FloatImage gray_buffer_;
+    std::array<float, 256> lum_r_lut_{};
+    std::array<float, 256> lum_g_lut_{};
+    std::array<float, 256> lum_b_lut_{};
     
-    FloatImage to_grayscale(const FrameBuffer& input) const;
+    void init_luminance_lut();
+    void to_grayscale(const FrameBuffer& input, FloatImage& output) const;
     ResizePlan compute_resize_plan(int src_w, int src_h) const;
-    FloatImage resize_for_cells(const FloatImage& input) const;
-    FrameBuffer resize_color_for_cells(const FrameBuffer& input, int target_w, int target_h) const;
+    void resize_for_cells(const FloatImage& input, FloatImage& output) const;
+    void resize_color_for_cells(const FrameBuffer& input, int target_w, int target_h, FrameBuffer& output) const;
 };
 
 }
