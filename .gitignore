@@ -52,3 +52,11 @@
 /output.txt
 /test_critical_fixes
 /images/
+
+# Internal planning and audit docs
+/PLAN.md
+/IMPLEMENTATION.md
+/IMPLEMENTATION_REMEDIATION_PLAN.md
+/AUDIT.md
+/QUESTIONS.md
+/ROADMAP.md
