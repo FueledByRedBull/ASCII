@@ -12,6 +12,7 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/version.h>
 #include <libswscale/swscale.h>
 }
 
@@ -61,8 +62,9 @@ AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output, bool st
         return fallback;
     }
 
-    const void* raw_formats = nullptr;
     int num_formats = 0;
+#if LIBAVUTIL_VERSION_MAJOR >= 59
+    const void* raw_formats = nullptr;
     const int ret = avcodec_get_supported_config(
         nullptr, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &raw_formats, &num_formats);
     if (ret < 0 || !raw_formats || num_formats <= 0) {
@@ -70,6 +72,18 @@ AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output, bool st
     }
 
     const auto* pix_fmts = static_cast<const AVPixelFormat*>(raw_formats);
+#else
+    const AVPixelFormat* pix_fmts = codec->pix_fmts;
+    if (!pix_fmts) {
+        return fallback;
+    }
+    while (pix_fmts[num_formats] != AV_PIX_FMT_NONE) {
+        ++num_formats;
+    }
+    if (num_formats <= 0) {
+        return fallback;
+    }
+#endif
     auto has_format = [&](AVPixelFormat fmt) -> bool {
         for (int i = 0; i < num_formats; ++i) {
             if (pix_fmts[i] == fmt) {
