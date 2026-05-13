@@ -52,6 +52,13 @@ struct ConfigEdge {
     int tile_size = 16;
     float dark_scene_floor = 0.02f;
     float global_percentile = 0.7f;
+    bool contours_enabled = true;
+    float contour_min_occupancy = 0.055f;
+    int contour_min_pixels = 4;
+    float contour_dominance_ratio = 1.35f;
+    float contour_intersection_ratio = 1.25f;
+    float contour_dog_sigma_inner = 0.8f;
+    float contour_dog_sigma_outer = 1.6f;
 };
 
 struct ConfigTemporal {
@@ -83,6 +90,7 @@ struct ConfigSelector {
     float weight_contrast = 0.15f;
     float weight_frequency = 0.20f;
     float weight_texture = 0.15f;
+    bool use_orientation_matching = true;
     bool enable_frequency_matching = true;
     bool enable_gabor_texture = true;
     bool use_simple_orientation = false;

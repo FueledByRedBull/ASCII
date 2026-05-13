@@ -22,6 +22,7 @@ public:
     void set_grid_size(int cols, int rows);
     void set_color_mode(ColorMode mode) { color_mode_ = mode; }
     void render(const std::vector<ASCIICell>& cells);
+    std::string render_to_string(const std::vector<ASCIICell>& cells);
     
 private:
     Terminal& term_;

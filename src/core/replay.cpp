@@ -215,10 +215,20 @@ bool ReplayReader::open(const std::string& path) {
         file_ = nullptr;
         return false;
     }
+    if (header_.cols == 0 || header_.rows == 0 || header_.fps == 0) {
+        fclose(file_);
+        file_ = nullptr;
+        return false;
+    }
     
     last_cells_.resize(header_.cols * header_.rows);
     
     if (!build_frame_index()) {
+        fclose(file_);
+        file_ = nullptr;
+        return false;
+    }
+    if (frame_offsets_.size() != header_.frame_count) {
         fclose(file_);
         file_ = nullptr;
         return false;
@@ -378,6 +388,10 @@ void ReplayReader::close() {
         file_ = nullptr;
     }
     frame_offsets_.clear();
+}
+
+void ReplayReader::reset_decode_state() {
+    last_cells_.assign(static_cast<size_t>(header_.cols) * header_.rows, ASCIICell{});
 }
 
 }

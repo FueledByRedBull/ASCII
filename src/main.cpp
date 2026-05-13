@@ -2,6 +2,8 @@
 #include "core/config.hpp"
 #include "core/frame_source.hpp"
 #include "core/pipeline.hpp"
+#include "core/pipeline_runtime_cache.hpp"
+#include "core/frame_composer.hpp"
 #include "core/motion.hpp"
 #include "core/replay.hpp"
 #include "core/temporal.hpp"
@@ -25,6 +27,7 @@
 #include <thread>
 #include <iostream>
 #include <atomic>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -178,42 +181,173 @@ void write_ascii_to_file_simple(const std::string& path, const std::vector<float
 
 namespace {
 
-void build_scene_signature(const ascii::FrameBuffer& frame, std::vector<float>& signature) {
-    signature.clear();
-    const int w = frame.width();
-    const int h = frame.height();
-    if (w <= 0 || h <= 0 || frame.empty()) {
-        return;
+enum class OutputKind {
+    Terminal,
+    TextFrames,
+    EncodedVideo,
+    StillImage,
+    Unsupported
+};
+
+bool ends_with_ci(const std::string& value, const std::string& suffix) {
+    if (suffix.size() > value.size()) {
+        return false;
     }
-
-    const int stride = std::max(1, std::min(w, h) / 48);
-    const uint8_t* src = frame.data();
-    const int samples_x = (w + stride - 1) / stride;
-    const int samples_y = (h + stride - 1) / stride;
-    signature.reserve(static_cast<size_t>(samples_x) * samples_y);
-
-    for (int y = 0; y < h; y += stride) {
-        const size_t row = static_cast<size_t>(y) * static_cast<size_t>(w) * 4;
-        for (int x = 0; x < w; x += stride) {
-            const size_t idx = row + static_cast<size_t>(x) * 4;
-            // Fast luma in [0,1], BT.709 coefficients.
-            float lum = (0.2126f * src[idx + 0] +
-                         0.7152f * src[idx + 1] +
-                         0.0722f * src[idx + 2]) / 255.0f;
-            signature.push_back(lum);
+    const size_t offset = value.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        unsigned char a = static_cast<unsigned char>(value[offset + i]);
+        unsigned char b = static_cast<unsigned char>(suffix[i]);
+        if (std::tolower(a) != std::tolower(b)) {
+            return false;
         }
     }
+    return true;
 }
 
-float signature_scene_change(const std::vector<float>& a, const std::vector<float>& b) {
-    if (a.empty() || b.empty() || a.size() != b.size()) {
-        return 1.0f;
+bool is_still_output_path(const std::string& path) {
+    return ends_with_ci(path, ".jpg") ||
+           ends_with_ci(path, ".jpeg") ||
+           ends_with_ci(path, ".bmp");
+}
+
+bool is_video_output_path(const std::string& path) {
+    return ends_with_ci(path, ".mp4") ||
+           ends_with_ci(path, ".m4v") ||
+           ends_with_ci(path, ".mov") ||
+           ends_with_ci(path, ".mkv") ||
+           ends_with_ci(path, ".avi") ||
+           ends_with_ci(path, ".webm") ||
+           ends_with_ci(path, ".gif");
+}
+
+OutputKind classify_output_target(const std::string& path) {
+    if (path.empty()) {
+        return OutputKind::Terminal;
     }
-    double sum = 0.0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        sum += std::abs(a[i] - b[i]);
+    if (ascii::input::ends_with_txt(path)) {
+        return OutputKind::TextFrames;
     }
-    return static_cast<float>(sum / static_cast<double>(a.size()));
+    if (is_still_output_path(path)) {
+        return OutputKind::StillImage;
+    }
+    if (is_video_output_path(path)) {
+        return OutputKind::EncodedVideo;
+    }
+    return OutputKind::Unsupported;
+}
+
+std::string text_frame_path(const std::string& output_target, uint32_t frame_index, bool single_frame) {
+    if (single_frame) {
+        return output_target;
+    }
+    size_t dot = output_target.rfind('.');
+    if (dot != std::string::npos) {
+        return output_target.substr(0, dot) + "_" + std::to_string(frame_index) + ".txt";
+    }
+    return output_target + "_" + std::to_string(frame_index) + ".txt";
+}
+
+int inspect_replay(const std::string& path) {
+    ascii::ReplayReader reader;
+    if (!reader.open(path)) {
+        std::cerr << "Error: Failed to open replay: " << path << "\n";
+        return 1;
+    }
+
+    const auto& header = reader.header();
+    const double duration = header.fps > 0
+        ? static_cast<double>(header.frame_count) / static_cast<double>(header.fps)
+        : 0.0;
+    std::cout << "Replay: " << path << "\n";
+    std::cout << "version: " << header.version << "\n";
+    std::cout << "grid: " << header.cols << "x" << header.rows << "\n";
+    std::cout << "fps: " << header.fps << "\n";
+    std::cout << "frames: " << header.frame_count << "\n";
+    std::cout << "indexed_frames: " << reader.indexed_frame_count() << "\n";
+    std::cout << "duration_seconds: " << duration << "\n";
+    std::cout << "config_hash: " << reader.config_hash() << "\n";
+    return 0;
+}
+
+int play_replay(const std::string& path, const std::string& output_target, ascii::ColorMode color_mode) {
+    ascii::ReplayReader reader;
+    if (!reader.open(path)) {
+        std::cerr << "Error: Failed to open replay: " << path << "\n";
+        return 1;
+    }
+
+    const bool export_text = !output_target.empty() && ascii::input::ends_with_txt(output_target);
+    if (!output_target.empty() && !export_text) {
+        std::cerr << "Error: Replay playback currently supports terminal output or .txt export only\n";
+        return 1;
+    }
+
+    std::vector<ascii::ASCIICell> cells;
+    if (export_text) {
+        reader.reset_decode_state();
+        const bool single_frame = reader.frame_count() <= 1;
+        for (uint32_t i = 0; i < reader.frame_count(); ++i) {
+            if (!reader.read_frame(i, cells)) {
+                std::cerr << "Error: Failed to read replay frame " << i << "\n";
+                return 1;
+            }
+            ascii::input::write_ascii_to_file(
+                text_frame_path(output_target, i, single_frame),
+                cells,
+                reader.cols(),
+                reader.rows());
+        }
+        std::cerr << "[REPLAY] exported " << reader.frame_count() << " text frame(s) to "
+                  << output_target << "\n";
+        return 0;
+    }
+
+    ascii::Terminal terminal;
+    ascii::TerminalRenderer renderer(terminal, color_mode);
+    renderer.set_grid_size(reader.cols(), reader.rows());
+
+    terminal.enter_alt_screen();
+    terminal.hide_cursor();
+    terminal.clear_screen();
+    ascii::input::setup_nonblocking_stdin();
+
+    const double fps = reader.header().fps > 0 ? static_cast<double>(reader.header().fps) : 30.0;
+    const auto frame_duration = std::chrono::duration<double>(1.0 / fps);
+    bool paused = false;
+    int result = 0;
+    reader.reset_decode_state();
+    for (uint32_t i = 0; i < reader.frame_count();) {
+        const auto start = std::chrono::high_resolution_clock::now();
+        int key = ascii::input::read_key();
+        if (key == 'q' || key == 27) {
+            break;
+        }
+        if (key == ' ') {
+            paused = !paused;
+        }
+        if (paused) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        if (!reader.read_frame(i, cells)) {
+            std::cerr << "Error: Failed to read replay frame " << i << "\n";
+            result = 1;
+            break;
+        }
+        renderer.render(cells);
+        terminal.flush();
+        ++i;
+        const auto elapsed = std::chrono::high_resolution_clock::now() - start;
+        const auto remaining = frame_duration - elapsed;
+        if (remaining > std::chrono::nanoseconds(0)) {
+            std::this_thread::sleep_for(remaining);
+        }
+    }
+
+    ascii::input::restore_stdin();
+    terminal.show_cursor();
+    terminal.exit_alt_screen();
+    return result;
 }
 
 }  // namespace
@@ -224,6 +358,16 @@ int main(int argc, char* argv[]) {
     if (args.show_help) {
         ascii::print_help(argv[0]);
         return 0;
+    }
+    if (!args.inspect_replay_path.empty() && !args.play_replay_path.empty()) {
+        std::cerr << "Error: --inspect-replay and --play-replay are mutually exclusive\n";
+        return 1;
+    }
+    if (!args.inspect_replay_path.empty()) {
+        return inspect_replay(args.inspect_replay_path);
+    }
+    if (!args.play_replay_path.empty()) {
+        return play_replay(args.play_replay_path, args.output, args.color_mode);
     }
     
     ascii::Terminal terminal;
@@ -270,6 +414,20 @@ int main(int argc, char* argv[]) {
 
     int cols = config.grid.cols > 0 ? config.grid.cols : term_info.cols;
     int rows = config.grid.rows > 0 ? config.grid.rows : term_info.rows;
+    if (config.debug.strict_memory) {
+        constexpr size_t kStrictMemoryBudgetBytes = 512ull * 1024ull * 1024ull;
+        const size_t pixel_width = static_cast<size_t>(cols) * static_cast<size_t>(config.grid.cell_width);
+        const size_t pixel_height = static_cast<size_t>(rows) * static_cast<size_t>(config.grid.cell_height);
+        const size_t pixels = pixel_width * pixel_height;
+        const size_t cells = static_cast<size_t>(cols) * static_cast<size_t>(rows);
+        const size_t estimated_bytes =
+            pixels * 96ull + cells * 256ull + static_cast<size_t>(config.temporal.motion_cap_pixels) * 64ull;
+        if (estimated_bytes > kStrictMemoryBudgetBytes) {
+            std::cerr << "Error: Strict memory estimate exceeds 512 MiB budget (estimated "
+                      << (estimated_bytes / (1024ull * 1024ull)) << " MiB)\n";
+            return 1;
+        }
+    }
 
     ascii::ColorMode color_mode = config.color.mode;
     ascii::ColorSpace::init();
@@ -323,6 +481,13 @@ int main(int argc, char* argv[]) {
     pipeline_cfg.tile_size = config.edge.tile_size;
     pipeline_cfg.dark_scene_floor = config.edge.dark_scene_floor;
     pipeline_cfg.global_percentile = config.edge.global_percentile;
+    pipeline_cfg.contours_enabled = config.edge.contours_enabled;
+    pipeline_cfg.contour_min_occupancy = config.edge.contour_min_occupancy;
+    pipeline_cfg.contour_min_pixels = config.edge.contour_min_pixels;
+    pipeline_cfg.contour_dominance_ratio = config.edge.contour_dominance_ratio;
+    pipeline_cfg.contour_intersection_ratio = config.edge.contour_intersection_ratio;
+    pipeline_cfg.contour_dog_sigma_inner = config.edge.contour_dog_sigma_inner;
+    pipeline_cfg.contour_dog_sigma_outer = config.edge.contour_dog_sigma_outer;
     pipeline_cfg.enable_orientation_histogram = !(config.selector.use_simple_orientation || config.selector.mode == "simple");
     pipeline_cfg.enable_frequency_signature = config.selector.enable_frequency_matching;
     pipeline_cfg.enable_texture_signature = config.selector.enable_gabor_texture;
@@ -341,7 +506,8 @@ int main(int argc, char* argv[]) {
     
     ascii::CharSelector::Config selector_cfg;
     selector_cfg.edge_threshold = config.edge.high_threshold;
-    selector_cfg.use_orientation_matching = (config.selector.mode == "histogram");
+    selector_cfg.use_orientation_matching =
+        config.selector.use_orientation_matching && config.selector.mode == "histogram";
     selector_cfg.use_simple_orientation = config.selector.use_simple_orientation || config.selector.mode == "simple";
     selector_cfg.use_unified_loss = !selector_cfg.use_simple_orientation;
     selector_cfg.loss_weights.brightness = config.selector.weight_brightness;
@@ -406,16 +572,26 @@ int main(int argc, char* argv[]) {
     bitmap_renderer.set_cell_size(config.grid.cell_width, config.grid.cell_height);
     
     const std::string output_target = config.output.target;
-    bool has_output = !output_target.empty() && !ascii::input::ends_with_txt(output_target);
+    const OutputKind output_kind = classify_output_target(output_target);
+    if (output_kind == OutputKind::Unsupported) {
+        std::cerr << "Error: Unsupported output extension for target: " << output_target << "\n";
+        return 1;
+    }
+    bool has_output = output_kind == OutputKind::EncodedVideo || output_kind == OutputKind::StillImage;
     if (has_output) {
         ascii::VideoEncoder::Config enc_cfg;
         enc_cfg.width = cols * config.grid.cell_width;
         enc_cfg.height = rows * config.grid.cell_height;
         enc_cfg.fps = config.fps;
         if (!video_encoder.open(output_target, enc_cfg)) {
-            std::cerr << "Warning: Failed to open video output: " << output_target << "\n";
-            has_output = false;
+            std::cerr << "Error: Failed to open output: " << output_target;
+            if (!video_encoder.last_error().empty()) {
+                std::cerr << " (" << video_encoder.last_error() << ")";
+            }
+            std::cerr << "\n";
+            return 1;
         }
+        std::cerr << "[OUTPUT] encoding to " << output_target << "\n";
     }
     
     ascii::TerminalRenderer term_renderer(terminal, color_mode);
@@ -437,7 +613,7 @@ int main(int argc, char* argv[]) {
     double source_fps = source->fps();
     bool is_single_image = (source_fps == 0.0);
     
-    if (!has_output && !is_single_image) {
+    if (output_kind == OutputKind::Terminal && !is_single_image) {
         terminal.enter_alt_screen();
         terminal.hide_cursor();
         terminal.clear_screen();
@@ -453,7 +629,6 @@ int main(int argc, char* argv[]) {
     auto session_start = std::chrono::steady_clock::now();
     
     ascii::FrameBuffer frame;
-    bool initialized = false;
     int frame_count = 0;
     double processing_seconds_total = 0.0;
     double stage_pipeline_seconds = 0.0;
@@ -461,33 +636,20 @@ int main(int argc, char* argv[]) {
     double stage_select_seconds = 0.0;
     double stage_render_seconds = 0.0;
     double stage_encode_seconds = 0.0;
+    int encoded_frame_count = 0;
+    bool encode_failed = false;
     std::atomic<bool> paused{false};
     std::atomic<bool> running{true};
     float edge_threshold = config.edge.high_threshold;
     ascii::FloatImage prev_luminance;
     bool have_prev_luminance = false;
-    ascii::Pipeline::Result cached_pipeline_result;
-    bool have_cached_pipeline_result = false;
-    bool cached_pipeline_has_color_buffer = false;
-    int pipeline_reuse_frames = 0;
-    std::vector<ascii::CellStats> cached_cell_stats;
-    bool have_cached_cell_stats = false;
-    int cell_stats_reuse_frames = 0;
-    std::vector<float> prev_scene_signature;
-    std::vector<float> curr_scene_signature;
-
-    auto invalidate_pipeline_cache = [&]() {
-        have_cached_pipeline_result = false;
-        cached_pipeline_has_color_buffer = false;
-        pipeline_reuse_frames = 0;
-        have_cached_cell_stats = false;
-        cell_stats_reuse_frames = 0;
-    };
+    ascii::PipelineRuntimeCache pipeline_runtime_cache;
+    ascii::FrameComposer frame_composer;
     
     while (running && source->read(frame)) {
         auto start = std::chrono::high_resolution_clock::now();
         
-        if (!has_output) {
+        if (output_kind == OutputKind::Terminal) {
             int key = ascii::input::read_key();
             if (key == 'q' || key == 27) {
                 running = false;
@@ -508,19 +670,19 @@ int main(int argc, char* argv[]) {
                 auto dc = ditherer.config();
                 dc.enabled = (color_mode == ascii::ColorMode::Ansi16 || color_mode == ascii::ColorMode::Ansi256);
                 ditherer.set_config(dc);
-                invalidate_pipeline_cache();
+                pipeline_runtime_cache.invalidate();
             } else if (key == '+' || key == '=') {
                 edge_threshold = std::min(1.0f, edge_threshold + 0.05f);
                 pipeline_cfg.edge_low = edge_threshold * 0.5f;
                 pipeline_cfg.edge_high = edge_threshold;
                 pipeline.set_config(pipeline_cfg);
-                invalidate_pipeline_cache();
+                pipeline_runtime_cache.invalidate();
             } else if (key == '-') {
                 edge_threshold = std::max(0.0f, edge_threshold - 0.05f);
                 pipeline_cfg.edge_low = edge_threshold * 0.5f;
                 pipeline_cfg.edge_high = edge_threshold;
                 pipeline.set_config(pipeline_cfg);
-                invalidate_pipeline_cache();
+                pipeline_runtime_cache.invalidate();
             }
         }
         
@@ -532,12 +694,6 @@ int main(int argc, char* argv[]) {
         auto stage_start = std::chrono::high_resolution_clock::now();
         ascii::Pipeline::Result computed_result;
         const ascii::Pipeline::Result* result_ptr = nullptr;
-        curr_scene_signature.clear();
-        build_scene_signature(frame, curr_scene_signature);
-        float scene_change = 1.0f;
-        if (!prev_scene_signature.empty() && prev_scene_signature.size() == curr_scene_signature.size()) {
-            scene_change = signature_scene_change(prev_scene_signature, curr_scene_signature);
-        }
 
         const bool allow_mixed_block_mode = config.grid.quad_tree_adaptive &&
                                             color_mode != ascii::ColorMode::BlockArt;
@@ -546,61 +702,21 @@ int main(int argc, char* argv[]) {
         const bool need_color_stats = need_color_buffer ||
                                       color_mode != ascii::ColorMode::None ||
                                       config.color.use_bilateral_grid;
+        ascii::PipelineRuntimeCache::Query cache_query;
+        cache_query.reuse_limit = std::max(0, config.temporal.motion_max_reuse_frames);
+        cache_query.still_threshold = std::max(0.0f, config.temporal.motion_still_scene_threshold);
+        cache_query.need_color_buffer = need_color_buffer;
+        cache_query.need_color_stats = need_color_stats;
 
-        bool reused_pipeline = false;
-        const int pipeline_reuse_limit = std::max(0, config.temporal.motion_max_reuse_frames);
-        const float pipeline_still_thresh = std::max(0.0f, config.temporal.motion_still_scene_threshold);
-
-        if (have_cached_pipeline_result &&
-            !prev_scene_signature.empty() &&
-            pipeline_reuse_limit > 0) {
-            const bool cached_color_ok = !need_color_buffer || cached_pipeline_has_color_buffer;
-            if (scene_change < pipeline_still_thresh &&
-                pipeline_reuse_frames < pipeline_reuse_limit &&
-                cached_color_ok) {
-                reused_pipeline = true;
-                result_ptr = &cached_pipeline_result;
-                ++pipeline_reuse_frames;
-                if (have_cached_cell_stats) {
-                    cell_stats_reuse_frames = std::min(cell_stats_reuse_frames + 1, pipeline_reuse_limit);
-                }
-            }
+        auto cache_decision = pipeline_runtime_cache.begin_frame(frame, cache_query);
+        if (cache_decision.reuse_pipeline_result) {
+            result_ptr = cache_decision.reused_result;
+        } else {
+            computed_result = pipeline.process(frame, cache_decision.process_options);
+            pipeline_runtime_cache.commit_processed_result(
+                computed_result, need_color_buffer, cache_decision.reuse_cell_stats);
+            result_ptr = &pipeline_runtime_cache.cached_result();
         }
-
-        if (!reused_pipeline) {
-            const int cell_stats_reuse_limit = std::max(0, config.temporal.motion_max_reuse_frames);
-            const float cell_stats_reuse_thresh =
-                std::max(0.0f, config.temporal.motion_still_scene_threshold * 0.8f);
-            const bool reuse_cell_stats =
-                have_cached_cell_stats &&
-                !prev_scene_signature.empty() &&
-                cell_stats_reuse_limit > 0 &&
-                scene_change < cell_stats_reuse_thresh &&
-                cell_stats_reuse_frames < cell_stats_reuse_limit;
-
-            ascii::Pipeline::ProcessOptions process_options;
-            process_options.need_color_buffer = need_color_buffer;
-            process_options.need_color_stats = need_color_stats;
-            if (reuse_cell_stats) {
-                process_options.reuse_cell_stats = &cached_cell_stats;
-            }
-
-            computed_result = pipeline.process(frame, process_options);
-            cached_pipeline_result = computed_result;
-            have_cached_pipeline_result = true;
-            cached_pipeline_has_color_buffer = need_color_buffer;
-            pipeline_reuse_frames = 0;
-            result_ptr = &cached_pipeline_result;
-
-            if (reuse_cell_stats) {
-                ++cell_stats_reuse_frames;
-            } else {
-                cached_cell_stats = cached_pipeline_result.cell_stats;
-                have_cached_cell_stats = true;
-                cell_stats_reuse_frames = 0;
-            }
-        }
-        prev_scene_signature = curr_scene_signature;
 
         const ascii::Pipeline::Result& result = *result_ptr;
         stage_pipeline_seconds += std::chrono::duration<double>(
@@ -628,7 +744,7 @@ int main(int argc, char* argv[]) {
             audio.sync_to_frame(frame_count, target_fps);
         }
         
-        if (!config.debug.mode.empty() && !has_output) {
+        if (!config.debug.mode.empty() && output_kind == OutputKind::Terminal) {
             if (config.debug.mode == "grayscale") {
                 std::vector<ascii::ASCIICell> debug_cells(result.grid_cols * result.grid_rows);
                 for (int i = 0; i < static_cast<int>(debug_cells.size()); ++i) {
@@ -683,181 +799,39 @@ int main(int argc, char* argv[]) {
         }
         
         stage_start = std::chrono::high_resolution_clock::now();
-        if (!initialized) {
-            smoother.initialize(result.grid_cols, result.grid_rows);
-            initialized = true;
-        }
-        
-        std::vector<ascii::ASCIICell> cells(result.grid_cols * result.grid_rows);
-        std::vector<ascii::BlockCell> block_cells;
-        const bool allow_mixed_block = config.grid.quad_tree_adaptive &&
-                                       color_mode != ascii::ColorMode::BlockArt;
-        if (color_mode == ascii::ColorMode::BlockArt || allow_mixed_block) {
-            block_cells.resize(cells.size());
-        }
-        
-        for (int i = 0; i < static_cast<int>(result.cell_stats.size()); ++i) {
-            const auto& stats = result.cell_stats[i];
-            int cell_x = i % result.grid_cols;
-            int cell_y = i / result.grid_cols;
-            
-            float smoothed_lum = smoother.smooth_luminance(i, stats.mean_luminance);
-            float smoothed_edge = smoother.smooth_edge_strength(i, stats.edge_strength);
-            float smoothed_coh = smoother.smooth_coherence(i, stats.structure_coherence);
-            
-            ascii::CellStats effective_stats = stats;
-            effective_stats.mean_luminance = smoothed_lum;
-            effective_stats.edge_strength = smoothed_edge;
-            effective_stats.structure_coherence = smoothed_coh;
-
-            if (bilateral_grid.valid()) {
-                auto smooth_rgb = bilateral_grid.sample(cell_x, cell_y, smoothed_lum);
-                effective_stats.mean_r = smooth_rgb.r;
-                effective_stats.mean_g = smooth_rgb.g;
-                effective_stats.mean_b = smooth_rgb.b;
-            }
-
-            float adaptive_edge_margin = 0.02f * static_cast<float>(effective_stats.adaptive_level);
-            float adaptive_edge_threshold = std::clamp(edge_threshold - adaptive_edge_margin, 0.0f, 1.0f);
-
-            bool edge_candidate = (stats.edge_occupancy >= adaptive_edge_threshold) ||
-                                  (smoothed_edge >= adaptive_edge_threshold) ||
-                                  (smoothed_coh >= std::max(0.05f, 0.2f - 0.04f * effective_stats.adaptive_level));
-            smoother.update_edge_state(i, edge_candidate);
-            effective_stats.is_edge_cell = smoother.get_edge_state(i);
-            
-            if (motion.has_motion()) {
-                float dx = 0.0f, dy = 0.0f;
-                motion.get_motion_for_cell(
-                    cell_x * config.grid.cell_width,
-                    cell_y * config.grid.cell_height,
-                    config.grid.cell_width,
-                    config.grid.cell_height,
-                    dx, dy
-                );
-                smoother.set_motion_offset(i,
-                    dx / static_cast<float>(std::max(1, config.grid.cell_width)),
-                    dy / static_cast<float>(std::max(1, config.grid.cell_height)));
-            } else {
-                smoother.set_motion_offset(i, 0.0f, 0.0f);
-            }
-            
-            bool use_block_cell = (color_mode == ascii::ColorMode::BlockArt) ||
-                                  (allow_mixed_block && effective_stats.adaptive_level >= 2);
-
-            if (use_block_cell) {
-                ascii::BlockRenderer::CellData block_data = block_renderer.analyze_cell(
-                    result.luminance,
-                    result.color_buffer,
-                    cell_x,
-                    cell_y,
-                    config.grid.cell_width,
-                    config.grid.cell_height,
-                    effective_stats);
-                
-                auto block_result = block_renderer.render_cell(block_data);
-                float block_score = std::clamp(1.0f - std::abs(block_data.top_left_lum - block_data.bottom_right_lum), 0.0f, 1.0f);
-                uint32_t final_cp = block_result.codepoint;
-                if (smoother.should_change_glyph(i, block_result.codepoint, block_score)) {
-                    final_cp = block_result.codepoint;
-                    smoother.update_glyph(i, block_result.codepoint, block_score);
-                } else {
-                    final_cp = smoother.frame_state()[i].last_glyph;
-                }
-                block_result.codepoint = final_cp;
-                block_cells[i] = block_result;
-                cells[i].codepoint = final_cp;
-
-                if (color_mode == ascii::ColorMode::BlockArt) {
-                    cells[i].fg_r = block_result.fg_r;
-                    cells[i].fg_g = block_result.fg_g;
-                    cells[i].fg_b = block_result.fg_b;
-                    cells[i].bg_r = block_result.bg_r;
-                    cells[i].bg_g = block_result.bg_g;
-                    cells[i].bg_b = block_result.bg_b;
-                } else {
-                    int row_dir = (cell_y % 2 == 0) ? 1 : -1;
-                    auto mapped = color_mapper.map_with_dither(
-                        cell_x, cell_y, row_dir,
-                        block_result.fg_r / 255.0f,
-                        block_result.fg_g / 255.0f,
-                        block_result.fg_b / 255.0f,
-                        effective_stats.is_edge_cell
-                    );
-                    cells[i].fg_r = mapped.r;
-                    cells[i].fg_g = mapped.g;
-                    cells[i].fg_b = mapped.b;
-                    cells[i].bg_r = 0;
-                    cells[i].bg_g = 0;
-                    cells[i].bg_b = 0;
-                }
-            } else {
-                auto selection = selector.select(effective_stats, smoother, i);
-                
-                if (selector.config().use_unified_loss) {
-                    float transition_cost = selector.compute_transition_cost(
-                        smoother.frame_state()[i].last_glyph, selection.codepoint);
-                    
-                    if (smoother.should_change_glyph_with_loss(i, selection.codepoint, selection.loss, transition_cost)) {
-                        cells[i].codepoint = selection.codepoint;
-                        smoother.update_glyph_with_loss(i, selection.codepoint, selection.score, selection.loss + transition_cost);
-                    } else {
-                        cells[i].codepoint = smoother.frame_state()[i].last_glyph;
-                    }
-                } else {
-                    if (smoother.should_change_glyph(i, selection.codepoint, selection.score)) {
-                        cells[i].codepoint = selection.codepoint;
-                        smoother.update_glyph(i, selection.codepoint, selection.score);
-                    } else {
-                        cells[i].codepoint = smoother.frame_state()[i].last_glyph;
-                    }
-                }
-                
-                uint8_t sr = 0, sg = 0, sb = 0;
-                ascii::ColorSpace::linear_to_srgb({effective_stats.mean_r, effective_stats.mean_g, effective_stats.mean_b}, sr, sg, sb);
-                int row_dir = (cell_y % 2 == 0) ? 1 : -1;
-                auto color = color_mapper.map_with_dither(
-                    cell_x, cell_y, row_dir,
-                    sr / 255.0f, sg / 255.0f, sb / 255.0f,
-                    effective_stats.is_edge_cell
-                );
-                
-                cells[i].fg_r = color.r;
-                cells[i].fg_g = color.g;
-                cells[i].fg_b = color.b;
-            }
-        }
-
-        if (color_mode == ascii::ColorMode::BlockArt &&
-            !block_cells.empty() &&
-            config.color.block_spectral_palette > 1) {
-            block_renderer.spectral_quantize_frame(
-                block_cells,
-                config.color.block_spectral_palette,
-                config.color.block_spectral_samples,
-                config.color.block_spectral_iterations
-            );
-            for (size_t i = 0; i < cells.size() && i < block_cells.size(); ++i) {
-                cells[i].fg_r = block_cells[i].fg_r;
-                cells[i].fg_g = block_cells[i].fg_g;
-                cells[i].fg_b = block_cells[i].fg_b;
-                cells[i].bg_r = block_cells[i].bg_r;
-                cells[i].bg_g = block_cells[i].bg_g;
-                cells[i].bg_b = block_cells[i].bg_b;
-            }
-        }
+        ascii::FrameComposer::Context compose_context{
+            smoother,
+            selector,
+            color_mapper,
+            bilateral_grid,
+            motion,
+            block_renderer,
+            config,
+            color_mode,
+            edge_threshold
+        };
+        auto composed = frame_composer.compose(result, compose_context);
+        std::vector<ascii::ASCIICell> cells = std::move(composed.cells);
         stage_select_seconds += std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - stage_start).count();
         
         if (has_output) {
             auto encode_start = std::chrono::high_resolution_clock::now();
-            std::vector<uint32_t> cps(cells.size());
-            for (size_t i = 0; i < cells.size(); ++i) {
-                cps[i] = cells[i].codepoint;
+            auto bitmap = bitmap_renderer.render(cells, result.grid_cols, result.grid_rows);
+            if (!video_encoder.write_frame(bitmap)) {
+                std::cerr << "Error: Failed to encode frame " << frame_count
+                          << " to output: " << output_target;
+                if (!video_encoder.last_error().empty()) {
+                    std::cerr << " (" << video_encoder.last_error() << ")";
+                }
+                std::cerr << "\n";
+                encode_failed = true;
+                running = false;
+            } else {
+                if (video_encoder.last_frame_was_written()) {
+                    ++encoded_frame_count;
+                }
             }
-            
-            auto bitmap = bitmap_renderer.render(cps, result.grid_cols, result.grid_rows);
-            video_encoder.write_frame(bitmap);
             stage_encode_seconds += std::chrono::duration<double>(
                 std::chrono::high_resolution_clock::now() - encode_start).count();
         }
@@ -879,19 +853,14 @@ int main(int argc, char* argv[]) {
         }
         
         if (!output_target.empty() && ascii::input::ends_with_txt(output_target)) {
-            std::string frame_path = output_target;
-            if (!is_single_image) {
-                size_t dot = output_target.rfind('.');
-                if (dot != std::string::npos) {
-                    frame_path = output_target.substr(0, dot) + "_" + std::to_string(frame_count) + ".txt";
-                } else {
-                    frame_path = output_target + "_" + std::to_string(frame_count) + ".txt";
-                }
-            }
+            std::string frame_path = text_frame_path(
+                output_target,
+                static_cast<uint32_t>(frame_count),
+                is_single_image);
             ascii::input::write_ascii_to_file(frame_path, cells, result.grid_cols, result.grid_rows);
         }
         
-        if (!has_output) {
+        if (output_kind == OutputKind::Terminal) {
             auto render_start = std::chrono::high_resolution_clock::now();
             term_renderer.render(cells);
             terminal.flush();
@@ -900,6 +869,10 @@ int main(int argc, char* argv[]) {
             }
             stage_render_seconds += std::chrono::duration<double>(
                 std::chrono::high_resolution_clock::now() - render_start).count();
+        }
+
+        if (output_kind == OutputKind::StillImage && encoded_frame_count > 0) {
+            running = false;
         }
         
         auto elapsed = std::chrono::high_resolution_clock::now() - start;
@@ -921,7 +894,7 @@ int main(int argc, char* argv[]) {
         frame_count++;
     }
     
-    if (!has_output) {
+    if (output_kind == OutputKind::Terminal) {
         ascii::input::restore_stdin();
         if (is_single_image) {
             terminal.write("\n\nPress Enter to exit...");
@@ -932,9 +905,24 @@ int main(int argc, char* argv[]) {
         terminal.exit_alt_screen();
     }
     
-    video_encoder.close();
+    const bool encoder_closed_ok = video_encoder.close();
     replay_writer.close();
     audio.close();
+
+    if (has_output) {
+        if (encode_failed || !encoder_closed_ok || encoded_frame_count == 0) {
+            std::cerr << "[OUTPUT] failed: " << output_target << "\n";
+            if (!encoder_closed_ok && !video_encoder.last_error().empty()) {
+                std::cerr << "[OUTPUT] close error: " << video_encoder.last_error() << "\n";
+            }
+            if (encoded_frame_count == 0) {
+                std::cerr << "[OUTPUT] no frames were written.\n";
+            }
+        } else {
+            std::cerr << "[OUTPUT] wrote " << output_target
+                      << " (frames=" << encoded_frame_count << ")\n";
+        }
+    }
 
     auto session_end = std::chrono::steady_clock::now();
     double wall_seconds = std::chrono::duration<double>(session_end - session_start).count();
@@ -976,5 +964,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "[PERF] no frames processed.\n";
     }
     
+    if (has_output && (encode_failed || !encoder_closed_ok || encoded_frame_count == 0)) {
+        return 1;
+    }
     return 0;
 }

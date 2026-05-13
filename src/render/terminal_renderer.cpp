@@ -18,6 +18,14 @@ void TerminalRenderer::set_grid_size(int cols, int rows) {
 }
 
 void TerminalRenderer::render(const std::vector<ASCIICell>& cells) {
+    write_buffer_ = render_to_string(cells);
+    if (!write_buffer_.empty()) {
+        term_.write(write_buffer_);
+    }
+    term_.flush();
+}
+
+std::string TerminalRenderer::render_to_string(const std::vector<ASCIICell>& cells) {
     out_buffer_.clear();
     int cursor_x = -1;
     int cursor_y = -1;
@@ -95,13 +103,8 @@ void TerminalRenderer::render(const std::vector<ASCIICell>& cells) {
         y++;
     }
 
-    if (!out_buffer_.empty()) {
-        write_buffer_.assign(out_buffer_.begin(), out_buffer_.end());
-        term_.write(write_buffer_);
-    }
-    term_.flush();
-    
     prev_buffer_ = cells;
+    return std::string(out_buffer_.begin(), out_buffer_.end());
 }
 
 void TerminalRenderer::append_string(const std::string& s) {

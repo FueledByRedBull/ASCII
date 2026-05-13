@@ -2,6 +2,7 @@
 
 #include "core/types.hpp"
 #include "cell_stats.hpp"
+#include "contour_extractor.hpp"
 #include "edge_detector.hpp"
 #include <array>
 #include <functional>
@@ -44,6 +45,13 @@ public:
         bool enable_orientation_histogram = true;
         bool enable_frequency_signature = true;
         bool enable_texture_signature = true;
+        bool contours_enabled = true;
+        float contour_min_occupancy = 0.055f;
+        int contour_min_pixels = 4;
+        float contour_dominance_ratio = 1.35f;
+        float contour_intersection_ratio = 1.25f;
+        float contour_dog_sigma_inner = 0.8f;
+        float contour_dog_sigma_outer = 1.6f;
     };
     
     Pipeline() : Pipeline(Config{}) {}
@@ -83,6 +91,7 @@ private:
     Config config_;
     EdgeDetector edge_detector_;
     CellStatsAggregator cell_aggregator_;
+    ContourExtractor contour_extractor_;
     FloatImage gray_buffer_;
     std::array<float, 256> linear_lut_{};
     std::array<float, 256> lum_r_lut_{};

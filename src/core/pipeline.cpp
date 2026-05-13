@@ -49,6 +49,16 @@ Pipeline::Pipeline(const Config& config) : config_(config) {
     cell_cfg.quad_tree_max_depth = config.quad_tree_max_depth;
     cell_cfg.quad_tree_variance_threshold = config.quad_tree_variance_threshold;
     cell_aggregator_.set_config(cell_cfg);
+
+    ContourExtractor::Config contour_cfg;
+    contour_cfg.enabled = config.contours_enabled;
+    contour_cfg.min_occupancy = config.contour_min_occupancy;
+    contour_cfg.min_pixels = config.contour_min_pixels;
+    contour_cfg.dominance_ratio = config.contour_dominance_ratio;
+    contour_cfg.intersection_ratio = config.contour_intersection_ratio;
+    contour_cfg.dog_sigma_inner = config.contour_dog_sigma_inner;
+    contour_cfg.dog_sigma_outer = config.contour_dog_sigma_outer;
+    contour_extractor_.set_config(contour_cfg);
 }
 
 void Pipeline::set_config(const Config& config) {
@@ -85,6 +95,16 @@ void Pipeline::set_config(const Config& config) {
     cell_cfg.quad_tree_max_depth = config.quad_tree_max_depth;
     cell_cfg.quad_tree_variance_threshold = config.quad_tree_variance_threshold;
     cell_aggregator_.set_config(cell_cfg);
+
+    ContourExtractor::Config contour_cfg;
+    contour_cfg.enabled = config.contours_enabled;
+    contour_cfg.min_occupancy = config.contour_min_occupancy;
+    contour_cfg.min_pixels = config.contour_min_pixels;
+    contour_cfg.dominance_ratio = config.contour_dominance_ratio;
+    contour_cfg.intersection_ratio = config.contour_intersection_ratio;
+    contour_cfg.dog_sigma_inner = config.contour_dog_sigma_inner;
+    contour_cfg.dog_sigma_outer = config.contour_dog_sigma_outer;
+    contour_extractor_.set_config(contour_cfg);
 }
 
 void Pipeline::init_luminance_lut() {
@@ -463,6 +483,15 @@ Pipeline::Result Pipeline::process(const FrameBuffer& input, const ProcessOption
             }
         }
     }
+
+    contour_extractor_.apply(
+        result.luminance,
+        result.edges,
+        config_.cell_width,
+        config_.cell_height,
+        result.grid_cols,
+        result.grid_rows,
+        result.cell_stats);
     
     return result;
 }

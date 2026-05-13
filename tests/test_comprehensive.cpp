@@ -194,7 +194,7 @@ TEST(utf8_validation_valid) {
     assert(cps[0] == 'H');
     assert(cps[11] == '!');
     
-    std::string unicode = "é";
+    std::string unicode = "\xC3\xA9";
     cps = CharSet::to_codepoints(unicode);
     assert(cps.size() == 1);
     assert(cps[0] == 0xE9);
@@ -397,6 +397,7 @@ TEST(glyph_stats_edge_detection) {
 }
 
 TEST(simple_orientation_mode) {
+    constexpr float kPi = 3.14159265358979323846f;
     CharSelector::Config cfg;
     cfg.use_simple_orientation = true;
     cfg.use_orientation_matching = false;
@@ -405,13 +406,13 @@ TEST(simple_orientation_mode) {
     auto sel = selector.select_edge_simple(0.0f);
     assert(sel.codepoint == static_cast<uint32_t>('-'));
     
-    sel = selector.select_edge_simple(M_PI / 2.0f);
+    sel = selector.select_edge_simple(kPi / 2.0f);
     assert(sel.codepoint == static_cast<uint32_t>('|'));
     
-    sel = selector.select_edge_simple(M_PI / 4.0f);
+    sel = selector.select_edge_simple(kPi / 4.0f);
     assert(sel.codepoint == static_cast<uint32_t>('/'));
     
-    sel = selector.select_edge_simple(-M_PI / 4.0f);
+    sel = selector.select_edge_simple(-kPi / 4.0f);
     assert(sel.codepoint == static_cast<uint32_t>('\\'));
 }
 
@@ -511,10 +512,10 @@ int main() {
     std::cout << "Failures: " << failures << "\n";
     
     if (failures == 0) {
-        std::cout << "\n✓ All tests passed!\n";
+        std::cout << "\n[OK] All tests passed!\n";
         return 0;
     } else {
-        std::cout << "\n✗ Some tests failed!\n";
+        std::cout << "\n[FAIL] Some tests failed!\n";
         return 1;
     }
 }

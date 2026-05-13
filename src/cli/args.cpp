@@ -66,6 +66,22 @@ Args parse_args(int argc, char* argv[]) {
                 }
             }
         }
+        else if (strcmp(arg, "--inspect-replay") == 0) {
+            if (i + 1 < argc) {
+                args.inspect_replay_path = argv[++i];
+                if (!validate_path(args.inspect_replay_path)) {
+                    args.inspect_replay_path.clear();
+                }
+            }
+        }
+        else if (strcmp(arg, "--play-replay") == 0) {
+            if (i + 1 < argc) {
+                args.play_replay_path = argv[++i];
+                if (!validate_path(args.play_replay_path)) {
+                    args.play_replay_path.clear();
+                }
+            }
+        }
         else if (strcmp(arg, "-f") == 0 || strcmp(arg, "--fps") == 0) {
             if (i + 1 < argc) args.fps = clamp_int(std::atoi(argv[++i]), 1, 120, 30);
         }
@@ -99,6 +115,9 @@ Args parse_args(int argc, char* argv[]) {
         }
         else if (strcmp(arg, "--edge-thresh") == 0) {
             if (i + 1 < argc) args.edge_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, 0.1f);
+        }
+        else if (strcmp(arg, "--contour-thresh") == 0) {
+            if (i + 1 < argc) args.contour_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
         }
         else if (strcmp(arg, "--blur") == 0) {
             if (i + 1 < argc) args.blur_sigma = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.1f, 10.0f, 1.0f);
@@ -149,6 +168,10 @@ Args parse_args(int argc, char* argv[]) {
         else if (strcmp(arg, "--no-hysteresis") == 0) {
             args.use_hysteresis = false;
         }
+        else if (strcmp(arg, "--no-contours") == 0) {
+            args.contours_enabled = false;
+            args.contours_enabled_set = true;
+        }
         else if (strcmp(arg, "--no-orientation") == 0) {
             args.use_orientation_matching = false;
         }
@@ -186,9 +209,11 @@ void print_help(const char* prog) {
     printf("INPUT:\n");
     printf("  Path to video file, image, or \"webcam\" for live capture\n\n");
     printf("OPTIONS:\n");
-    printf("  -o, --output <FILE>     Output file (.mp4 or .gif video, or .txt frames)\n");
+    printf("  -o, --output <FILE>     Output file (.txt frames, video, or still image)\n");
     printf("      --config <FILE>     Config file path (default: platform-specific)\n");
     printf("      --replay <FILE>     Write deterministic replay to .areplay file\n");
+    printf("      --inspect-replay <FILE>  Print .areplay metadata\n");
+    printf("      --play-replay <FILE>     Play .areplay in terminal, or export text with -o\n");
     printf("  -f, --fps <N>           Target FPS (default: 30, range: 1-120)\n");
     printf("  -c, --cols <N>          Max columns (default: auto-detect, range: 1-500)\n");
     printf("  -r, --rows <N>          Max rows (default: auto-detect, range: 1-200)\n");
@@ -196,6 +221,7 @@ void print_help(const char* prog) {
     printf("      --profile <NAME>    Content preset: natural, anime, ui\n");
     printf("      --color <MODE>      Color mode: none, 16, 256, truecolor, blockart\n");
     printf("      --edge-thresh <N>   Edge detection threshold (0.0-1.0)\n");
+    printf("      --contour-thresh <N> Minimum contour occupancy per cell (0.0-1.0)\n");
     printf("      --blur <N>          Blur sigma (default: 1.0, range: 0.1-10.0)\n");
     printf("      --temporal <N>      Temporal smoothing alpha (0.0-1.0)\n");
     printf("      --motion-solve-div <N>  Motion solve downscale divisor (1-8)\n");
@@ -209,6 +235,7 @@ void print_help(const char* prog) {
     printf("      --font <PATH>       Font file to use (auto-detects system font if not set)\n");
     printf("      --no-audio          Disable audio playback\n");
     printf("      --no-hysteresis     Disable edge hysteresis\n");
+    printf("      --no-contours       Disable default ASCII contour overlay\n");
     printf("      --no-orientation    Disable orientation-based glyph selection\n");
     printf("      --simple-orientation Use simple 8-direction orientation mapping\n");
     printf("      --debug <MODE>      Debug view: grayscale, edges, orientation\n");

@@ -14,6 +14,8 @@ struct Args {
     std::string debug_mode;
     std::string config_path;
     std::string replay_path;
+    std::string inspect_replay_path;
+    std::string play_replay_path;
     ColorMode color_mode = ColorMode::Truecolor;
     bool color_mode_set = false;
     
@@ -24,6 +26,7 @@ struct Args {
     int cell_height = 16;
     
     float edge_threshold = 0.1f;
+    float contour_threshold = -1.0f;
     float blur_sigma = 1.0f;
     float temporal_alpha = 0.3f;
     int motion_solve_divisor = 0;
@@ -37,6 +40,8 @@ struct Args {
     std::string scale_mode = "fit";
     bool no_audio = false;
     bool use_hysteresis = true;
+    bool contours_enabled = true;
+    bool contours_enabled_set = false;
     bool use_orientation_matching = true;
     bool use_simple_orientation = false;
     

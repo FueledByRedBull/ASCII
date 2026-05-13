@@ -1,76 +1,69 @@
 cmake_minimum_required(VERSION 3.16)
 
-add_executable(test_comprehensive test_comprehensive.cpp
-    ../src/core/temporal.cpp
-    ../src/core/edge_detector.cpp
-    ../src/core/cell_stats.cpp
-    ../src/glyph/font_loader.cpp
-    ../src/glyph/glyph_cache.cpp
-    ../src/mapping/color_mapper.cpp
-    ../src/mapping/char_selector.cpp
-    ../src/terminal/terminal.cpp
-    ../src/cli/args.cpp
-)
-
-target_include_directories(test_comprehensive PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_comprehensive 
-    ${OpenCV_LIBS}
-)
-
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(test_comprehensive OpenMP::OpenMP_CXX)
-    target_compile_definitions(test_comprehensive PRIVATE HAS_OPENMP)
-endif()
+add_executable(test_comprehensive test_comprehensive.cpp)
+target_link_libraries(test_comprehensive PRIVATE ascii-engine-core)
 
 add_test(NAME ComprehensiveTest COMMAND test_comprehensive)
 
-add_executable(test_critical_fixes test_critical_fixes.cpp
-    ../src/core/temporal.cpp
-    ../src/core/edge_detector.cpp
-    ../src/glyph/font_loader.cpp
-)
-
-target_include_directories(test_critical_fixes PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_critical_fixes 
-    ${OpenCV_LIBS}
-)
+add_executable(test_critical_fixes test_critical_fixes.cpp)
+target_link_libraries(test_critical_fixes PRIVATE ascii-engine-core)
 
 add_test(NAME CriticalFixesTest COMMAND test_critical_fixes)
 
-add_executable(test_integration test_integration.cpp
-    ../src/core/frame_source.cpp
-    ../src/core/pipeline.cpp
-    ../src/core/cell_stats.cpp
-    ../src/core/edge_detector.cpp
-)
+add_executable(test_replay test_replay.cpp)
+target_link_libraries(test_replay PRIVATE ascii-engine-core)
 
-target_include_directories(test_integration PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor
-    ${OpenCV_INCLUDE_DIRS}
-)
+add_test(NAME ReplayTest COMMAND test_replay)
 
-target_link_libraries(test_integration
-    ${OpenCV_LIBS}
-)
+add_executable(test_terminal_renderer test_terminal_renderer.cpp)
+target_link_libraries(test_terminal_renderer PRIVATE ascii-engine-core)
 
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(test_integration OpenMP::OpenMP_CXX)
-    target_compile_definitions(test_integration PRIVATE HAS_OPENMP)
+add_test(NAME TerminalRendererTest COMMAND test_terminal_renderer)
+
+add_executable(test_contours test_contours.cpp)
+target_link_libraries(test_contours PRIVATE ascii-engine-core)
+
+add_test(NAME ContourTest COMMAND test_contours)
+
+if(ASCII_USE_OPENCV)
+    add_executable(test_integration test_integration.cpp)
+    target_link_libraries(test_integration PRIVATE ascii-engine-core)
+    add_test(NAME IntegrationTest COMMAND test_integration)
 endif()
-
-add_test(NAME IntegrationTest COMMAND test_integration)
 
 if(TARGET ascii-engine)
     add_test(NAME MainHelpTest COMMAND $<TARGET_FILE:ascii-engine> --help)
+    add_test(NAME HelpNoContoursTest COMMAND $<TARGET_FILE:ascii-engine> --help)
+    set_tests_properties(HelpNoContoursTest PROPERTIES
+        PASS_REGULAR_EXPRESSION "--no-contours")
+    add_test(NAME HelpContourThresholdTest COMMAND $<TARGET_FILE:ascii-engine> --help)
+    set_tests_properties(HelpContourThresholdTest PROPERTIES
+        PASS_REGULAR_EXPRESSION "--contour-thresh")
+    add_test(NAME UnsupportedOutputTest
+        COMMAND $<TARGET_FILE:ascii-engine> dummy-input --no-audio -o out.unsupported)
+    set_tests_properties(UnsupportedOutputTest PROPERTIES
+        WILL_FAIL TRUE
+        PASS_REGULAR_EXPRESSION "Unsupported output extension")
+    add_test(NAME ImageTextSmoke
+        COMMAND $<TARGET_FILE:ascii-engine>
+            ${CMAKE_SOURCE_DIR}/images/potsepis.png
+            --cols 16 --rows 8 --fast --no-audio
+            -o ${CMAKE_CURRENT_BINARY_DIR}/smoke.txt)
+    add_test(NAME ImageStillSmoke
+        COMMAND $<TARGET_FILE:ascii-engine>
+            ${CMAKE_SOURCE_DIR}/images/potsepis.png
+            --cols 16 --rows 8 --fast --no-audio
+            -o ${CMAKE_CURRENT_BINARY_DIR}/smoke.jpg)
+    add_test(NAME ImageReplaySmoke
+        COMMAND $<TARGET_FILE:ascii-engine>
+            ${CMAKE_SOURCE_DIR}/images/potsepis.png
+            --cols 16 --rows 8 --fast --no-audio
+            --replay ${CMAKE_CURRENT_BINARY_DIR}/smoke.areplay
+            -o ${CMAKE_CURRENT_BINARY_DIR}/smoke_replay.txt)
+    add_test(NAME ReplayInspectSmoke
+        COMMAND $<TARGET_FILE:ascii-engine>
+            --inspect-replay ${CMAKE_CURRENT_BINARY_DIR}/smoke.areplay)
+    set_tests_properties(ReplayInspectSmoke PROPERTIES
+        DEPENDS ImageReplaySmoke
+        PASS_REGULAR_EXPRESSION "frames: 1")
 endif()

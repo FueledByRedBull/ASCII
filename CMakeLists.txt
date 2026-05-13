@@ -17,7 +17,7 @@ else()
     set(CMAKE_CXX_FLAGS_DEBUG "-g -fsanitize=address")
 endif()
 
-option(ASCII_USE_OPENCV "Enable OpenCV utility paths" ON)
+option(ASCII_USE_OPENCV "Enable OpenCV utility paths" OFF)
 option(ASCII_ENABLE_AVX2 "Enable AVX2 optimized kernels where supported" OFF)
 
 if(ASCII_USE_OPENCV)
@@ -73,14 +73,16 @@ endif()
 
 find_package(OpenMP)
 
-add_executable(ascii-engine
-    src/main.cpp
+add_library(ascii-engine-core STATIC
     src/core/config.cpp
     src/core/color_space.cpp
     src/core/replay.cpp
     src/core/motion.cpp
     src/core/frame_source.cpp
     src/core/pipeline.cpp
+    src/core/pipeline_runtime_cache.cpp
+    src/core/frame_composer.cpp
+    src/core/contour_extractor.cpp
     src/core/cell_stats.cpp
     src/core/edge_detector.cpp
     src/core/temporal.cpp
@@ -100,27 +102,30 @@ add_executable(ascii-engine
     src/cli/args.cpp
 )
 
-target_include_directories(ascii-engine PRIVATE
+target_include_directories(ascii-engine-core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor
+)
+
+target_include_directories(ascii-engine-core PRIVATE
     ${SDL2_INCLUDE_DIRS}
     ${LIBAV_INCLUDE_DIRS}
     ${ZSTD_INCLUDE_DIRS}
 )
 
 if(ASCII_USE_OPENCV)
-    target_include_directories(ascii-engine PRIVATE ${OpenCV_INCLUDE_DIRS})
+    target_include_directories(ascii-engine-core PRIVATE ${OpenCV_INCLUDE_DIRS})
 endif()
 
 if(SDL2_LIBRARY_DIRS OR LIBAV_LIBRARY_DIRS OR ZSTD_LIBRARY_DIRS)
-    target_link_directories(ascii-engine PRIVATE
+    target_link_directories(ascii-engine-core PUBLIC
         ${SDL2_LIBRARY_DIRS}
         ${LIBAV_LIBRARY_DIRS}
         ${ZSTD_LIBRARY_DIRS}
     )
 endif()
 
-target_link_libraries(ascii-engine PRIVATE
+target_link_libraries(ascii-engine-core PUBLIC
     ${SDL2_LIBRARIES}
     ${AVFORMAT_LIB}
     ${AVCODEC_LIB}
@@ -131,37 +136,40 @@ target_link_libraries(ascii-engine PRIVATE
 )
 
 if(ASCII_USE_OPENCV)
-    target_link_libraries(ascii-engine PRIVATE ${OpenCV_LIBS})
+    target_link_libraries(ascii-engine-core PUBLIC ${OpenCV_LIBS})
 endif()
 
 if(OpenMP_CXX_FOUND)
-    target_link_libraries(ascii-engine PRIVATE OpenMP::OpenMP_CXX)
-    target_compile_definitions(ascii-engine PRIVATE HAS_OPENMP)
+    target_link_libraries(ascii-engine-core PUBLIC OpenMP::OpenMP_CXX)
+    target_compile_definitions(ascii-engine-core PUBLIC HAS_OPENMP)
 endif()
 
 if(MSVC)
-    target_compile_options(ascii-engine PRIVATE /W4)
-    target_compile_definitions(ascii-engine PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(ascii-engine-core PRIVATE /W4)
+    target_compile_definitions(ascii-engine-core PUBLIC _CRT_SECURE_NO_WARNINGS)
 else()
-    target_compile_options(ascii-engine PRIVATE -Wall -Wextra)
+    target_compile_options(ascii-engine-core PRIVATE -Wall -Wextra)
 endif()
 
 if(ASCII_ENABLE_AVX2)
     if(MSVC)
-        target_compile_options(ascii-engine PRIVATE /arch:AVX2)
+        target_compile_options(ascii-engine-core PRIVATE /arch:AVX2)
     else()
-        target_compile_options(ascii-engine PRIVATE -mavx2)
+        target_compile_options(ascii-engine-core PRIVATE -mavx2)
     endif()
 endif()
 
 if(WIN32)
-    target_compile_definitions(ascii-engine PRIVATE _WIN32 WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_link_libraries(ascii-engine PRIVATE ws2_32)
+    target_compile_definitions(ascii-engine-core PUBLIC _WIN32 WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(ascii-engine-core PUBLIC ws2_32)
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT MSVC)
-    target_link_options(ascii-engine PRIVATE -fsanitize=address)
+    target_link_options(ascii-engine-core PUBLIC -fsanitize=address)
 endif()
+
+add_executable(ascii-engine src/main.cpp)
+target_link_libraries(ascii-engine PRIVATE ascii-engine-core)
 
 option(BUILD_TESTS "Build unit tests" ON)
 if(BUILD_TESTS)

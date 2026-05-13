@@ -25,7 +25,7 @@ void test_temporal_initialization() {
     assert(smoother.frame_state()[0].initialized);
     assert(edge1 == 0.3f);
     
-    std::cout << "✓ Temporal initialization test passed\n";
+    std::cout << "[OK] Temporal initialization test passed\n";
 }
 
 void test_edge_bounds_checking() {
@@ -56,7 +56,7 @@ void test_edge_bounds_checking() {
     assert(edges.magnitude.width() == 3);
     assert(edges.magnitude.height() == 3);
     
-    std::cout << "✓ Edge bounds checking test passed\n";
+    std::cout << "[OK] Edge bounds checking test passed\n";
 }
 
 void test_font_validation() {
@@ -72,7 +72,7 @@ void test_font_validation() {
     auto mem_result = loader.load_from_memory(small_data, 4);
     assert(!mem_result.success());
     
-    std::cout << "✓ Font validation test passed\n";
+    std::cout << "[OK] Font validation test passed\n";
 }
 
 int main() {
@@ -83,14 +83,14 @@ int main() {
         test_edge_bounds_checking();
         test_font_validation();
         
-        std::cout << "\n✓ All critical fixes tests passed!\n";
+        std::cout << "\n[OK] All critical fixes tests passed!\n";
         return 0;
         
     } catch (const std::exception& e) {
-        std::cerr << "✗ Test failed with exception: " << e.what() << "\n";
+        std::cerr << "[FAIL] Test failed with exception: " << e.what() << "\n";
         return 1;
     } catch (...) {
-        std::cerr << "✗ Test failed with unknown exception\n";
+        std::cerr << "[FAIL] Test failed with unknown exception\n";
         return 1;
     }
 }

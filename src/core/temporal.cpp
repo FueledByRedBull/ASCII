@@ -167,6 +167,7 @@ float TemporalSmoother::smooth_edge_strength(int idx, float new_value) {
     
     if (!state.initialized) {
         state.smoothed_edge_strength = new_value;
+        state.initialized = true;
         return new_value;
     }
     
@@ -181,6 +182,7 @@ float TemporalSmoother::smooth_coherence(int idx, float new_value) {
     
     if (!state.initialized) {
         state.smoothed_coherence = new_value;
+        state.initialized = true;
         return new_value;
     }
     

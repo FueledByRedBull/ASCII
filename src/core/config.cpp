@@ -176,6 +176,23 @@ bool Config::validate(std::string& error) const {
         error = "edge.global_percentile must be between 0.0 and 1.0 (exclusive)";
         return false;
     }
+    if (edge.contour_min_occupancy < 0.0f || edge.contour_min_occupancy > 1.0f) {
+        error = "edge.contour_min_occupancy must be between 0.0 and 1.0";
+        return false;
+    }
+    if (edge.contour_min_pixels < 0 || edge.contour_min_pixels > 4096) {
+        error = "edge.contour_min_pixels must be between 0 and 4096";
+        return false;
+    }
+    if (edge.contour_dominance_ratio < 1.0f || edge.contour_intersection_ratio < 1.0f) {
+        error = "edge contour ratios must be >= 1.0";
+        return false;
+    }
+    if (edge.contour_dog_sigma_inner <= 0.0f || edge.contour_dog_sigma_outer <= 0.0f ||
+        edge.contour_dog_sigma_inner >= edge.contour_dog_sigma_outer) {
+        error = "edge contour DoG sigmas must be > 0 and inner < outer";
+        return false;
+    }
     if (temporal.alpha < 0.0f || temporal.alpha > 1.0f) {
         error = "temporal.alpha must be between 0.0 and 1.0";
         return false;
@@ -202,6 +219,10 @@ bool Config::validate(std::string& error) const {
     }
     if (temporal.motion_still_scene_threshold < 0.0f || temporal.motion_still_scene_threshold > 1.0f) {
         error = "temporal.motion_still_scene_threshold must be between 0.0 and 1.0";
+        return false;
+    }
+    if (temporal.motion_cap_pixels < 0) {
+        error = "temporal.motion_cap_pixels must be non-negative";
         return false;
     }
     if (temporal.wavelet_strength < 0.0f || temporal.wavelet_strength > 1.0f) {
@@ -334,6 +355,13 @@ std::string Config::compute_hash() const {
     h = hash_combine(h, hash_int(edge.tile_size));
     h = hash_combine(h, hash_float(edge.dark_scene_floor));
     h = hash_combine(h, hash_float(edge.global_percentile));
+    h = hash_combine(h, hash_int(static_cast<int>(edge.contours_enabled)));
+    h = hash_combine(h, hash_float(edge.contour_min_occupancy));
+    h = hash_combine(h, hash_int(edge.contour_min_pixels));
+    h = hash_combine(h, hash_float(edge.contour_dominance_ratio));
+    h = hash_combine(h, hash_float(edge.contour_intersection_ratio));
+    h = hash_combine(h, hash_float(edge.contour_dog_sigma_inner));
+    h = hash_combine(h, hash_float(edge.contour_dog_sigma_outer));
     h = hash_combine(h, hash_float(temporal.alpha));
     h = hash_combine(h, hash_float(temporal.transition_penalty));
     h = hash_combine(h, hash_float(temporal.edge_enter_threshold));
@@ -359,6 +387,7 @@ std::string Config::compute_hash() const {
     h = hash_combine(h, hash_float(selector.weight_contrast));
     h = hash_combine(h, hash_float(selector.weight_frequency));
     h = hash_combine(h, hash_float(selector.weight_texture));
+    h = hash_combine(h, hash_int(static_cast<int>(selector.use_orientation_matching)));
     h = hash_combine(h, hash_int(static_cast<int>(selector.enable_frequency_matching)));
     h = hash_combine(h, hash_int(static_cast<int>(selector.enable_gabor_texture)));
     h = hash_combine(h, hash_int(static_cast<int>(color.mode)));
@@ -444,6 +473,13 @@ std::optional<Config> Config::load(const std::string& path) {
             if (auto v = edge["tile_size"].value<int>()) cfg.edge.tile_size = *v;
             if (auto v = edge["dark_scene_floor"].value<double>()) cfg.edge.dark_scene_floor = static_cast<float>(*v);
             if (auto v = edge["global_percentile"].value<double>()) cfg.edge.global_percentile = static_cast<float>(*v);
+            if (auto v = edge["contours_enabled"].value<bool>()) cfg.edge.contours_enabled = *v;
+            if (auto v = edge["contour_min_occupancy"].value<double>()) cfg.edge.contour_min_occupancy = static_cast<float>(*v);
+            if (auto v = edge["contour_min_pixels"].value<int>()) cfg.edge.contour_min_pixels = *v;
+            if (auto v = edge["contour_dominance_ratio"].value<double>()) cfg.edge.contour_dominance_ratio = static_cast<float>(*v);
+            if (auto v = edge["contour_intersection_ratio"].value<double>()) cfg.edge.contour_intersection_ratio = static_cast<float>(*v);
+            if (auto v = edge["contour_dog_sigma_inner"].value<double>()) cfg.edge.contour_dog_sigma_inner = static_cast<float>(*v);
+            if (auto v = edge["contour_dog_sigma_outer"].value<double>()) cfg.edge.contour_dog_sigma_outer = static_cast<float>(*v);
         }
         
         if (auto temporal = tbl["temporal"]) {
@@ -475,6 +511,7 @@ std::optional<Config> Config::load(const std::string& path) {
             if (auto v = selector["weight_contrast"].value<double>()) cfg.selector.weight_contrast = static_cast<float>(*v);
             if (auto v = selector["weight_frequency"].value<double>()) cfg.selector.weight_frequency = static_cast<float>(*v);
             if (auto v = selector["weight_texture"].value<double>()) cfg.selector.weight_texture = static_cast<float>(*v);
+            if (auto v = selector["use_orientation_matching"].value<bool>()) cfg.selector.use_orientation_matching = *v;
             if (auto v = selector["enable_frequency_matching"].value<bool>()) cfg.selector.enable_frequency_matching = *v;
             if (auto v = selector["enable_gabor_texture"].value<bool>()) cfg.selector.enable_gabor_texture = *v;
             if (auto v = selector["use_simple_orientation"].value<bool>()) cfg.selector.use_simple_orientation = *v;
@@ -586,6 +623,19 @@ Config merge_config(Config base, const Config& override) {
         result.edge.dark_scene_floor = override.edge.dark_scene_floor;
     if (override.edge.global_percentile != Config::defaults().edge.global_percentile)
         result.edge.global_percentile = override.edge.global_percentile;
+    result.edge.contours_enabled = override.edge.contours_enabled;
+    if (override.edge.contour_min_occupancy != Config::defaults().edge.contour_min_occupancy)
+        result.edge.contour_min_occupancy = override.edge.contour_min_occupancy;
+    if (override.edge.contour_min_pixels != Config::defaults().edge.contour_min_pixels)
+        result.edge.contour_min_pixels = override.edge.contour_min_pixels;
+    if (override.edge.contour_dominance_ratio != Config::defaults().edge.contour_dominance_ratio)
+        result.edge.contour_dominance_ratio = override.edge.contour_dominance_ratio;
+    if (override.edge.contour_intersection_ratio != Config::defaults().edge.contour_intersection_ratio)
+        result.edge.contour_intersection_ratio = override.edge.contour_intersection_ratio;
+    if (override.edge.contour_dog_sigma_inner != Config::defaults().edge.contour_dog_sigma_inner)
+        result.edge.contour_dog_sigma_inner = override.edge.contour_dog_sigma_inner;
+    if (override.edge.contour_dog_sigma_outer != Config::defaults().edge.contour_dog_sigma_outer)
+        result.edge.contour_dog_sigma_outer = override.edge.contour_dog_sigma_outer;
     
     if (override.temporal.alpha != Config::defaults().temporal.alpha)
         result.temporal.alpha = override.temporal.alpha;
@@ -664,6 +714,7 @@ Config merge_config(Config base, const Config& override) {
     if (override.color.block_spectral_iterations != Config::defaults().color.block_spectral_iterations)
         result.color.block_spectral_iterations = override.color.block_spectral_iterations;
     
+    result.selector.use_orientation_matching = override.selector.use_orientation_matching;
     result.debug = override.debug;
     if (!override.profile.empty()) result.profile = override.profile;
     
@@ -700,6 +751,10 @@ Config apply_cli_overrides(Config config, const Args& args) {
     if (args.blur_sigma != Config::defaults().edge.blur_sigma)
         config.edge.blur_sigma = args.blur_sigma;
     config.edge.use_hysteresis = args.use_hysteresis;
+    if (args.contours_enabled_set)
+        config.edge.contours_enabled = args.contours_enabled;
+    if (args.contour_threshold >= 0.0f)
+        config.edge.contour_min_occupancy = args.contour_threshold;
     
     if (args.temporal_alpha != Config::defaults().temporal.alpha)
         config.temporal.alpha = args.temporal_alpha;
@@ -723,6 +778,7 @@ Config apply_cli_overrides(Config config, const Args& args) {
     if (args.color_mode_set)
         config.color.mode = args.color_mode;
     
+    config.selector.use_orientation_matching = args.use_orientation_matching;
     config.selector.use_simple_orientation = args.use_simple_orientation;
 
     if (args.fps != Config::defaults().fps) config.fps = args.fps;

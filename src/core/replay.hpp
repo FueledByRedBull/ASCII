@@ -76,10 +76,12 @@ public:
     
     const ReplayHeader& header() const { return header_; }
     uint32_t frame_count() const { return header_.frame_count; }
+    size_t indexed_frame_count() const { return frame_offsets_.size(); }
     int cols() const { return static_cast<int>(header_.cols); }
     int rows() const { return static_cast<int>(header_.rows); }
     std::string config_hash() const { return std::string(header_.config_hash, 8); }
     bool is_open() const { return file_ != nullptr; }
+    void reset_decode_state();
     
 private:
     FILE* file_ = nullptr;

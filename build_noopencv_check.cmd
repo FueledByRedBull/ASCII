@@ -35,6 +35,11 @@ if exist "!LOCAL_VCPKG!\scripts\buildsystems\vcpkg.cmake" (
     set "VCPKG_ROOT=!LOCAL_VCPKG!"
     set "USE_VCPKG_TOOLCHAIN=1"
     echo [INFO] Using local vcpkg toolchain: !VCPKG_ROOT!
+) else if exist "!LOCAL_VCPKG!" (
+    echo [ERROR] Found project-local .tools\vcpkg, but its CMake toolchain is missing.
+    echo [HINT] Run setup_windows_deps.cmd to bootstrap and install SDL2, FFmpeg, and zstd.
+    set "EXITCODE=1"
+    goto :done
 ) else if defined VCPKG_ROOT (
     if exist "!VCPKG_ROOT!\scripts\buildsystems\vcpkg.cmake" (
         set "USE_VCPKG_TOOLCHAIN=1"

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap vcpkg dependencies
+        shell: cmd
+        run: |
+          git clone https://github.com/microsoft/vcpkg .tools\vcpkg
+          .tools\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          .tools\vcpkg\vcpkg.exe install sdl2:x64-windows ffmpeg:x64-windows zstd:x64-windows
+      - name: Configure
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cmake -S . -B build -G Ninja -DASCII_USE_OPENCV=OFF -DASCII_ENABLE_AVX2=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="%CD%\.tools\vcpkg\scripts\buildsystems\vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cmake --build build -j 4
+      - name: Test
+        shell: cmd
+        run: ctest --test-dir build --output-on-failure
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libzstd-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DASCII_USE_OPENCV=OFF -DASCII_ENABLE_AVX2=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install ninja sdl2 ffmpeg zstd
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DASCII_USE_OPENCV=OFF -DASCII_ENABLE_AVX2=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

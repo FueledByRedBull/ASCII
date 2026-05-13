@@ -203,6 +203,9 @@ struct CellStats {
     float edge_strength_max = 0.0f;
     float edge_occupancy = 0.0f;
     bool is_edge_cell = false;
+    bool has_contour = false;
+    uint32_t contour_codepoint = 0;
+    float contour_strength = 0.0f;
     
     float structure_coherence = 0.0f;
     float dominant_orientation = 0.0f;

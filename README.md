@@ -1,12 +1,15 @@
 # ASCII Engine
 
+Status: active implementation. The current v1 baseline is the no-OpenCV, non-AVX2 build; OpenCV, AVX2, webcam, and audio are optional or deferred areas tracked in `PROJECT.md`.
+
 ASCII Engine is a deterministic, non-ML C++20 renderer that converts video and images into ANSI/ASCII output for terminal playback and file export.
 
 ## Highlights
 
 - Real-time terminal rendering from video/images.
-- Output modes: live terminal, `.txt`, encoded video, `.areplay` replay.
+- Output modes: live terminal, `.txt`, encoded video, verified still image formats, `.areplay` replay.
 - Color modes: `none`, `16`, `256`, `truecolor`, `blockart`.
+- Default CPU contour overlay maps strong local edges to `-`, `|`, `/`, `\`, and `+`.
 - Content presets: `natural`, `anime`, `ui`.
 - Deterministic replay capture with config hash.
 
@@ -15,7 +18,7 @@ ASCII Engine is a deterministic, non-ML C++20 renderer that converts video and i
 Recent performance-oriented updates include:
 
 1. Hierarchical motion estimation (coarse-to-fine pyramid refinement)
-2. SIMD hot paths (AVX2/SSE2 where available, scalar fallback)
+2. SIMD hot paths when explicitly enabled; the default release baseline is scalar-portable
 3. Cache-aware tiling in edge/blur kernels
 4. Optimized in-tree FFT phase-correlation (plan/twiddle caching, workspace reuse, rectangular FFT)
 5. Stable-frame cache reuse for pipeline and cell stats
@@ -123,6 +126,8 @@ Webcam:
 .\build-noopencv\ascii-engine.exe webcam --fps 30
 ```
 
+Webcam support is v2/deferred for the no-OpenCV baseline and requires an OpenCV-capable build.
+
 Export video:
 
 ```powershell
@@ -147,6 +152,33 @@ Write replay:
 .\build-noopencv\ascii-engine.exe ".\media\clip.mp4" --replay run.areplay
 ```
 
+Inspect replay:
+
+```powershell
+.\build-noopencv\ascii-engine.exe --inspect-replay run.areplay
+```
+
+Play replay or export replay text:
+
+```powershell
+.\build-noopencv\ascii-engine.exe --play-replay run.areplay
+.\build-noopencv\ascii-engine.exe --play-replay run.areplay -o replay.txt
+```
+
+### Output Matrix
+
+| Source | Target | Behavior |
+|---|---|---|
+| image | none | render once to terminal |
+| image | `.txt` | write one text file |
+| image | video (`.mp4`, `.gif`, etc.) | encode a one-frame video/animation |
+| image | still (`.jpg`, `.jpeg`, `.bmp`) | write one rendered still image |
+| video | none | live terminal playback |
+| video | `.txt` | write numbered text frames |
+| video | video (`.mp4`, `.gif`, etc.) | encode all rendered frames |
+| video | still (`.jpg`, `.jpeg`, `.bmp`) | write the first rendered frame only |
+| any | unsupported extension | fail before processing with a clear error |
+
 ### Common Flags
 
 - `--profile natural|anime|ui`
@@ -154,6 +186,7 @@ Write replay:
 - `--color none|16|256|truecolor|blockart`
 - `--fps N --cols N --rows N`
 - `--edge-thresh X --blur X --temporal X`
+- `--no-contours --contour-thresh X`
 - `--motion-solve-div N --motion-reuse N --motion-still-thresh X`
 - `--phase-interval N --phase-scene-trigger X`
 - `--scale fit|fill|stretch`
@@ -201,7 +234,7 @@ Precedence:
 2. config file
 3. CLI overrides
 
-Presets are documented in `PRESETS.md`.
+Preset details and development/release notes are documented in `PROJECT.md`.
 
 ## Troubleshooting
 

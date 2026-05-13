@@ -2,11 +2,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <cstdio>
 #include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/dict.h>
+#include <libavutil/error.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
@@ -31,8 +34,29 @@ bool ends_with_ci(const std::string& value, const std::string& suffix) {
     return true;
 }
 
-AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output) {
-    const AVPixelFormat fallback = gif_output ? AV_PIX_FMT_RGB8 : AV_PIX_FMT_YUV420P;
+bool is_still_image_output(const std::string& filename) {
+    return ends_with_ci(filename, ".png") ||
+           ends_with_ci(filename, ".jpg") ||
+           ends_with_ci(filename, ".jpeg") ||
+           ends_with_ci(filename, ".bmp") ||
+           ends_with_ci(filename, ".webp") ||
+           ends_with_ci(filename, ".tif") ||
+           ends_with_ci(filename, ".tiff");
+}
+
+AVCodecID preferred_still_codec_id(const std::string& filename) {
+    if (ends_with_ci(filename, ".png")) return AV_CODEC_ID_PNG;
+    if (ends_with_ci(filename, ".jpg") || ends_with_ci(filename, ".jpeg")) return AV_CODEC_ID_MJPEG;
+    if (ends_with_ci(filename, ".bmp")) return AV_CODEC_ID_BMP;
+    if (ends_with_ci(filename, ".webp")) return AV_CODEC_ID_WEBP;
+    if (ends_with_ci(filename, ".tif") || ends_with_ci(filename, ".tiff")) return AV_CODEC_ID_TIFF;
+    return AV_CODEC_ID_NONE;
+}
+
+AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output, bool still_image_output) {
+    const AVPixelFormat fallback = gif_output
+        ? AV_PIX_FMT_RGB8
+        : (still_image_output ? AV_PIX_FMT_RGB24 : AV_PIX_FMT_YUV420P);
     if (!codec) {
         return fallback;
     }
@@ -64,6 +88,35 @@ AVPixelFormat choose_pixel_format(const AVCodec* codec, bool gif_output) {
         for (AVPixelFormat pf : preferred) {
             if (has_format(pf)) {
                 return pf;
+            }
+        }
+    } else if (still_image_output) {
+        if (codec->id == AV_CODEC_ID_MJPEG) {
+            const AVPixelFormat preferred_jpeg[] = {
+                AV_PIX_FMT_YUVJ444P,
+                AV_PIX_FMT_YUVJ422P,
+                AV_PIX_FMT_YUVJ420P,
+                AV_PIX_FMT_YUV444P,
+                AV_PIX_FMT_YUV422P,
+                AV_PIX_FMT_YUV420P
+            };
+            for (AVPixelFormat pf : preferred_jpeg) {
+                if (has_format(pf)) {
+                    return pf;
+                }
+            }
+        } else {
+            const AVPixelFormat preferred[] = {
+                AV_PIX_FMT_RGBA,
+                AV_PIX_FMT_RGB24,
+                AV_PIX_FMT_BGRA,
+                AV_PIX_FMT_BGR24,
+                AV_PIX_FMT_YUV420P
+            };
+            for (AVPixelFormat pf : preferred) {
+                if (has_format(pf)) {
+                    return pf;
+                }
             }
         }
     } else if (has_format(AV_PIX_FMT_YUV420P)) {
@@ -101,6 +154,14 @@ void push_codec_candidate(std::vector<const AVCodec*>& out, const AVCodec* codec
     out.push_back(codec);
 }
 
+std::string ffmpeg_error_string(int errnum) {
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+    if (av_strerror(errnum, buf, sizeof(buf)) == 0) {
+        return std::string(buf);
+    }
+    return "unknown ffmpeg error";
+}
+
 }  // namespace
 
 VideoEncoder::VideoEncoder() = default;
@@ -110,11 +171,21 @@ VideoEncoder::~VideoEncoder() {
 }
 
 bool VideoEncoder::open(const std::string& filename, const Config& config) {
+    close();
+    last_error_.clear();
     config_ = config;
+    output_filename_ = filename;
     output_is_gif_ = ends_with_ci(filename, ".gif");
+    output_is_still_image_ = is_still_image_output(filename);
+    wrote_still_image_frame_ = false;
     
     int ret = avformat_alloc_output_context2(&format_ctx_, nullptr, nullptr, filename.c_str());
     if (ret < 0 || !format_ctx_) {
+        if (ret < 0) {
+            set_error("Failed to allocate output context: " + ffmpeg_error_string(ret));
+        } else {
+            set_error("Failed to allocate output context");
+        }
         return false;
     }
     
@@ -126,17 +197,25 @@ bool VideoEncoder::open(const std::string& filename, const Config& config) {
     if (!(format_ctx_->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&format_ctx_->pb, filename.c_str(), AVIO_FLAG_WRITE);
         if (ret < 0) {
+            set_error("Failed to open output file: " + ffmpeg_error_string(ret));
             close();
             return false;
         }
     }
     
-    return write_header();
+    if (!write_header()) {
+        close();
+        return false;
+    }
+    return true;
 }
 
-void VideoEncoder::close() {
+bool VideoEncoder::close() {
+    bool ok = true;
     if (format_ctx_) {
-        write_trailer();
+        if (!write_trailer()) {
+            ok = false;
+        }
         
         if (codec_ctx_) {
             avcodec_free_context(&codec_ctx_);
@@ -164,13 +243,25 @@ void VideoEncoder::close() {
     }
     
     pts_ = 0;
+    output_filename_.clear();
     output_is_gif_ = false;
+    output_is_still_image_ = false;
+    wrote_still_image_frame_ = false;
+    return ok;
 }
 
 bool VideoEncoder::write_frame(const FrameBuffer& frame) {
-    if (!is_open() || !frame_) return false;
+    last_frame_written_ = false;
+    if (!is_open() || !frame_) {
+        set_error("Encoder is not open");
+        return false;
+    }
+    if (output_is_still_image_ && wrote_still_image_frame_) {
+        return true;
+    }
 
     if (av_frame_make_writable(frame_) < 0) {
+        set_error("Failed to make output frame writable");
         return false;
     }
     
@@ -180,7 +271,10 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
             config_.width, config_.height, codec_ctx_->pix_fmt,
             SWS_BILINEAR, nullptr, nullptr, nullptr
         );
-        if (!sws_ctx_) return false;
+        if (!sws_ctx_) {
+            set_error("Failed to create scaling context");
+            return false;
+        }
     }
     
     const uint8_t* src_data[1] = { frame.data() };
@@ -192,19 +286,33 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
     frame_->pts = pts_++;
     
     int ret = avcodec_send_frame(codec_ctx_, frame_);
-    if (ret < 0) return false;
+    if (ret < 0) {
+        set_error("Failed to send frame to encoder: " + ffmpeg_error_string(ret));
+        return false;
+    }
     
     while (ret >= 0) {
         ret = avcodec_receive_packet(codec_ctx_, pkt_);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-        if (ret < 0) return false;
+        if (ret < 0) {
+            set_error("Failed to receive encoded packet: " + ffmpeg_error_string(ret));
+            return false;
+        }
         
         av_packet_rescale_ts(pkt_, codec_ctx_->time_base, stream_->time_base);
         pkt_->stream_index = stream_->index;
         
         ret = av_interleaved_write_frame(format_ctx_, pkt_);
-        if (ret < 0) return false;
+        if (ret < 0) {
+            set_error("Failed to write encoded packet: " + ffmpeg_error_string(ret));
+            return false;
+        }
     }
+
+    if (output_is_still_image_) {
+        wrote_still_image_frame_ = true;
+    }
+    last_frame_written_ = true;
     
     return true;
 }
@@ -213,6 +321,29 @@ bool VideoEncoder::init_codec() {
     std::vector<const AVCodec*> candidates;
     if (output_is_gif_) {
         push_codec_candidate(candidates, avcodec_find_encoder(AV_CODEC_ID_GIF));
+    } else if (output_is_still_image_) {
+        const AVCodecID preferred_id = preferred_still_codec_id(output_filename_);
+        if (preferred_id != AV_CODEC_ID_NONE) {
+            push_codec_candidate(candidates, avcodec_find_encoder(preferred_id));
+            // For explicit still-image extensions (e.g. .png), avoid falling back
+            // to unrelated codecs such as MJPEG which can trigger range/pixfmt warnings.
+            if (candidates.empty()) {
+                set_error("No encoder available for requested still-image extension");
+                return false;
+            }
+        } else if (candidates.empty()) {
+            const AVCodecID guessed = av_guess_codec(
+                format_ctx_->oformat, nullptr, output_filename_.c_str(), nullptr, AVMEDIA_TYPE_VIDEO);
+            if (guessed != AV_CODEC_ID_NONE) {
+                push_codec_candidate(candidates, avcodec_find_encoder(guessed));
+            }
+        }
+        if (candidates.empty()) {
+            const AVCodecID muxer_default = format_ctx_->oformat->video_codec;
+            if (muxer_default != AV_CODEC_ID_NONE) {
+                push_codec_candidate(candidates, avcodec_find_encoder(muxer_default));
+            }
+        }
     } else {
         push_codec_candidate(candidates, avcodec_find_encoder_by_name(config_.codec.c_str()));
         push_codec_candidate(candidates, avcodec_find_encoder_by_name("libx264"));
@@ -222,6 +353,7 @@ bool VideoEncoder::init_codec() {
         push_codec_candidate(candidates, avcodec_find_encoder(AV_CODEC_ID_H264));
     }
     if (candidates.empty()) {
+        set_error("No encoder candidates available for output format");
         return false;
     }
 
@@ -248,10 +380,13 @@ bool VideoEncoder::init_codec() {
         codec_ctx_->height = config_.height;
         codec_ctx_->time_base = {1, config_.fps};
         codec_ctx_->framerate = {config_.fps, 1};
-        codec_ctx_->pix_fmt = choose_pixel_format(codec, output_is_gif_);
+        codec_ctx_->pix_fmt = choose_pixel_format(codec, output_is_gif_, output_is_still_image_);
         codec_ctx_->gop_size = std::max(1, config_.fps);
-        if (!output_is_gif_) {
+        if (!output_is_gif_ && !output_is_still_image_) {
             codec_ctx_->bit_rate = config_.bitrate;
+        }
+        if (codec->id == AV_CODEC_ID_MJPEG) {
+            codec_ctx_->color_range = AVCOL_RANGE_JPEG;
         }
 
         if (format_ctx_->oformat->flags & AVFMT_GLOBALHEADER) {
@@ -267,37 +402,67 @@ bool VideoEncoder::init_codec() {
             opened_codec = codec;
             break;
         }
+        set_error("Failed to open encoder '" + std::string(codec->name ? codec->name : "unknown") +
+                  "': " + ffmpeg_error_string(ret));
         avcodec_free_context(&codec_ctx_);
     }
     if (!opened_codec || !codec_ctx_) {
+        if (last_error_.empty()) {
+            set_error("Failed to open any compatible encoder");
+        }
         return false;
     }
     
     stream_ = avformat_new_stream(format_ctx_, nullptr);
-    if (!stream_) return false;
+    if (!stream_) {
+        set_error("Failed to create output stream");
+        return false;
+    }
     
     stream_->time_base = codec_ctx_->time_base;
     int ret = avcodec_parameters_from_context(stream_->codecpar, codec_ctx_);
-    if (ret < 0) return false;
+    if (ret < 0) {
+        set_error("Failed to copy codec parameters: " + ffmpeg_error_string(ret));
+        return false;
+    }
     
     frame_ = av_frame_alloc();
-    if (!frame_) return false;
+    if (!frame_) {
+        set_error("Failed to allocate output frame");
+        return false;
+    }
     
     frame_->format = codec_ctx_->pix_fmt;
     frame_->width = codec_ctx_->width;
     frame_->height = codec_ctx_->height;
     
     ret = av_frame_get_buffer(frame_, 0);
-    if (ret < 0) return false;
+    if (ret < 0) {
+        set_error("Failed to allocate frame buffer: " + ffmpeg_error_string(ret));
+        return false;
+    }
     
     pkt_ = av_packet_alloc();
-    if (!pkt_) return false;
+    if (!pkt_) {
+        set_error("Failed to allocate packet");
+        return false;
+    }
     
     return true;
 }
 
 bool VideoEncoder::write_header() {
-    return avformat_write_header(format_ctx_, nullptr) >= 0;
+    AVDictionary* options = nullptr;
+    if (output_is_still_image_) {
+        av_dict_set(&options, "update", "1", 0);
+    }
+    const int ret = avformat_write_header(format_ctx_, options ? &options : nullptr);
+    av_dict_free(&options);
+    if (ret < 0) {
+        set_error("Failed to write output header: " + ffmpeg_error_string(ret));
+        return false;
+    }
+    return true;
 }
 
 bool VideoEncoder::write_trailer() {
@@ -309,16 +474,33 @@ bool VideoEncoder::write_trailer() {
         while (true) {
             int ret = avcodec_receive_packet(codec_ctx_, pkt_);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-            if (ret < 0) return false;
+            if (ret < 0) {
+                set_error("Failed to flush encoder packet: " + ffmpeg_error_string(ret));
+                return false;
+            }
             
             av_packet_rescale_ts(pkt_, codec_ctx_->time_base, stream_->time_base);
             pkt_->stream_index = stream_->index;
             ret = av_interleaved_write_frame(format_ctx_, pkt_);
-            if (ret < 0) return false;
+            if (ret < 0) {
+                set_error("Failed to write trailer packet: " + ffmpeg_error_string(ret));
+                return false;
+            }
         }
     }
     
-    return av_write_trailer(format_ctx_) >= 0;
+    const int ret = av_write_trailer(format_ctx_);
+    if (ret < 0) {
+        set_error("Failed to finalize output file: " + ffmpeg_error_string(ret));
+        return false;
+    }
+    return true;
+}
+
+void VideoEncoder::set_error(const std::string& message) {
+    if (!message.empty()) {
+        last_error_ = message;
+    }
 }
 
 }

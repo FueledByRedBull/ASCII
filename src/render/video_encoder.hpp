@@ -30,14 +30,18 @@ public:
     ~VideoEncoder();
     
     bool open(const std::string& filename, const Config& config);
-    void close();
+    bool close();
     bool write_frame(const FrameBuffer& frame);
     bool is_open() const { return format_ctx_ != nullptr; }
+    bool last_frame_was_written() const { return last_frame_written_; }
+    bool is_still_image_target() const { return output_is_still_image_; }
+    const std::string& last_error() const { return last_error_; }
     
 private:
     bool init_codec();
     bool write_header();
     bool write_trailer();
+    void set_error(const std::string& message);
     
     Config config_;
     AVFormatContext* format_ctx_ = nullptr;
@@ -47,7 +51,12 @@ private:
     AVPacket* pkt_ = nullptr;
     SwsContext* sws_ctx_ = nullptr;
     int64_t pts_ = 0;
+    std::string output_filename_;
     bool output_is_gif_ = false;
+    bool output_is_still_image_ = false;
+    bool wrote_still_image_frame_ = false;
+    bool last_frame_written_ = false;
+    std::string last_error_;
 };
 
 }
