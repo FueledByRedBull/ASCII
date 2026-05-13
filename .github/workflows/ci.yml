@@ -4,11 +4,27 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows-msvc:
     runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\.vcpkg-bincache,readwrite
     steps:
       - uses: actions/checkout@v4
+      - name: Cache vcpkg artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .vcpkg-bincache
+            .tools/vcpkg/downloads
+          key: windows-vcpkg-${{ hashFiles('.github/workflows/ci.yml', 'CMakeLists.txt') }}
+          restore-keys: |
+            windows-vcpkg-
       - name: Bootstrap vcpkg dependencies
         shell: cmd
         run: |
@@ -31,12 +47,13 @@ jobs:
 
   linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libzstd-dev
+          sudo apt-get install -y --no-install-recommends ninja-build libsdl2-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libzstd-dev
       - name: Configure
         run: cmake -S . -B build -G Ninja -DASCII_USE_OPENCV=OFF -DASCII_ENABLE_AVX2=OFF -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -46,10 +63,18 @@ jobs:
 
   macos:
     runs-on: macos-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: macos-homebrew-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            macos-homebrew-
       - name: Install dependencies
-        run: brew install ninja sdl2 ffmpeg zstd
+        run: brew list ninja sdl2 ffmpeg zstd >/dev/null 2>&1 || brew install ninja sdl2 ffmpeg zstd
       - name: Configure
         run: cmake -S . -B build -G Ninja -DASCII_USE_OPENCV=OFF -DASCII_ENABLE_AVX2=OFF -DCMAKE_BUILD_TYPE=Release
       - name: Build
