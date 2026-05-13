@@ -496,4 +496,8 @@ Pipeline::Result Pipeline::process(const FrameBuffer& input, const ProcessOption
     return result;
 }
 
+Pipeline::ProcessOptions Pipeline::default_process_options() {
+    return ProcessOptions{};
+}
+
 }

@@ -76,7 +76,8 @@ public:
         const std::vector<CellStats>* reuse_cell_stats = nullptr;
     };
     
-    Result process(const FrameBuffer& input, const ProcessOptions& options = ProcessOptions{});
+    static ProcessOptions default_process_options();
+    Result process(const FrameBuffer& input, const ProcessOptions& options = default_process_options());
     
 private:
     struct ResizePlan {
