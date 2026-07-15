@@ -261,7 +261,11 @@ void GlyphCache::render_and_analyze(uint32_t codepoint) {
     scaled.bearing_y = src.bearing_y;
     scaled.pixels.assign(static_cast<size_t>(cell_width_) * cell_height_, 0);
 
-    if (!src.empty()) {
+    if (is_renderer_block) {
+        // Block elements are renderer primitives, so their cell coverage must
+        // not depend on the platform font's bearings or internal padding.
+        scaled = procedural_block(codepoint, cell_width_, cell_height_);
+    } else if (!src.empty()) {
         const float shrink = std::min({1.0f,
             static_cast<float>(cell_width_) / std::max(1, src.width),
             static_cast<float>(cell_height_) / std::max(1, src.height)});
@@ -284,8 +288,6 @@ void GlyphCache::render_and_analyze(uint32_t codepoint) {
                 scaled.pixels[static_cast<size_t>(dy) * cell_width_ + dx] = bilinear_sample(src, sx, sy);
             }
         }
-    } else if (is_renderer_block) {
-        scaled = procedural_block(codepoint, cell_width_, cell_height_);
     }
     
     bitmaps_[codepoint] = std::move(scaled);
