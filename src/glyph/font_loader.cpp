@@ -263,9 +263,10 @@ bool FontLoader::validate_font_file(const std::string& path) {
                          (static_cast<uint32_t>(bytes[2]) << 8) |
                          static_cast<uint32_t>(bytes[3]);
     
-    return (signature == 0x00010000) || 
-           (signature == 0x74727565) || 
-           (signature == 0x4F54544F);
+    return (signature == 0x00010000) ||
+           (signature == 0x74727565) ||
+           (signature == 0x4F54544F) ||
+           (signature == 0x74746366);  // TrueType Collection (ttcf), used by macOS Menlo.
 }
 
 bool FontLoader::validate_font_data(const uint8_t* data, size_t size) {
@@ -278,9 +279,10 @@ bool FontLoader::validate_font_data(const uint8_t* data, size_t size) {
                          (static_cast<uint32_t>(data[2]) << 8) |
                          static_cast<uint32_t>(data[3]);
     
-    return (signature == 0x00010000) || 
-           (signature == 0x74727565) || 
-           (signature == 0x4F54544F);
+    return (signature == 0x00010000) ||
+           (signature == 0x74727565) ||
+           (signature == 0x4F54544F) ||
+           (signature == 0x74746366);  // TrueType Collection (ttcf), used by macOS Menlo.
 }
 
 Result FontLoader::load_system_fallback(float pixel_height) {

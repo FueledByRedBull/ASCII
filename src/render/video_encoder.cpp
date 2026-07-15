@@ -509,6 +509,8 @@ bool VideoEncoder::init_codec() {
     }
     
     stream_->time_base = codec_ctx_->time_base;
+    stream_->avg_frame_rate = codec_ctx_->framerate;
+    stream_->r_frame_rate = codec_ctx_->framerate;
     int ret = avcodec_parameters_from_context(stream_->codecpar, codec_ctx_);
     if (ret < 0) {
         set_error("Failed to copy codec parameters: " + ffmpeg_error_string(ret));

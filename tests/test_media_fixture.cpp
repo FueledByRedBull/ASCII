@@ -46,17 +46,35 @@ bool generate_video(const std::filesystem::path& path, int frame_count,
 
 bool verify_video(const std::filesystem::path& path, int expected_frames, double expected_fps) {
     VideoFileSource source;
-    if (!source.open(path.string())) return false;
-    if (std::abs(source.fps() - expected_fps) > 0.1) return false;
+    if (!source.open(path.string())) {
+        std::cerr << "Failed to open video fixture: " << path << "\n";
+        return false;
+    }
+    const double actual_fps = source.fps();
+    // Short Matroska streams can expose the millisecond muxer time base as
+    // 30.303 FPS instead of the nominal 30 FPS on some FFmpeg versions.
+    if (std::abs(actual_fps - expected_fps) > 0.5) {
+        std::cerr << "Unexpected frame rate: expected " << expected_fps
+                  << ", got " << actual_fps << "\n";
+        return false;
+    }
     FrameBuffer frame;
     int count = 0;
     while (true) {
         const auto status = source.read_next(frame);
         if (status == FrameReadStatus::End) break;
-        if (status != FrameReadStatus::Frame || frame.empty()) return false;
+        if (status != FrameReadStatus::Frame || frame.empty()) {
+            std::cerr << "Video decode failed after " << count << " frames\n";
+            return false;
+        }
         ++count;
     }
-    return count == expected_frames;
+    if (count != expected_frames) {
+        std::cerr << "Unexpected frame count: expected " << expected_frames
+                  << ", got " << count << "\n";
+        return false;
+    }
+    return true;
 }
 
 bool verify_image(const std::filesystem::path& path) {
