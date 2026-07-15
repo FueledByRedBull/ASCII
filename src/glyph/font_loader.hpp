@@ -38,6 +38,7 @@ public:
     
     int line_height() const { return line_height_; }
     int max_advance() const { return max_advance_; }
+    int ascent_pixels() const { return static_cast<int>(std::lround(ascent_ * scale_)); }
     float pixel_height() const { return pixel_height_; }
     
     static std::string find_system_monospace_font();

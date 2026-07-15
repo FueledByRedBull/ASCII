@@ -184,7 +184,9 @@ void Pipeline::resize_for_cells(const FloatImage& input, FloatImage& output) con
     
     cv::Mat scaled_mat;
     cv::Size scale_size(plan.scale_w, plan.scale_h);
-    cv::resize(input_mat, scaled_mat, scale_size, 0, 0, cv::INTER_LINEAR);
+    const int interpolation = (plan.scale_w < input.width() || plan.scale_h < input.height())
+        ? cv::INTER_AREA : cv::INTER_LINEAR;
+    cv::resize(input_mat, scaled_mat, scale_size, 0, 0, interpolation);
     
     if (output.width() != plan.target_w || output.height() != plan.target_h) {
         output = FloatImage(plan.target_w, plan.target_h, 0.0f);
@@ -192,6 +194,9 @@ void Pipeline::resize_for_cells(const FloatImage& input, FloatImage& output) con
         output.fill(0.0f);
     }
     
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < plan.scale_h; ++y) {
         int dst_y = y + plan.offset_y;
         if (dst_y < 0 || dst_y >= plan.target_h) continue;
@@ -211,21 +216,49 @@ void Pipeline::resize_for_cells(const FloatImage& input, FloatImage& output) con
     float x_ratio = static_cast<float>(input.width()) / plan.scale_w;
     float y_ratio = static_cast<float>(input.height()) / plan.scale_h;
     
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < plan.scale_h; ++y) {
         int dst_y = y + plan.offset_y;
         if (dst_y < 0 || dst_y >= plan.target_h) continue;
-        float src_y = y * y_ratio;
-        int y0 = static_cast<int>(src_y);
+        float src_y = (y + 0.5f) * y_ratio - 0.5f;
+        int y0 = static_cast<int>(std::floor(src_y));
         int y1 = std::min(y0 + 1, input.height() - 1);
         float fy = src_y - y0;
+        y0 = std::clamp(y0, 0, input.height() - 1);
+        y1 = std::clamp(y1, 0, input.height() - 1);
         
         for (int x = 0; x < plan.scale_w; ++x) {
             int dst_x = x + plan.offset_x;
             if (dst_x < 0 || dst_x >= plan.target_w) continue;
-            float src_x = x * x_ratio;
-            int x0 = static_cast<int>(src_x);
+            if (x_ratio > 1.0f || y_ratio > 1.0f) {
+                const float sx0 = x * x_ratio;
+                const float sx1 = (x + 1) * x_ratio;
+                const float sy0 = y * y_ratio;
+                const float sy1 = (y + 1) * y_ratio;
+                double sum = 0.0;
+                double weight_sum = 0.0;
+                for (int sy = static_cast<int>(std::floor(sy0)); sy < static_cast<int>(std::ceil(sy1)); ++sy) {
+                    if (sy < 0 || sy >= input.height()) continue;
+                    const float wy = std::max(0.0f, std::min(sy1, sy + 1.0f) - std::max(sy0, static_cast<float>(sy)));
+                    for (int sx = static_cast<int>(std::floor(sx0)); sx < static_cast<int>(std::ceil(sx1)); ++sx) {
+                        if (sx < 0 || sx >= input.width()) continue;
+                        const float wx = std::max(0.0f, std::min(sx1, sx + 1.0f) - std::max(sx0, static_cast<float>(sx)));
+                        const float weight = wx * wy;
+                        sum += input.get(sx, sy) * weight;
+                        weight_sum += weight;
+                    }
+                }
+                output.set(dst_x, dst_y, weight_sum > 0.0 ? static_cast<float>(sum / weight_sum) : 0.0f);
+                continue;
+            }
+            float src_x = (x + 0.5f) * x_ratio - 0.5f;
+            int x0 = static_cast<int>(std::floor(src_x));
             int x1 = std::min(x0 + 1, input.width() - 1);
             float fx = src_x - x0;
+            x0 = std::clamp(x0, 0, input.width() - 1);
+            x1 = std::clamp(x1, 0, input.width() - 1);
             
             float v00 = input.get_clamped(x0, y0);
             float v10 = input.get_clamped(x1, y0);
@@ -255,7 +288,9 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
     
     cv::Mat scaled_mat;
     cv::Size scale_size(plan.scale_w, plan.scale_h);
-    cv::resize(input_mat, scaled_mat, scale_size, 0, 0, cv::INTER_LINEAR);
+    const int interpolation = (plan.scale_w < input.width() || plan.scale_h < input.height())
+        ? cv::INTER_AREA : cv::INTER_LINEAR;
+    cv::resize(input_mat, scaled_mat, scale_size, 0, 0, interpolation);
     
     if (output.width() != target_w || output.height() != target_h) {
         output = FrameBuffer(target_w, target_h, Color(0, 0, 0, 255));
@@ -290,10 +325,12 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
     for (int y = 0; y < plan.scale_h; ++y) {
         int dst_y = y + plan.offset_y;
         if (dst_y < 0 || dst_y >= plan.target_h) continue;
-        const float src_y = y * y_ratio;
-        int y0 = static_cast<int>(src_y);
+        const float src_y = (y + 0.5f) * y_ratio - 0.5f;
+        int y0 = static_cast<int>(std::floor(src_y));
         int y1 = std::min(y0 + 1, src_h - 1);
         const float fy = src_y - y0;
+        y0 = std::clamp(y0, 0, src_h - 1);
+        y1 = std::clamp(y1, 0, src_h - 1);
         const float wy0 = 1.0f - fy;
 
         const size_t row0 = static_cast<size_t>(y0) * src_w * 4;
@@ -303,10 +340,38 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
         for (int x = 0; x < plan.scale_w; ++x) {
             int dst_x = x + plan.offset_x;
             if (dst_x < 0 || dst_x >= plan.target_w) continue;
-            const float src_x = x * x_ratio;
-            int x0 = static_cast<int>(src_x);
+            if (x_ratio > 1.0f || y_ratio > 1.0f) {
+                const float sx0 = x * x_ratio;
+                const float sx1 = (x + 1) * x_ratio;
+                const float sy0 = y * y_ratio;
+                const float sy1 = (y + 1) * y_ratio;
+                double sums[4] = {};
+                double weight_sum = 0.0;
+                for (int sy = static_cast<int>(std::floor(sy0)); sy < static_cast<int>(std::ceil(sy1)); ++sy) {
+                    if (sy < 0 || sy >= src_h) continue;
+                    const float wy = std::max(0.0f, std::min(sy1, sy + 1.0f) - std::max(sy0, static_cast<float>(sy)));
+                    for (int sx = static_cast<int>(std::floor(sx0)); sx < static_cast<int>(std::ceil(sx1)); ++sx) {
+                        if (sx < 0 || sx >= src_w) continue;
+                        const float wx = std::max(0.0f, std::min(sx1, sx + 1.0f) - std::max(sx0, static_cast<float>(sx)));
+                        const float weight = wx * wy;
+                        const size_t source_index = (static_cast<size_t>(sy) * src_w + sx) * 4;
+                        for (int c = 0; c < 4; ++c) sums[c] += src[source_index + c] * weight;
+                        weight_sum += weight;
+                    }
+                }
+                const size_t output_index = dst_row + static_cast<size_t>(dst_x) * 4;
+                for (int c = 0; c < 4; ++c) {
+                    dst[output_index + c] = weight_sum > 0.0
+                        ? static_cast<uint8_t>(std::clamp(sums[c] / weight_sum, 0.0, 255.0)) : 0;
+                }
+                continue;
+            }
+            const float src_x = (x + 0.5f) * x_ratio - 0.5f;
+            int x0 = static_cast<int>(std::floor(src_x));
             int x1 = std::min(x0 + 1, src_w - 1);
             const float fx = src_x - x0;
+            x0 = std::clamp(x0, 0, src_w - 1);
+            x1 = std::clamp(x1, 0, src_w - 1);
             const float wx0 = 1.0f - fx;
 
             const size_t i00 = row0 + static_cast<size_t>(x0) * 4;
@@ -340,68 +405,59 @@ void Pipeline::compute_cell_mean_colors(const FrameBuffer& input,
         return;
     }
 
-    std::vector<int> counts(static_cast<size_t>(cell_count), 0);
-    ResizePlan plan = compute_resize_plan(input.width(), input.height());
+    const ResizePlan plan = compute_resize_plan(input.width(), input.height());
     const int src_w = input.width();
     const int src_h = input.height();
     const uint8_t* src = input.data();
-    const float x_ratio = static_cast<float>(src_w) / plan.scale_w;
-    const float y_ratio = static_cast<float>(src_h) / plan.scale_h;
+    const float x_ratio = static_cast<float>(src_w) / static_cast<float>(plan.scale_w);
+    const float y_ratio = static_cast<float>(src_h) / static_cast<float>(plan.scale_h);
 
-    for (int y = 0; y < plan.scale_h; ++y) {
-        const int dst_y = y + plan.offset_y;
-        if (dst_y < 0 || dst_y >= target_h) continue;
-        const int cell_row = dst_y / config_.cell_height;
-        if (cell_row < 0 || cell_row >= grid_rows) continue;
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int cell = 0; cell < cell_count; ++cell) {
+        const int cell_col = cell % grid_cols;
+        const int cell_row = cell / grid_cols;
+        const int dst_x0 = cell_col * config_.cell_width;
+        const int dst_y0 = cell_row * config_.cell_height;
+        const int dst_x1 = std::min(dst_x0 + config_.cell_width, target_w);
+        const int dst_y1 = std::min(dst_y0 + config_.cell_height, target_h);
+        const int image_x0 = std::max(dst_x0, plan.offset_x);
+        const int image_y0 = std::max(dst_y0, plan.offset_y);
+        const int image_x1 = std::min(dst_x1, plan.offset_x + plan.scale_w);
+        const int image_y1 = std::min(dst_y1, plan.offset_y + plan.scale_h);
+        if (image_x0 >= image_x1 || image_y0 >= image_y1) continue;
 
-        const float src_y = y * y_ratio;
-        const int y0 = static_cast<int>(src_y);
-        const int y1 = std::min(y0 + 1, src_h - 1);
-        const float fy = src_y - y0;
-        const float wy0 = 1.0f - fy;
-        const size_t row0 = static_cast<size_t>(y0) * src_w * 4;
-        const size_t row1 = static_cast<size_t>(y1) * src_w * 4;
-
-        for (int x = 0; x < plan.scale_w; ++x) {
-            const int dst_x = x + plan.offset_x;
-            if (dst_x < 0 || dst_x >= target_w) continue;
-            const int cell_col = dst_x / config_.cell_width;
-            if (cell_col < 0 || cell_col >= grid_cols) continue;
-
-            const float src_x = x * x_ratio;
-            const int x0 = static_cast<int>(src_x);
-            const int x1 = std::min(x0 + 1, src_w - 1);
-            const float fx = src_x - x0;
-            const float wx0 = 1.0f - fx;
-
-            const size_t i00 = row0 + static_cast<size_t>(x0) * 4;
-            const size_t i10 = row0 + static_cast<size_t>(x1) * 4;
-            const size_t i01 = row1 + static_cast<size_t>(x0) * 4;
-            const size_t i11 = row1 + static_cast<size_t>(x1) * 4;
-
-            const size_t cell_idx = static_cast<size_t>(cell_row) * grid_cols + cell_col;
-            for (int c = 0; c < 3; ++c) {
-                const float p00 = static_cast<float>(src[i00 + static_cast<size_t>(c)]);
-                const float p10 = static_cast<float>(src[i10 + static_cast<size_t>(c)]);
-                const float p01 = static_cast<float>(src[i01 + static_cast<size_t>(c)]);
-                const float p11 = static_cast<float>(src[i11 + static_cast<size_t>(c)]);
-                const float v0 = p00 * wx0 + p10 * fx;
-                const float v1 = p01 * wx0 + p11 * fx;
-                const uint8_t srgb = static_cast<uint8_t>(
-                    std::clamp(v0 * wy0 + v1 * fy, 0.0f, 255.0f));
-                means[cell_idx][c] += linear_lut_[srgb];
+        const float sx0 = (image_x0 - plan.offset_x) * x_ratio;
+        const float sx1 = (image_x1 - plan.offset_x) * x_ratio;
+        const float sy0 = (image_y0 - plan.offset_y) * y_ratio;
+        const float sy1 = (image_y1 - plan.offset_y) * y_ratio;
+        double sums[3] = {};
+        double weight_sum = 0.0;
+        for (int sy = static_cast<int>(std::floor(sy0));
+             sy < static_cast<int>(std::ceil(sy1)); ++sy) {
+            if (sy < 0 || sy >= src_h) continue;
+            const float wy = std::max(
+                0.0f, std::min(sy1, sy + 1.0f) - std::max(sy0, static_cast<float>(sy)));
+            const size_t row = static_cast<size_t>(sy) * src_w * 4;
+            for (int sx = static_cast<int>(std::floor(sx0));
+                 sx < static_cast<int>(std::ceil(sx1)); ++sx) {
+                if (sx < 0 || sx >= src_w) continue;
+                const float wx = std::max(
+                    0.0f, std::min(sx1, sx + 1.0f) - std::max(sx0, static_cast<float>(sx)));
+                const float weight = wx * wy;
+                const size_t pixel = row + static_cast<size_t>(sx) * 4;
+                sums[0] += linear_lut_[src[pixel]] * weight;
+                sums[1] += linear_lut_[src[pixel + 1]] * weight;
+                sums[2] += linear_lut_[src[pixel + 2]] * weight;
+                weight_sum += weight;
             }
-            counts[cell_idx] += 1;
         }
-    }
-
-    for (size_t i = 0; i < means.size(); ++i) {
-        const int n = counts[i];
-        if (n > 0) {
-            const float inv = 1.0f / static_cast<float>(n);
-            means[i][0] *= inv;
-            means[i][1] *= inv;
-            means[i][2] *= inv;
+        if (weight_sum > 0.0) {
+            const float inv = static_cast<float>(1.0 / weight_sum);
+            means[static_cast<size_t>(cell)][0] = static_cast<float>(sums[0]) * inv;
+            means[static_cast<size_t>(cell)][1] = static_cast<float>(sums[1]) * inv;
+            means[static_cast<size_t>(cell)][2] = static_cast<float>(sums[2]) * inv;
         }
     }
 }
@@ -414,34 +470,7 @@ Pipeline::Result Pipeline::process(const FrameBuffer& input, const ProcessOption
 
     // Drive edge-mask generation through the detector's configured path
     // (multi-scale + adaptive thresholds), then compute gx/gy for cell stats.
-    result.edges = edge_detector_.detect(result.luminance);
-
-    if (config_.multi_scale) {
-        // Reuse detector output to avoid recomputing multi-scale gradients.
-        // gx/gy are reconstructed from magnitude+orientation.
-        const int w = result.luminance.width();
-        const int h = result.luminance.height();
-        result.gradients.gx = FloatImage(w, h, 0.0f);
-        result.gradients.gy = FloatImage(w, h, 0.0f);
-
-        const float* mag = result.edges.magnitude.data();
-        const float* ori = result.edges.orientation.data();
-        float* gx = result.gradients.gx.data();
-        float* gy = result.gradients.gy.data();
-        const int n = w * h;
-
-#ifdef HAS_OPENMP
-        #pragma omp parallel for
-#endif
-        for (int i = 0; i < n; ++i) {
-            float m = mag[i];
-            float a = ori[i];
-            gx[i] = m * std::cos(a);
-            gy[i] = m * std::sin(a);
-        }
-    } else {
-        result.gradients = edge_detector_.compute_gradients(result.luminance);
-    }
+    result.edges = edge_detector_.detect(result.luminance, &result.gradients);
     
     result.grid_cols = cell_aggregator_.grid_cols(result.luminance.width());
     result.grid_rows = cell_aggregator_.grid_rows(result.luminance.height());

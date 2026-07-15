@@ -30,12 +30,16 @@ public:
     void build(const std::vector<CellStats>& cells, int cols, int rows);
     Sample sample(int x, int y, float luminance) const;
     bool valid() const { return built_ && !weight_.empty(); }
+    int grid_cols() const { return cols_; }
+    int grid_rows() const { return rows_; }
 
 private:
     Config config_;
     int cols_ = 0;
     int rows_ = 0;
     int range_bins_ = 16;
+    int source_cols_ = 0;
+    int source_rows_ = 0;
     bool built_ = false;
 
     std::vector<float> sum_r_;

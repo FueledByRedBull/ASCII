@@ -371,6 +371,9 @@ std::vector<CellStats> CellStatsAggregator::compute(const FloatImage& luminance,
     
     IntegralImage integral_lum(luminance);
     FloatImage luminance_sq(luminance.width(), luminance.height());
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < luminance.height(); ++y) {
         for (int x = 0; x < luminance.width(); ++x) {
             float v = luminance.get(x, y);

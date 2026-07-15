@@ -34,7 +34,9 @@ public:
     void invalidate();
 
 private:
-    std::vector<float> prev_scene_signature_;
+    std::vector<uint8_t> previous_frame_bytes_;
+    int previous_frame_width_ = 0;
+    int previous_frame_height_ = 0;
     Pipeline::Result cached_pipeline_result_;
     bool have_cached_pipeline_result_ = false;
     bool cached_pipeline_has_color_buffer_ = false;
@@ -44,8 +46,8 @@ private:
     bool have_cached_cell_stats_ = false;
     int cell_stats_reuse_frames_ = 0;
 
-    static void build_scene_signature(const FrameBuffer& frame, std::vector<float>& signature);
-    static float signature_scene_change(const std::vector<float>& a, const std::vector<float>& b);
+    bool is_identical_to_previous(const FrameBuffer& frame) const;
+    void remember_frame(const FrameBuffer& frame);
 };
 
 }  // namespace ascii

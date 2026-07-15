@@ -20,7 +20,7 @@ public:
     TerminalRenderer(Terminal& term, ColorMode color_mode);
     
     void set_grid_size(int cols, int rows);
-    void set_color_mode(ColorMode mode) { color_mode_ = mode; }
+    void set_color_mode(ColorMode mode);
     void render(const std::vector<ASCIICell>& cells);
     std::string render_to_string(const std::vector<ASCIICell>& cells);
     
@@ -32,6 +32,7 @@ private:
     std::vector<ASCIICell> prev_buffer_;
     std::vector<char> out_buffer_;
     std::string write_buffer_;
+    bool force_color_reset_ = false;
 
     void append_utf8(uint32_t cp);
     void append_cursor_move(int row, int col);

@@ -32,6 +32,7 @@
 *.sln.docstates
 *.swp
 *.tmp
+*.tmp-*
 *.bak
 
 # Binary and object outputs
@@ -53,6 +54,7 @@
 /output.txt
 /test_critical_fixes
 /images/
+/static_analysis_semgrep_*/
 
 # Internal planning and audit docs
 /PLAN.md

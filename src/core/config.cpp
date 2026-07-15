@@ -116,6 +116,12 @@ bool Config::validate(std::string& error) const {
         error = "grid.cell_height must be between 1 and 64";
         return false;
     }
+    const uint64_t pixel_width = static_cast<uint64_t>(grid.cols) * grid.cell_width;
+    const uint64_t pixel_height = static_cast<uint64_t>(grid.rows) * grid.cell_height;
+    if (pixel_width != 0 && pixel_height > 100000000ull / pixel_width) {
+        error = "configured output grid exceeds the 100 megapixel safety cap";
+        return false;
+    }
     if (grid.quad_tree_max_depth < 0 || grid.quad_tree_max_depth > 6) {
         error = "grid.quad_tree_max_depth must be between 0 and 6";
         return false;
@@ -273,6 +279,16 @@ bool Config::validate(std::string& error) const {
         error = "selector.mode must be 'simple' or 'histogram'";
         return false;
     }
+    if (selector.char_set != "basic" && selector.char_set != "blocks" &&
+        selector.char_set != "line-art") {
+        error = "selector.char_set must be 'basic', 'blocks', or 'line-art'";
+        return false;
+    }
+    if (!debug.mode.empty() && debug.mode != "grayscale" && debug.mode != "edges" &&
+        debug.mode != "orientation") {
+        error = "debug.mode must be '', 'grayscale', 'edges', or 'orientation'";
+        return false;
+    }
     if (!profile.empty() && profile != "natural" && profile != "anime" && profile != "ui") {
         error = "profile must be '', 'natural', 'anime', or 'ui'";
         return false;
@@ -424,6 +440,11 @@ std::optional<Config> Config::load(const std::string& path) {
         
         Config cfg = defaults();
         cfg.config_path = path;
+
+        if (auto v = tbl["profile"].value<std::string>()) {
+            cfg.profile = *v;
+            apply_content_profile(cfg);
+        }
         
         if (auto v = tbl["config_version"].value<int>()) {
             if (*v != CONFIG_VERSION) {
@@ -546,8 +567,6 @@ std::optional<Config> Config::load(const std::string& path) {
             if (auto v = debug["profile_live"].value<bool>()) cfg.debug.profile_live = *v;
             if (auto v = debug["strict_memory"].value<bool>()) cfg.debug.strict_memory = *v;
         }
-        if (auto v = tbl["profile"].value<std::string>()) cfg.profile = *v;
-        
         if (auto v = tbl["font_path"].value<std::string>()) cfg.font_path = *v;
         if (auto v = tbl["fps"].value<int>()) cfg.fps = *v;
         if (auto v = tbl["no_audio"].value<bool>()) cfg.no_audio = *v;
@@ -729,34 +748,35 @@ Config apply_cli_overrides(Config config, const Args& args) {
     if (!args.input.empty()) config.input.source = args.input;
     if (!args.output.empty()) config.output.target = args.output;
     if (!args.replay_path.empty()) config.output.replay_path = args.replay_path;
-    if (!args.font_path.empty()) config.font_path = args.font_path;
-    if (!args.char_set.empty()) config.selector.char_set = args.char_set;
+    if (args.font_path_set) config.font_path = args.font_path;
+    if (args.char_set_set) config.selector.char_set = args.char_set;
     if (!args.profile.empty()) config.profile = args.profile;
     if (!args.debug_mode.empty()) {
         config.debug.enabled = true;
         config.debug.mode = args.debug_mode;
     }
     
-    if (args.cols > 0) config.grid.cols = args.cols;
-    if (args.rows > 0) config.grid.rows = args.rows;
+    if (args.cols_set) config.grid.cols = args.cols;
+    if (args.rows_set) config.grid.rows = args.rows;
     if (args.cell_width != Config::defaults().grid.cell_width) 
         config.grid.cell_width = args.cell_width;
     if (args.cell_height != Config::defaults().grid.cell_height) 
         config.grid.cell_height = args.cell_height;
     
-    if (args.edge_threshold != Config::defaults().edge.high_threshold) {
+    if (args.edge_threshold_set) {
         config.edge.high_threshold = args.edge_threshold;
         config.edge.low_threshold = args.edge_threshold * 0.5f;
     }
-    if (args.blur_sigma != Config::defaults().edge.blur_sigma)
+    if (args.blur_sigma_set)
         config.edge.blur_sigma = args.blur_sigma;
-    config.edge.use_hysteresis = args.use_hysteresis;
+    if (args.use_hysteresis_set)
+        config.edge.use_hysteresis = args.use_hysteresis;
     if (args.contours_enabled_set)
         config.edge.contours_enabled = args.contours_enabled;
     if (args.contour_threshold >= 0.0f)
         config.edge.contour_min_occupancy = args.contour_threshold;
     
-    if (args.temporal_alpha != Config::defaults().temporal.alpha)
+    if (args.temporal_alpha_set)
         config.temporal.alpha = args.temporal_alpha;
     if (args.motion_solve_divisor > 0)
         config.temporal.motion_solve_divisor = args.motion_solve_divisor;
@@ -773,18 +793,20 @@ Config apply_cli_overrides(Config config, const Args& args) {
     if (args.motion_still_scene_threshold >= 0.0f)
         config.temporal.motion_still_scene_threshold = args.motion_still_scene_threshold;
     
-    if (!args.scale_mode.empty()) config.grid.scale_mode = args.scale_mode;
+    if (args.scale_mode_set) config.grid.scale_mode = args.scale_mode;
     
     if (args.color_mode_set)
         config.color.mode = args.color_mode;
     
-    config.selector.use_orientation_matching = args.use_orientation_matching;
-    config.selector.use_simple_orientation = args.use_simple_orientation;
+    if (args.orientation_mode_set) {
+        config.selector.use_orientation_matching = args.use_orientation_matching;
+        config.selector.use_simple_orientation = args.use_simple_orientation;
+    }
 
-    if (args.fps != Config::defaults().fps) config.fps = args.fps;
-    config.no_audio = args.no_audio;
-    config.debug.profile_live = args.profile_live;
-    config.debug.strict_memory = args.strict_memory;
+    if (args.fps_set) config.fps = args.fps;
+    if (args.no_audio_set) config.no_audio = args.no_audio;
+    if (args.profile_live_set) config.debug.profile_live = args.profile_live;
+    if (args.strict_memory_set) config.debug.strict_memory = args.strict_memory;
     if (args.fast_mode) {
         config.selector.mode = "simple";
         config.selector.use_simple_orientation = true;

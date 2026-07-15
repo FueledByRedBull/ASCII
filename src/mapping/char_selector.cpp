@@ -18,14 +18,19 @@ float CharSelector::compute_loss(const CellStats& cell, const GlyphStats& glyph)
     float brightness_err = std::abs(cell.mean_luminance - glyph.brightness);
     
     float orientation_err = 0.0f;
-    if (!glyph.orientation_hist.empty()) {
+    if (config_.use_orientation_matching && !glyph.orientation_hist.empty()) {
         int bins = std::min(static_cast<int>(glyph.orientation_hist.size()), 8);
         float dot = 0.0f;
         float norm_cell = 0.0f;
         float norm_glyph = 0.0f;
-        for (int i = 0; i < bins; ++i) {
+        const int folded_bins = bins >= 2 ? bins / 2 : bins;
+        for (int i = 0; i < folded_bins; ++i) {
             float cv = cell.orientation_histogram[i];
             float gv = glyph.orientation_hist[i];
+            if (i + folded_bins < bins) {
+                cv += cell.orientation_histogram[i + folded_bins];
+                gv += glyph.orientation_hist[i + folded_bins];
+            }
             dot += cv * gv;
             norm_cell += cv * cv;
             norm_glyph += gv * gv;
@@ -67,6 +72,12 @@ float CharSelector::compute_loss(const CellStats& cell, const GlyphStats& glyph)
                   config_.loss_weights.texture * texture_err) / norm;
     
     return loss;
+}
+
+float CharSelector::compute_loss_for_glyph(const CellStats& cell, uint32_t glyph) const {
+    if (!cache_ || glyph == 0) return 1.0f;
+    const auto* stats = cache_->get_stats(glyph);
+    return stats ? compute_loss(cell, *stats) : 1.0f;
 }
 
 float CharSelector::compute_transition_cost(uint32_t from_glyph, uint32_t to_glyph) const {
@@ -141,8 +152,7 @@ CharSelector::Selection CharSelector::select_unified(const CellStats& stats, uin
     
     if (stats.is_edge_cell && !cache_->get_edge_glyphs().empty()) {
         auto edge_glyphs = cache_->get_edge_glyphs();
-        int edge_stride = (adaptive <= 0) ? 2 : 1;
-        for (size_t ei = 0; ei < edge_glyphs.size(); ei += edge_stride) {
+        for (size_t ei = 0; ei < edge_glyphs.size(); ++ei) {
             uint32_t cp = edge_glyphs[ei];
             auto* glyph_stats = cache_->get_stats(cp);
             if (!glyph_stats) continue;
@@ -161,14 +171,7 @@ CharSelector::Selection CharSelector::select_unified(const CellStats& stats, uin
         }
     }
     
-    int search_radius = 10 + adaptive * 5;
-    int stride = 1;
-    int start_idx = static_cast<int>(sorted.size() * stats.mean_luminance);
-    start_idx = std::clamp(start_idx - search_radius, 0, static_cast<int>(sorted.size()) - 1);
-    int end_idx = std::min(start_idx + (2 * search_radius + 1), static_cast<int>(sorted.size()));
-    
-    for (int i = start_idx; i < end_idx; i += stride) {
-        uint32_t cp = sorted[i];
+    for (uint32_t cp : sorted) {
         auto* glyph_stats = cache_->get_stats(cp);
         if (!glyph_stats) continue;
 
@@ -201,7 +204,7 @@ CharSelector::Selection CharSelector::select(const CellStats& stats, const Tempo
     if (config_.use_unified_loss) {
         uint32_t prev_glyph = 0;
         if (idx >= 0 && static_cast<size_t>(idx) < smoother.frame_state().size()) {
-            prev_glyph = smoother.frame_state()[idx].last_glyph;
+            prev_glyph = smoother.reference_glyph(idx);
         }
         return select_unified(stats, prev_glyph);
     }
@@ -287,7 +290,8 @@ CharSelector::Selection CharSelector::select_edge_simple(float orientation) {
     };
     constexpr float kPi = 3.14159265358979323846f;
     
-    float normalized = (orientation + kPi) / (2.0f * kPi);
+    const float tangent = orientation + 0.5f * kPi;
+    float normalized = (tangent + kPi) / (2.0f * kPi);
     int bin = static_cast<int>(normalized * 8) % 8;
     if (bin < 0) bin += 8;
     

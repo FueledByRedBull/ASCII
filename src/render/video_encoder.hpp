@@ -52,10 +52,15 @@ private:
     SwsContext* sws_ctx_ = nullptr;
     int64_t pts_ = 0;
     std::string output_filename_;
+    std::string temporary_filename_;
     bool output_is_gif_ = false;
     bool output_is_still_image_ = false;
     bool wrote_still_image_frame_ = false;
     bool last_frame_written_ = false;
+    bool header_written_ = false;
+    bool failed_ = false;
+    int source_width_ = 0;
+    int source_height_ = 0;
     std::string last_error_;
 };
 

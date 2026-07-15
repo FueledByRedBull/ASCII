@@ -1,6 +1,6 @@
 # ASCII Engine
 
-Status: active implementation. The current v1 baseline is the no-OpenCV, non-AVX2 build; OpenCV, AVX2, webcam, and audio are optional or deferred areas tracked in `PROJECT.md`.
+Status: the Windows/MSVC v1 implementation is locally complete for the no-OpenCV, non-AVX2 baseline and passes 34 clean-build tests. Hosted cross-platform CI and a separate clean-machine ZIP smoke test remain release-publication evidence gates tracked in `PROJECT.md`.
 
 ASCII Engine is a deterministic, non-ML C++20 renderer that converts video and images into ANSI/ASCII output for terminal playback and file export.
 
@@ -22,6 +22,7 @@ Recent performance-oriented updates include:
 3. Cache-aware tiling in edge/blur kernels
 4. Optimized in-tree FFT phase-correlation (plan/twiddle caching, workspace reuse, rectangular FFT)
 5. Stable-frame cache reuse for pipeline and cell stats
+6. Parallel independent-cell composition, motion confidence evaluation, area resampling, and contour aggregation when OpenMP is available
 
 These changes target better throughput without changing the external CLI.
 
@@ -98,6 +99,18 @@ Enable AVX2 kernel paths (optional):
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DASCII_USE_OPENCV=OFF -DASCII_ENABLE_AVX2=ON
 cmake --build build --target ascii-engine -j
+```
+
+Run tests:
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+Create the verified Windows x64 release ZIP from a built tree:
+
+```powershell
+.\package_windows_release.ps1 -BuildDirectory build-noopencv -Version 1.0.0
 ```
 
 ## Usage
@@ -179,6 +192,8 @@ Play replay or export replay text:
 | video | still (`.jpg`, `.jpeg`, `.bmp`) | write the first rendered frame only |
 | any | unsupported extension | fail before processing with a clear error |
 
+Requested file outputs are finalized through temporary files and return non-zero on open, write, encode, replay, or truncated-decode failure. PNG is intentionally not an output target in the verified no-OpenCV Windows baseline.
+
 ### Common Flags
 
 - `--profile natural|anime|ui`
@@ -204,6 +219,15 @@ At program exit the engine prints a summary to `stderr`:
 - `[PERF]` total frames, wall time, effective FPS, processing FPS
 - `[PERF_STAGES]` absolute stage times (pipeline, motion, select, render, encode, misc)
 - `[PERF_STAGES_PCT]` stage percentages of processing time
+
+The 2026-07-16 reference measurement used a deterministic 60-frame 1920x1080 video, `120x40`, truecolor, no audio, Release MSVC/OpenMP, no OpenCV, and no AVX2 on a Ryzen 7 7800X3D:
+
+| Mode | Processing | Peak working set |
+|---|---:|---:|
+| Full quality | 10.86 FPS | 136.43 MiB |
+| `--fast --no-contours` | 25.70 FPS | 106.70 MiB |
+
+One-image startup/process/exit measured 0.32 seconds and 75.91 MiB. The explicit speed path meets the 24 FPS reference target; full-quality mode does not, so use `--fast --no-contours` when throughput is the priority.
 
 ### Speed Tuning Example
 
@@ -235,6 +259,10 @@ Precedence:
 3. CLI overrides
 
 Preset details and development/release notes are documented in `PROJECT.md`.
+
+### Font fidelity
+
+`--font` controls glyph analysis and bitmap/video rendering. A terminal still draws emitted codepoints with the terminal application's own font, which can differ from the analysis font. Use still-image or video output when validating against a known font. The `natural`, `anime`, and `ui` profiles are deterministic hand-tuned presets, not claims that one is universally higher quality.
 
 ## Troubleshooting
 

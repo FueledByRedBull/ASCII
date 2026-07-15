@@ -144,6 +144,14 @@ AVCodecID image_codec_from_extension(const std::string& path) {
 }
 #endif
 
+bool valid_source_dimensions(int width, int height, int channels = 4) {
+    constexpr uint64_t kMaxSourcePixels = 100000000ull;
+    return width > 0 && height > 0 && channels > 0 &&
+           static_cast<uint64_t>(width) * static_cast<uint64_t>(height) <= kMaxSourcePixels &&
+           static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * channels <=
+               std::numeric_limits<size_t>::max();
+}
+
 #ifndef ASCII_USE_OPENCV
 struct FFmpegDecoder {
     AVFormatContext* format_ctx = nullptr;
@@ -155,6 +163,9 @@ struct FFmpegDecoder {
     SwsContext* sws_ctx = nullptr;
     int stream_idx = -1;
     bool eof = false;
+    bool input_error = false;
+    int64_t expected_frames = 0;
+    int64_t decoded_frames = 0;
     std::vector<uint8_t> rgb_buffer;
 
     void close() {
@@ -173,12 +184,15 @@ struct FFmpegDecoder {
         format_ctx = nullptr;
         stream_idx = -1;
         eof = false;
+        input_error = false;
+        expected_frames = 0;
+        decoded_frames = 0;
         rgb_buffer.clear();
     }
 };
 
 bool ensure_rgb_pipeline(FFmpegDecoder& dec, int width, int height, AVPixelFormat src_fmt) {
-    if (width <= 0 || height <= 0 || !dec.rgb_frame) {
+    if (!valid_source_dimensions(width, height, 3) || !dec.rgb_frame) {
         return false;
     }
 
@@ -278,6 +292,10 @@ bool init_video_decoder(const std::string& uri, FFmpegDecoder& dec, Size& size, 
     int stream_h = stream->codecpar ? stream->codecpar->height : 0;
     size.width = std::max(dec.codec_ctx->width, stream_w);
     size.height = std::max(dec.codec_ctx->height, stream_h);
+    if (!valid_source_dimensions(size.width, size.height)) {
+        dec.close();
+        return false;
+    }
 
     AVRational fr = stream->avg_frame_rate.num > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
     if (fr.num > 0 && fr.den > 0) {
@@ -286,6 +304,15 @@ bool init_video_decoder(const std::string& uri, FFmpegDecoder& dec, Size& size, 
         fps = 30.0;
     }
     if (fps <= 0.0) fps = 30.0;
+    double duration_seconds = 0.0;
+    if (stream->duration > 0) {
+        duration_seconds = stream->duration * av_q2d(stream->time_base);
+    } else if (dec.format_ctx->duration > 0) {
+        duration_seconds = static_cast<double>(dec.format_ctx->duration) / AV_TIME_BASE;
+    }
+    if (duration_seconds > 0.0 && std::isfinite(duration_seconds)) {
+        dec.expected_frames = std::max<int64_t>(1, static_cast<int64_t>(std::llround(duration_seconds * fps)));
+    }
 
     dec.packet = av_packet_alloc();
     dec.frame = av_frame_alloc();
@@ -320,21 +347,21 @@ void copy_rgb_frame_to_buffer(const AVFrame* rgb, int width, int height, FrameBu
     }
 }
 
-bool decode_next_frame(FFmpegDecoder& dec, Size& size, FrameBuffer& out) {
+FrameReadStatus decode_next_frame(FFmpegDecoder& dec, Size& size, FrameBuffer& out) {
     while (true) {
         int recv = avcodec_receive_frame(dec.codec_ctx, dec.frame);
         if (recv == 0) {
             int frame_w = dec.frame->width;
             int frame_h = dec.frame->height;
             AVPixelFormat src_fmt = static_cast<AVPixelFormat>(dec.frame->format);
-            if (frame_w <= 0 || frame_h <= 0) {
+            if (!valid_source_dimensions(frame_w, frame_h)) {
                 av_frame_unref(dec.frame);
-                return false;
+                return FrameReadStatus::Error;
             }
             if (!dec.sws_ctx || size.width != frame_w || size.height != frame_h) {
                 if (!ensure_rgb_pipeline(dec, frame_w, frame_h, src_fmt)) {
                     av_frame_unref(dec.frame);
-                    return false;
+                    return FrameReadStatus::Error;
                 }
             }
             size.width = frame_w;
@@ -345,24 +372,32 @@ bool decode_next_frame(FFmpegDecoder& dec, Size& size, FrameBuffer& out) {
                       dec.rgb_frame->data, dec.rgb_frame->linesize);
             copy_rgb_frame_to_buffer(dec.rgb_frame, frame_w, frame_h, out);
             av_frame_unref(dec.frame);
-            return true;
+            ++dec.decoded_frames;
+            return FrameReadStatus::Frame;
         }
 
         if (recv != AVERROR(EAGAIN) && recv != AVERROR_EOF) {
-            return false;
+            return FrameReadStatus::Error;
         }
         if (dec.eof && recv == AVERROR_EOF) {
-            return false;
+            const bool incomplete = dec.expected_frames > 0 &&
+                                    dec.decoded_frames + 1 < dec.expected_frames;
+            return (dec.input_error || incomplete) ? FrameReadStatus::Error : FrameReadStatus::End;
         }
 
         bool fed_decoder = false;
         while (!fed_decoder) {
             int read_ret = av_read_frame(dec.format_ctx, dec.packet);
             if (read_ret < 0) {
+                if (read_ret != AVERROR_EOF) {
+                    dec.input_error = true;
+                } else if (dec.format_ctx->pb && dec.format_ctx->pb->error < 0) {
+                    dec.input_error = true;
+                }
                 dec.eof = true;
                 int flush_ret = avcodec_send_packet(dec.codec_ctx, nullptr);
                 if (flush_ret < 0 && flush_ret != AVERROR_EOF) {
-                    return false;
+                    return FrameReadStatus::Error;
                 }
                 fed_decoder = true;
                 continue;
@@ -372,7 +407,7 @@ bool decode_next_frame(FFmpegDecoder& dec, Size& size, FrameBuffer& out) {
                 int send_ret = avcodec_send_packet(dec.codec_ctx, dec.packet);
                 av_packet_unref(dec.packet);
                 if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) {
-                    return false;
+                    return FrameReadStatus::Error;
                 }
                 fed_decoder = true;
             } else {
@@ -388,7 +423,7 @@ bool decode_first_frame(const std::string& uri, FrameBuffer& out, Size& size) {
     if (!init_video_decoder(uri, dec, size, fps)) {
         return false;
     }
-    bool ok = decode_next_frame(dec, size, out);
+    bool ok = decode_next_frame(dec, size, out) == FrameReadStatus::Frame;
     dec.close();
     return ok;
 }
@@ -400,7 +435,7 @@ bool decode_image_file_direct(const std::string& uri, FrameBuffer& out, Size& si
         return false;
     }
 
-    if (w <= 0 || h <= 0) {
+    if (!valid_source_dimensions(w, h)) {
         stbi_image_free(data);
         return false;
     }
@@ -469,14 +504,14 @@ bool VideoFileSource::open(const std::string& uri) {
 #endif
 }
 
-bool VideoFileSource::read(FrameBuffer& out) {
+FrameReadStatus VideoFileSource::read_next(FrameBuffer& out) {
 #ifdef ASCII_USE_OPENCV
     cv::Mat frame;
-    if (!cap_.read(frame)) return false;
+    if (!cap_.read(frame)) return FrameReadStatus::End;
     convert_mat_to_framebuffer(frame, out);
-    return true;
+    return FrameReadStatus::Frame;
 #else
-    if (!impl_ || !impl_->opened) return false;
+    if (!impl_ || !impl_->opened) return FrameReadStatus::Error;
     return decode_next_frame(impl_->decoder, size_, out);
 #endif
 }
@@ -500,6 +535,8 @@ void VideoFileSource::reset() {
     av_seek_frame(impl_->decoder.format_ctx, impl_->decoder.stream_idx, 0, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(impl_->decoder.codec_ctx);
     impl_->decoder.eof = false;
+    impl_->decoder.input_error = false;
+    impl_->decoder.decoded_frames = 0;
 #endif
 }
 
@@ -534,15 +571,15 @@ bool WebcamSource::open(const std::string& uri) {
 #endif
 }
 
-bool WebcamSource::read(FrameBuffer& out) {
+FrameReadStatus WebcamSource::read_next(FrameBuffer& out) {
 #ifdef ASCII_USE_OPENCV
     cv::Mat frame;
-    if (!cap_.read(frame)) return false;
+    if (!cap_.read(frame)) return FrameReadStatus::Error;
     convert_mat_to_framebuffer(frame, out);
-    return true;
+    return FrameReadStatus::Frame;
 #else
     (void)out;
-    return false;
+    return FrameReadStatus::Error;
 #endif
 }
 
@@ -585,17 +622,19 @@ bool ImageSource::open(const std::string& uri) {
 #endif
 }
 
-bool ImageSource::read(FrameBuffer& out) {
+FrameReadStatus ImageSource::read_next(FrameBuffer& out) {
 #ifdef ASCII_USE_OPENCV
-    if (sent_ || image_.empty()) return false;
+    if (sent_) return FrameReadStatus::End;
+    if (image_.empty()) return FrameReadStatus::Error;
     convert_mat_to_framebuffer(image_, out);
     sent_ = true;
-    return true;
+    return FrameReadStatus::Frame;
 #else
-    if (sent_ || !loaded_) return false;
+    if (sent_) return FrameReadStatus::End;
+    if (!loaded_) return FrameReadStatus::Error;
     out = image_buffer_;
     sent_ = true;
-    return true;
+    return FrameReadStatus::Frame;
 #endif
 }
 
@@ -672,27 +711,25 @@ bool ImageSequenceSource::open(const std::string& uri) {
     return true;
 }
 
-bool ImageSequenceSource::read(FrameBuffer& out) {
-    while (current_index_ < files_.size()) {
+FrameReadStatus ImageSequenceSource::read_next(FrameBuffer& out) {
+    if (current_index_ >= files_.size()) return FrameReadStatus::End;
 #ifdef ASCII_USE_OPENCV
         cv::Mat image = cv::imread(files_[current_index_], cv::IMREAD_COLOR);
         ++current_index_;
-        if (image.empty()) continue;
+        if (image.empty()) return FrameReadStatus::Error;
         convert_mat_to_framebuffer(image, out);
-        return true;
+        return FrameReadStatus::Frame;
 #else
         Size decoded_size{};
         bool ok = decode_image_file_direct(files_[current_index_], out, decoded_size);
         if (!ok) ok = decode_first_frame(files_[current_index_], out, decoded_size);
         ++current_index_;
-        if (!ok) continue;
+        if (!ok) return FrameReadStatus::Error;
         if (size_.width == 0 || size_.height == 0) {
             size_ = decoded_size;
         }
-        return true;
+        return FrameReadStatus::Frame;
 #endif
-    }
-    return false;
 }
 
 double ImageSequenceSource::fps() const { return fps_; }
@@ -730,7 +767,7 @@ bool PipeSource::open(const std::string& uri) {
         return false;
     }
 
-    if (width_ <= 0 || height_ <= 0) return false;
+    if (!valid_source_dimensions(width_, height_, channels_)) return false;
 
     if (parts.size() >= 2) {
         std::string fmt = to_lower_copy(parts[1]);
@@ -749,21 +786,22 @@ bool PipeSource::open(const std::string& uri) {
         } catch (...) {
             return false;
         }
-        if (fps_ <= 0.0) return false;
+        if (!std::isfinite(fps_) || fps_ <= 0.0 || fps_ > 120.0) return false;
     }
 
     opened_ = true;
     return true;
 }
 
-bool PipeSource::read(FrameBuffer& out) {
-    if (!opened_) return false;
+FrameReadStatus PipeSource::read_next(FrameBuffer& out) {
+    if (!opened_) return FrameReadStatus::Error;
 
     size_t frame_bytes = static_cast<size_t>(width_) * height_ * channels_;
     std::vector<uint8_t> buffer(frame_bytes);
     std::cin.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(frame_bytes));
     if (static_cast<size_t>(std::cin.gcount()) != frame_bytes) {
-        return false;
+        return std::cin.gcount() == 0 && std::cin.eof()
+            ? FrameReadStatus::End : FrameReadStatus::Error;
     }
 
     if (out.width() != width_ || out.height() != height_) {
@@ -781,7 +819,7 @@ bool PipeSource::read(FrameBuffer& out) {
         }
     }
 
-    return true;
+    return FrameReadStatus::Frame;
 }
 
 double PipeSource::fps() const { return fps_; }
@@ -789,6 +827,11 @@ Size PipeSource::frame_size() const { return {width_, height_}; }
 bool PipeSource::is_open() const { return opened_; }
 
 void PipeSource::reset() {}
+
+FrameReadStatus read_frame_if_ready(FrameSource& source, bool paused, FrameBuffer& out) {
+    if (paused) return FrameReadStatus::Paused;
+    return source.read_next(out);
+}
 
 std::unique_ptr<FrameSource> create_source(const std::string& uri) {
     if (uri.rfind("pipe:", 0) == 0) {

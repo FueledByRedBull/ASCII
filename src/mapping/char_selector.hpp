@@ -56,6 +56,7 @@ public:
     Selection select_unified(const CellStats& stats, uint32_t prev_glyph);
     
     float compute_loss(const CellStats& cell, const GlyphStats& glyph) const;
+    float compute_loss_for_glyph(const CellStats& cell, uint32_t glyph) const;
     float compute_transition_cost(uint32_t from_glyph, uint32_t to_glyph) const;
     
 private:

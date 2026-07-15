@@ -19,6 +19,7 @@ public:
         bool use_wavelet_flicker = true;
         float wavelet_strength = 0.45f;
         int wavelet_window = 8;
+        float frame_rate = 30.0f;
     };
     
     TemporalSmoother() : TemporalSmoother(Config{}) {}
@@ -39,6 +40,11 @@ public:
         float last_loss = 0.0f;
         bool is_edge_state = false;
         bool initialized = false;
+        bool luminance_initialized = false;
+        bool edge_initialized = false;
+        bool coherence_initialized = false;
+        bool glyph_initialized = false;
+        bool edge_state_initialized = false;
         
         float prev_luminance = 0.0f;
         float prev_edge_strength = 0.0f;
@@ -51,12 +57,15 @@ public:
     
     std::vector<CellState>& frame_state() { return frame_state_; }
     const std::vector<CellState>& frame_state() const { return frame_state_; }
+    void begin_frame();
+    uint32_t reference_glyph(int idx) const;
     
     float smooth_luminance(int idx, float new_value);
     float smooth_edge_strength(int idx, float new_value);
     float smooth_coherence(int idx, float new_value);
     bool should_change_glyph(int idx, uint32_t new_glyph, float new_score);
-    bool should_change_glyph_with_loss(int idx, uint32_t new_glyph, float new_loss, float transition_cost);
+    bool should_change_glyph_with_loss(int idx, uint32_t new_glyph, float new_loss,
+                                       float keep_loss, float transition_cost);
     void update_glyph(int idx, uint32_t glyph, float score);
     void update_glyph_with_loss(int idx, uint32_t glyph, float score, float loss);
     
@@ -68,10 +77,12 @@ public:
 private:
     Config config_;
     std::vector<CellState> frame_state_;
+    std::vector<CellState> previous_frame_state_;
     int cols_ = 0;
     int rows_ = 0;
 
     int reference_index_for_cell(int idx) const;
+    float effective_alpha() const;
 };
 
 }

@@ -11,11 +11,19 @@
 
 namespace ascii {
 
+enum class FrameReadStatus {
+    Frame,
+    End,
+    Error,
+    Paused
+};
+
 class FrameSource {
 public:
     virtual ~FrameSource() = default;
     virtual bool open(const std::string& uri) = 0;
-    virtual bool read(FrameBuffer& out) = 0;
+    virtual FrameReadStatus read_next(FrameBuffer& out) = 0;
+    bool read(FrameBuffer& out) { return read_next(out) == FrameReadStatus::Frame; }
     virtual double fps() const = 0;
     virtual Size frame_size() const = 0;
     virtual bool is_open() const = 0;
@@ -33,7 +41,7 @@ public:
     ~VideoFileSource() override;
     
     bool open(const std::string& uri) override;
-    bool read(FrameBuffer& out) override;
+    FrameReadStatus read_next(FrameBuffer& out) override;
     double fps() const override;
     Size frame_size() const override;
     bool is_open() const override;
@@ -56,7 +64,7 @@ public:
     ~WebcamSource() override;
     
     bool open(const std::string& uri) override;
-    bool read(FrameBuffer& out) override;
+    FrameReadStatus read_next(FrameBuffer& out) override;
     double fps() const override;
     Size frame_size() const override;
     bool is_open() const override;
@@ -79,7 +87,7 @@ public:
     ~ImageSource() override;
     
     bool open(const std::string& uri) override;
-    bool read(FrameBuffer& out) override;
+    FrameReadStatus read_next(FrameBuffer& out) override;
     double fps() const override;
     Size frame_size() const override;
     bool is_open() const override;
@@ -102,7 +110,7 @@ public:
     ~ImageSequenceSource() override;
     
     bool open(const std::string& uri) override;
-    bool read(FrameBuffer& out) override;
+    FrameReadStatus read_next(FrameBuffer& out) override;
     double fps() const override;
     Size frame_size() const override;
     bool is_open() const override;
@@ -121,7 +129,7 @@ public:
     ~PipeSource() override;
     
     bool open(const std::string& uri) override;
-    bool read(FrameBuffer& out) override;
+    FrameReadStatus read_next(FrameBuffer& out) override;
     double fps() const override;
     Size frame_size() const override;
     bool is_open() const override;
@@ -136,5 +144,6 @@ private:
 };
 
 std::unique_ptr<FrameSource> create_source(const std::string& uri);
+FrameReadStatus read_frame_if_ready(FrameSource& source, bool paused, FrameBuffer& out);
 
 }

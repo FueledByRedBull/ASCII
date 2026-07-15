@@ -53,6 +53,9 @@ void ContourExtractor::apply(const FloatImage& luminance,
     FloatImage inner = EdgeDetector::gaussian_blur(luminance, config_.dog_sigma_inner);
     FloatImage outer = EdgeDetector::gaussian_blur(luminance, config_.dog_sigma_outer);
     FloatImage dog(w, h, 0.0f);
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             dog.set(x, y, inner.get(x, y) - outer.get(x, y));
@@ -65,6 +68,9 @@ void ContourExtractor::apply(const FloatImage& luminance,
 
     FloatImage magnitude(w, h, 0.0f);
     FloatImage orientation(w, h, 0.0f);
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             const float sx = gx.get(x, y);
@@ -79,6 +85,9 @@ void ContourExtractor::apply(const FloatImage& luminance,
     FloatImage threshold_map = EdgeDetector::compute_adaptive_threshold_map(
         nms, threshold_tile, 0.72f, 0.001f);
 
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int row = 0; row < grid_rows; ++row) {
         for (int col = 0; col < grid_cols; ++col) {
             const int x0 = col * cell_width;

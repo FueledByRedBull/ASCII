@@ -19,6 +19,7 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
 
     Output output;
     output.cells.resize(static_cast<size_t>(result.grid_cols) * result.grid_rows);
+    context.smoother.begin_frame();
 
     const bool allow_mixed_block = context.config.grid.quad_tree_adaptive &&
                                    context.color_mode != ColorMode::BlockArt;
@@ -26,6 +27,11 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
         output.block_cells.resize(output.cells.size());
     }
 
+#ifdef HAS_OPENMP
+    const bool cells_are_independent = context.color_mode == ColorMode::Truecolor ||
+                                       context.color_mode == ColorMode::None;
+    #pragma omp parallel for schedule(static) if(cells_are_independent)
+#endif
     for (int i = 0; i < static_cast<int>(result.cell_stats.size()); ++i) {
         const auto& stats = result.cell_stats[i];
         const int cell_x = i % result.grid_cols;
@@ -93,11 +99,14 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
             const float block_score = std::clamp(
                 1.0f - std::abs(block_data.top_left_lum - block_data.bottom_right_lum), 0.0f, 1.0f);
             uint32_t final_cp = block_result.codepoint;
-            if (context.smoother.should_change_glyph(i, block_result.codepoint, block_score)) {
+            const uint32_t previous = context.smoother.reference_glyph(i);
+            if (previous == 0 || previous == block_result.codepoint ||
+                context.smoother.should_change_glyph(i, block_result.codepoint, block_score)) {
                 final_cp = block_result.codepoint;
                 context.smoother.update_glyph(i, block_result.codepoint, block_score);
             } else {
-                final_cp = context.smoother.frame_state()[i].last_glyph;
+                final_cp = previous;
+                context.smoother.update_glyph(i, previous, block_score);
             }
             block_result.codepoint = final_cp;
             output.block_cells[i] = block_result;
@@ -111,7 +120,7 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
                 output.cells[i].bg_g = block_result.bg_g;
                 output.cells[i].bg_b = block_result.bg_b;
             } else {
-                const int row_dir = (cell_y % 2 == 0) ? 1 : -1;
+                const int row_dir = 1;
                 auto mapped = context.color_mapper.map_with_dither(
                     cell_x,
                     cell_y,
@@ -139,11 +148,13 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
         }
 
         if (context.selector.config().use_unified_loss) {
+            const uint32_t previous = context.smoother.reference_glyph(i);
             const float transition_cost = context.selector.compute_transition_cost(
-                context.smoother.frame_state()[i].last_glyph, selection.codepoint);
+                previous, selection.codepoint);
+            const float keep_loss = context.selector.compute_loss_for_glyph(effective_stats, previous);
 
             if (context.smoother.should_change_glyph_with_loss(
-                    i, selection.codepoint, selection.loss, transition_cost)) {
+                    i, selection.codepoint, selection.loss, keep_loss, transition_cost)) {
                 output.cells[i].codepoint = selection.codepoint;
                 context.smoother.update_glyph_with_loss(
                     i,
@@ -151,14 +162,22 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
                     selection.score,
                     selection.loss + transition_cost);
             } else {
-                output.cells[i].codepoint = context.smoother.frame_state()[i].last_glyph;
+                output.cells[i].codepoint = previous;
+                context.smoother.update_glyph_with_loss(
+                    i, previous, 1.0f - std::min(keep_loss, 1.0f), keep_loss);
             }
         } else {
-            if (context.smoother.should_change_glyph(i, selection.codepoint, selection.score)) {
+            const uint32_t previous = context.smoother.reference_glyph(i);
+            const float keep_loss = context.selector.compute_loss_for_glyph(effective_stats, previous);
+            if (context.smoother.should_change_glyph_with_loss(
+                    i, selection.codepoint, selection.loss, keep_loss, 0.0f)) {
                 output.cells[i].codepoint = selection.codepoint;
-                context.smoother.update_glyph(i, selection.codepoint, selection.score);
+                context.smoother.update_glyph_with_loss(
+                    i, selection.codepoint, selection.score, selection.loss);
             } else {
-                output.cells[i].codepoint = context.smoother.frame_state()[i].last_glyph;
+                output.cells[i].codepoint = previous;
+                context.smoother.update_glyph_with_loss(
+                    i, previous, 1.0f - std::min(keep_loss, 1.0f), keep_loss);
             }
         }
 
@@ -167,7 +186,7 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
         uint8_t sb = 0;
         ColorSpace::linear_to_srgb(
             {effective_stats.mean_r, effective_stats.mean_g, effective_stats.mean_b}, sr, sg, sb);
-        const int row_dir = (cell_y % 2 == 0) ? 1 : -1;
+        const int row_dir = 1;
         auto color = context.color_mapper.map_with_dither(
             cell_x, cell_y, row_dir, sr / 255.0f, sg / 255.0f, sb / 255.0f, effective_stats.is_edge_cell);
 

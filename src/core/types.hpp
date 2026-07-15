@@ -6,8 +6,26 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <limits>
+#include <stdexcept>
 
 namespace ascii {
+
+inline size_t checked_image_size(int width, int height, size_t channels = 1) {
+    if (width < 0 || height < 0 || channels == 0) {
+        throw std::invalid_argument("Image dimensions must be non-negative");
+    }
+    const size_t w = static_cast<size_t>(width);
+    const size_t h = static_cast<size_t>(height);
+    if (w != 0 && h > std::numeric_limits<size_t>::max() / w) {
+        throw std::length_error("Image dimensions overflow");
+    }
+    const size_t pixels = w * h;
+    if (pixels != 0 && channels > std::numeric_limits<size_t>::max() / pixels) {
+        throw std::length_error("Image storage size overflow");
+    }
+    return pixels * channels;
+}
 
 enum class ErrorCode {
     SUCCESS = 0,
@@ -39,7 +57,7 @@ struct Size {
         return width == other.width && height == other.height;
     }
     bool operator!=(const Size& other) const { return !(*this == other); }
-    int area() const { return width * height; }
+    size_t area() const { return checked_image_size(width, height); }
 };
 
 struct Color {
@@ -65,10 +83,12 @@ struct Color {
 class FrameBuffer {
 public:
     FrameBuffer() = default;
-    FrameBuffer(int w, int h) : width_(w), height_(h), data_(w * h * 4, 0) {}
-    FrameBuffer(int w, int h, const Color& fill) : width_(w), height_(h), data_(w * h * 4) {
-        for (int i = 0; i < w * h; ++i) {
-            set_pixel(i % w, i / w, fill);
+    FrameBuffer(int w, int h) : width_(w), height_(h), data_(checked_image_size(w, h, 4), 0) {}
+    FrameBuffer(int w, int h, const Color& fill) : width_(w), height_(h), data_(checked_image_size(w, h, 4)) {
+        const size_t pixels = checked_image_size(w, h);
+        for (size_t i = 0; i < pixels; ++i) {
+            set_pixel(static_cast<int>(i % static_cast<size_t>(w)),
+                      static_cast<int>(i / static_cast<size_t>(w)), fill);
         }
     }
     
@@ -116,8 +136,8 @@ private:
 class FloatImage {
 public:
     FloatImage() = default;
-    FloatImage(int w, int h) : width_(w), height_(h), data_(w * h, 0.0f) {}
-    FloatImage(int w, int h, float fill) : width_(w), height_(h), data_(w * h, fill) {}
+    FloatImage(int w, int h) : width_(w), height_(h), data_(checked_image_size(w, h), 0.0f) {}
+    FloatImage(int w, int h, float fill) : width_(w), height_(h), data_(checked_image_size(w, h), fill) {}
     
     int width() const { return width_; }
     int height() const { return height_; }
@@ -152,8 +172,12 @@ public:
     }
     
     static FloatImage from_rgba(const uint8_t* rgba, int w, int h) {
+        if (!rgba && checked_image_size(w, h) != 0) {
+            throw std::invalid_argument("RGBA source is null");
+        }
         FloatImage img(w, h);
-        for (int i = 0; i < w * h; ++i) {
+        const size_t pixels = checked_image_size(w, h);
+        for (size_t i = 0; i < pixels; ++i) {
             float r = rgba[i * 4] / 255.0f;
             float g = rgba[i * 4 + 1] / 255.0f;
             float b = rgba[i * 4 + 2] / 255.0f;

@@ -7,14 +7,26 @@ namespace ascii {
 
 TemporalSmoother::TemporalSmoother(const Config& config) : config_(config) {}
 
+float TemporalSmoother::effective_alpha() const {
+    const float alpha = std::clamp(config_.alpha, 0.0f, 1.0f);
+    const float fps = std::max(config_.frame_rate, 1.0f);
+    return 1.0f - std::pow(1.0f - alpha, 30.0f / fps);
+}
+
 void TemporalSmoother::initialize(int grid_cols, int grid_rows) {
     cols_ = grid_cols;
     rows_ = grid_rows;
     frame_state_.assign(static_cast<size_t>(grid_cols) * grid_rows, CellState{});
+    previous_frame_state_.assign(frame_state_.size(), CellState{});
 }
 
 void TemporalSmoother::reset() {
     frame_state_.assign(static_cast<size_t>(cols_) * rows_, CellState{});
+    previous_frame_state_.assign(frame_state_.size(), CellState{});
+}
+
+void TemporalSmoother::begin_frame() {
+    previous_frame_state_ = frame_state_;
 }
 
 static void check_bounds(int idx, const std::vector<TemporalSmoother::CellState>& state) {
@@ -137,8 +149,9 @@ float TemporalSmoother::smooth_luminance(int idx, float new_value) {
     state.prev_luminance = state.smoothed_luminance;
     push_history(state.lum_history, state.lum_history_head, state.lum_history_count, new_value);
     
-    if (!state.initialized) {
+    if (!state.luminance_initialized) {
         state.smoothed_luminance = new_value;
+        state.luminance_initialized = true;
         state.initialized = true;
         return new_value;
     }
@@ -154,8 +167,9 @@ float TemporalSmoother::smooth_luminance(int idx, float new_value) {
         );
     }
 
-    state.smoothed_luminance = config_.alpha * observed +
-                               (1.0f - config_.alpha) * state.smoothed_luminance;
+    const float alpha = effective_alpha();
+    state.smoothed_luminance = alpha * observed +
+                               (1.0f - alpha) * state.smoothed_luminance;
     return state.smoothed_luminance;
 }
 
@@ -165,14 +179,16 @@ float TemporalSmoother::smooth_edge_strength(int idx, float new_value) {
     
     state.prev_edge_strength = state.smoothed_edge_strength;
     
-    if (!state.initialized) {
+    if (!state.edge_initialized) {
         state.smoothed_edge_strength = new_value;
+        state.edge_initialized = true;
         state.initialized = true;
         return new_value;
     }
     
-    state.smoothed_edge_strength = config_.alpha * new_value + 
-                                   (1.0f - config_.alpha) * state.smoothed_edge_strength;
+    const float alpha = effective_alpha();
+    state.smoothed_edge_strength = alpha * new_value +
+                                   (1.0f - alpha) * state.smoothed_edge_strength;
     return state.smoothed_edge_strength;
 }
 
@@ -180,13 +196,15 @@ float TemporalSmoother::smooth_coherence(int idx, float new_value) {
     check_bounds(idx, frame_state_);
     CellState& state = frame_state_[idx];
     
-    if (!state.initialized) {
+    if (!state.coherence_initialized) {
         state.smoothed_coherence = new_value;
+        state.coherence_initialized = true;
         state.initialized = true;
         return new_value;
     }
     
-    state.smoothed_coherence = config_.alpha * new_value + (1.0f - config_.alpha) * state.smoothed_coherence;
+    const float alpha = effective_alpha();
+    state.smoothed_coherence = alpha * new_value + (1.0f - alpha) * state.smoothed_coherence;
     return state.smoothed_coherence;
 }
 
@@ -210,14 +228,25 @@ int TemporalSmoother::reference_index_for_cell(int idx) const {
     return ridx;
 }
 
+uint32_t TemporalSmoother::reference_glyph(int idx) const {
+    check_bounds(idx, frame_state_);
+    const int ref_idx = reference_index_for_cell(idx);
+    if (previous_frame_state_.size() == frame_state_.size() &&
+        previous_frame_state_[ref_idx].glyph_initialized) {
+        return previous_frame_state_[ref_idx].last_glyph;
+    }
+    return frame_state_[idx].glyph_initialized ? frame_state_[idx].last_glyph : 0;
+}
+
 bool TemporalSmoother::should_change_glyph(int idx, uint32_t new_glyph, float new_score) {
     check_bounds(idx, frame_state_);
     CellState& state = frame_state_[idx];
     int ref_idx = reference_index_for_cell(idx);
-    const CellState& ref_state = frame_state_[ref_idx];
-    const CellState& baseline = ref_state.initialized ? ref_state : state;
+    const CellState& ref_state = previous_frame_state_.size() == frame_state_.size()
+        ? previous_frame_state_[ref_idx] : frame_state_[ref_idx];
+    const CellState& baseline = ref_state.glyph_initialized ? ref_state : state;
     
-    if (!baseline.initialized || baseline.last_glyph == 0) {
+    if (!baseline.glyph_initialized || baseline.last_glyph == 0) {
         return true;
     }
     
@@ -232,14 +261,16 @@ bool TemporalSmoother::should_change_glyph(int idx, uint32_t new_glyph, float ne
     return true;
 }
 
-bool TemporalSmoother::should_change_glyph_with_loss(int idx, uint32_t new_glyph, float new_loss, float transition_cost) {
+bool TemporalSmoother::should_change_glyph_with_loss(int idx, uint32_t new_glyph, float new_loss,
+                                                     float keep_loss, float transition_cost) {
     check_bounds(idx, frame_state_);
     CellState& state = frame_state_[idx];
     int ref_idx = reference_index_for_cell(idx);
-    const CellState& ref_state = frame_state_[ref_idx];
-    const CellState& baseline = ref_state.initialized ? ref_state : state;
+    const CellState& ref_state = previous_frame_state_.size() == frame_state_.size()
+        ? previous_frame_state_[ref_idx] : frame_state_[ref_idx];
+    const CellState& baseline = ref_state.glyph_initialized ? ref_state : state;
     
-    if (!baseline.initialized || baseline.last_glyph == 0) {
+    if (!baseline.glyph_initialized || baseline.last_glyph == 0) {
         return true;
     }
     
@@ -249,7 +280,7 @@ bool TemporalSmoother::should_change_glyph_with_loss(int idx, uint32_t new_glyph
     
     float total_new_loss = new_loss + transition_cost;
     float margin = config_.enable_hysteresis ? config_.hysteresis_margin : 0.0f;
-    return total_new_loss + margin < baseline.last_loss;
+    return total_new_loss + margin < keep_loss;
 }
 
 void TemporalSmoother::update_glyph(int idx, uint32_t glyph, float score) {
@@ -257,6 +288,7 @@ void TemporalSmoother::update_glyph(int idx, uint32_t glyph, float score) {
     CellState& state = frame_state_[idx];
     state.last_glyph = glyph;
     state.last_score = score;
+    state.glyph_initialized = true;
     state.initialized = true;
 }
 
@@ -266,6 +298,7 @@ void TemporalSmoother::update_glyph_with_loss(int idx, uint32_t glyph, float sco
     state.last_glyph = glyph;
     state.last_score = score;
     state.last_loss = loss;
+    state.glyph_initialized = true;
     state.initialized = true;
 }
 
@@ -273,8 +306,9 @@ void TemporalSmoother::update_edge_state(int idx, bool is_edge) {
     check_bounds(idx, frame_state_);
     CellState& state = frame_state_[idx];
     
-    if (!state.initialized) {
+    if (!state.edge_state_initialized) {
         state.is_edge_state = is_edge;
+        state.edge_state_initialized = true;
         return;
     }
     

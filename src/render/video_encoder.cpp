@@ -4,6 +4,12 @@
 #include <cstring>
 #include <cstdio>
 #include <vector>
+#include <chrono>
+#include <filesystem>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -19,6 +25,22 @@ extern "C" {
 namespace ascii {
 
 namespace {
+
+std::string temporary_video_path(const std::string& filename) {
+    const std::filesystem::path target(filename);
+    const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    return (target.parent_path() /
+        (target.stem().string() + ".tmp-" + std::to_string(nonce) + target.extension().string())).string();
+}
+
+bool replace_video_file(const std::string& temporary, const std::string& target) {
+#ifdef _WIN32
+    return MoveFileExA(temporary.c_str(), target.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(temporary.c_str(), target.c_str()) == 0;
+#endif
+}
 
 bool ends_with_ci(const std::string& value, const std::string& suffix) {
     if (suffix.size() > value.size()) {
@@ -189,11 +211,17 @@ bool VideoEncoder::open(const std::string& filename, const Config& config) {
     last_error_.clear();
     config_ = config;
     output_filename_ = filename;
+    temporary_filename_ = temporary_video_path(filename);
     output_is_gif_ = ends_with_ci(filename, ".gif");
     output_is_still_image_ = is_still_image_output(filename);
     wrote_still_image_frame_ = false;
+    header_written_ = false;
+    failed_ = false;
+    source_width_ = 0;
+    source_height_ = 0;
     
-    int ret = avformat_alloc_output_context2(&format_ctx_, nullptr, nullptr, filename.c_str());
+    int ret = avformat_alloc_output_context2(
+        &format_ctx_, nullptr, nullptr, temporary_filename_.c_str());
     if (ret < 0 || !format_ctx_) {
         if (ret < 0) {
             set_error("Failed to allocate output context: " + ffmpeg_error_string(ret));
@@ -209,7 +237,7 @@ bool VideoEncoder::open(const std::string& filename, const Config& config) {
     }
     
     if (!(format_ctx_->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&format_ctx_->pb, filename.c_str(), AVIO_FLAG_WRITE);
+        ret = avio_open(&format_ctx_->pb, temporary_filename_.c_str(), AVIO_FLAG_WRITE);
         if (ret < 0) {
             set_error("Failed to open output file: " + ffmpeg_error_string(ret));
             close();
@@ -218,16 +246,19 @@ bool VideoEncoder::open(const std::string& filename, const Config& config) {
     }
     
     if (!write_header()) {
+        failed_ = true;
         close();
         return false;
     }
+    header_written_ = true;
     return true;
 }
 
 bool VideoEncoder::close() {
-    bool ok = true;
+    bool ok = !failed_;
+    const bool has_frames = pts_ > 0 || wrote_still_image_frame_;
     if (format_ctx_) {
-        if (!write_trailer()) {
+        if (header_written_ && !write_trailer()) {
             ok = false;
         }
         
@@ -236,7 +267,7 @@ bool VideoEncoder::close() {
         }
         
         if (!(format_ctx_->oformat->flags & AVFMT_NOFILE)) {
-            avio_closep(&format_ctx_->pb);
+            if (avio_closep(&format_ctx_->pb) < 0) ok = false;
         }
         
         avformat_free_context(format_ctx_);
@@ -256,11 +287,34 @@ bool VideoEncoder::close() {
         sws_ctx_ = nullptr;
     }
     
+    if (!temporary_filename_.empty()) {
+        if (ok && has_frames) {
+            if (!replace_video_file(temporary_filename_, output_filename_)) {
+#ifdef _WIN32
+                set_error("Failed to finalize output file (Windows error " +
+                          std::to_string(GetLastError()) + ")");
+#else
+                set_error("Failed to finalize output file");
+#endif
+                ok = false;
+            }
+        }
+        if (!ok || !has_frames) {
+            std::error_code ec;
+            std::filesystem::remove(temporary_filename_, ec);
+        }
+    }
+
     pts_ = 0;
     output_filename_.clear();
+    temporary_filename_.clear();
     output_is_gif_ = false;
     output_is_still_image_ = false;
     wrote_still_image_frame_ = false;
+    header_written_ = false;
+    failed_ = false;
+    source_width_ = 0;
+    source_height_ = 0;
     return ok;
 }
 
@@ -268,6 +322,12 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
     last_frame_written_ = false;
     if (!is_open() || !frame_) {
         set_error("Encoder is not open");
+        failed_ = true;
+        return false;
+    }
+    if (frame.empty()) {
+        set_error("Input frame is empty");
+        failed_ = true;
         return false;
     }
     if (output_is_still_image_ && wrote_still_image_frame_) {
@@ -276,9 +336,14 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
 
     if (av_frame_make_writable(frame_) < 0) {
         set_error("Failed to make output frame writable");
+        failed_ = true;
         return false;
     }
     
+    if (sws_ctx_ && (source_width_ != frame.width() || source_height_ != frame.height())) {
+        sws_freeContext(sws_ctx_);
+        sws_ctx_ = nullptr;
+    }
     if (!sws_ctx_) {
         sws_ctx_ = sws_getContext(
             frame.width(), frame.height(), AV_PIX_FMT_RGBA,
@@ -287,21 +352,29 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
         );
         if (!sws_ctx_) {
             set_error("Failed to create scaling context");
+            failed_ = true;
             return false;
         }
+        source_width_ = frame.width();
+        source_height_ = frame.height();
     }
     
     const uint8_t* src_data[1] = { frame.data() };
     int src_linesize[1] = { frame.width() * 4 };
     
-    sws_scale(sws_ctx_, src_data, src_linesize, 0, frame.height(),
-              frame_->data, frame_->linesize);
+    if (sws_scale(sws_ctx_, src_data, src_linesize, 0, frame.height(),
+                  frame_->data, frame_->linesize) <= 0) {
+        set_error("Failed to convert input frame");
+        failed_ = true;
+        return false;
+    }
     
     frame_->pts = pts_++;
     
     int ret = avcodec_send_frame(codec_ctx_, frame_);
     if (ret < 0) {
         set_error("Failed to send frame to encoder: " + ffmpeg_error_string(ret));
+        failed_ = true;
         return false;
     }
     
@@ -310,6 +383,7 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
         if (ret < 0) {
             set_error("Failed to receive encoded packet: " + ffmpeg_error_string(ret));
+            failed_ = true;
             return false;
         }
         
@@ -319,6 +393,7 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
         ret = av_interleaved_write_frame(format_ctx_, pkt_);
         if (ret < 0) {
             set_error("Failed to write encoded packet: " + ffmpeg_error_string(ret));
+            failed_ = true;
             return false;
         }
     }

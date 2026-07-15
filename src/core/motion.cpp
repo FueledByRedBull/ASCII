@@ -333,6 +333,9 @@ FloatImage upsample_flow_field(const FloatImage& src, int dst_w, int dst_h, floa
     const float sx_scale = static_cast<float>(src.width()) / static_cast<float>(std::max(1, dst_w));
     const float sy_scale = static_cast<float>(src.height()) / static_cast<float>(std::max(1, dst_h));
 
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < dst_h; ++y) {
         float sy = (static_cast<float>(y) + 0.5f) * sy_scale - 0.5f;
         int y0 = static_cast<int>(std::floor(sy));
@@ -375,6 +378,9 @@ FloatImage downsample_area_average(const FloatImage& src, int dst_w, int dst_h) 
     const float* s = src.data();
     float* d = dst.data();
 
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < dst_h; ++y) {
         int y0 = (y * src_h) / dst_h;
         int y1 = ((y + 1) * src_h) / dst_h;
@@ -469,9 +475,13 @@ void compute_sparse_block_matching_flow(const FloatImage& prev,
     float* fx = flow_x.data();
     float* fy = flow_y.data();
 
+    // Each sparse sample owns a disjoint half-open tile, so rows can be solved in parallel.
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = margin; y < h - margin; y += step) {
         const int y0 = std::max(0, y - step / 2);
-        const int y1 = std::min(h, y + step / 2 + 1);
+        const int y1 = std::min(h, y + (step + 1) / 2);
         for (int x = margin; x < w - margin; x += step) {
             float best_cost = std::numeric_limits<float>::infinity();
             int best_dx = 0;
@@ -501,7 +511,7 @@ void compute_sparse_block_matching_flow(const FloatImage& prev,
             const float best_fx = std::clamp(static_cast<float>(best_dx), -motion_cap, motion_cap);
             const float best_fy = std::clamp(static_cast<float>(best_dy), -motion_cap, motion_cap);
             const int x0 = std::max(0, x - step / 2);
-            const int x1 = std::min(w, x + step / 2 + 1);
+            const int x1 = std::min(w, x + (step + 1) / 2);
             for (int yy = y0; yy < y1; ++yy) {
                 float* row_fx = fx + static_cast<size_t>(yy) * w;
                 float* row_fy = fy + static_cast<size_t>(yy) * w;
@@ -728,6 +738,9 @@ void MotionEstimator::build_pyramid(const FloatImage& img, FloatImage* pyramid, 
         
         pyramid[l] = FloatImage(dst_w, dst_h);
         
+#ifdef HAS_OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
         for (int y = 0; y < dst_h; ++y) {
             for (int x = 0; x < dst_w; ++x) {
                 int sx = x * 2;
@@ -1047,6 +1060,9 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
         flow_y = upsample_flow_field(flow_y, width_, height_, scale);
     }
     
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (int y = 0; y < height_; ++y) {
         for (int x = 0; x < width_; ++x) {
             int idx = y * width_ + x;
@@ -1060,12 +1076,45 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
             }
             flow_[idx].dx = std::clamp(dx, -config_.motion_cap, config_.motion_cap);
             flow_[idx].dy = std::clamp(dy, -config_.motion_cap, config_.motion_cap);
-            
-            float mag = std::sqrt(flow_[idx].dx * flow_[idx].dx + flow_[idx].dy * flow_[idx].dy);
-            flow_[idx].confidence = std::min(mag / std::max(config_.motion_cap, 1e-6f), 1.0f);
-            if (config_.use_phase_correlation) {
-                flow_[idx].confidence = std::max(flow_[idx].confidence, phase_mv.confidence * 0.7f);
+        }
+    }
+
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int y = 0; y < height_; ++y) {
+        for (int x = 0; x < width_; ++x) {
+            const int idx = y * width_ + x;
+            const auto& mv = flow_[idx];
+            const int px = std::clamp(static_cast<int>(std::lround(x - mv.dx)), 0, width_ - 1);
+            const int py = std::clamp(static_cast<int>(std::lround(y - mv.dy)), 0, height_ - 1);
+            const float residual = std::abs(curr.get(x, y) - prev.get(px, py));
+            const float photometric = 1.0f - std::clamp(residual / 0.25f, 0.0f, 1.0f);
+            const float gx = std::abs(prev.get_clamped(px + 1, py) - prev.get_clamped(px - 1, py));
+            const float gy = std::abs(prev.get_clamped(px, py + 1) - prev.get_clamped(px, py - 1));
+            const float texture = std::clamp((gx + gy) / 0.2f, 0.0f, 1.0f);
+
+            float consistency_error = 0.0f;
+            int neighbors = 0;
+            constexpr int offsets[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+            for (const auto& offset : offsets) {
+                const int nx = x + offset[0];
+                const int ny = y + offset[1];
+                if (nx < 0 || nx >= width_ || ny < 0 || ny >= height_) continue;
+                const auto& neighbor = flow_[ny * width_ + nx];
+                consistency_error += std::hypot(mv.dx - neighbor.dx, mv.dy - neighbor.dy);
+                ++neighbors;
             }
+            const float consistency = neighbors > 0
+                ? 1.0f - std::clamp(
+                    consistency_error / (neighbors * std::max(config_.motion_cap, 1.0f)),
+                    0.0f, 1.0f)
+                : 0.0f;
+            float confidence = photometric * (0.2f + 0.8f * texture) * consistency;
+            if (config_.use_phase_correlation) {
+                confidence = std::max(confidence, phase_mv.confidence * photometric * 0.7f);
+            }
+            flow_[idx].confidence = std::clamp(confidence, 0.0f, 1.0f);
         }
     }
 
@@ -1119,6 +1168,7 @@ void MotionEstimator::average_flow_for_cell(int x0, int y0, int w, int h,
     }
     
     float sum_dx = 0.0f, sum_dy = 0.0f;
+    float sum_confidence = 0.0f;
     int count = 0;
     
     int x1 = std::min(x0 + w, width_);
@@ -1127,15 +1177,17 @@ void MotionEstimator::average_flow_for_cell(int x0, int y0, int w, int h,
     for (int y = y0; y < y1; ++y) {
         for (int x = x0; x < x1; ++x) {
             const auto& mv = get_motion(x, y);
-            sum_dx += mv.dx;
-            sum_dy += mv.dy;
+            sum_dx += mv.dx * mv.confidence;
+            sum_dy += mv.dy * mv.confidence;
+            sum_confidence += mv.confidence;
             count++;
         }
     }
     
-    if (count > 0) {
-        dx = sum_dx / count;
-        dy = sum_dy / count;
+    if (count > 0 && sum_confidence > 1e-6f) {
+        const float mean_confidence = sum_confidence / count;
+        dx = (sum_dx / sum_confidence) * mean_confidence;
+        dy = (sum_dy / sum_confidence) * mean_confidence;
     } else {
         dx = 0.0f;
         dy = 0.0f;

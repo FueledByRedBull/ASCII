@@ -3,31 +3,72 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <limits>
 
 namespace ascii {
 
-ColorMode parse_color_mode(const std::string& s) {
-    if (s == "none") return ColorMode::None;
-    if (s == "16") return ColorMode::Ansi16;
-    if (s == "256") return ColorMode::Ansi256;
-    if (s == "blockart") return ColorMode::BlockArt;
-    return ColorMode::Truecolor;
-}
-
-static int clamp_int(int val, int min_val, int max_val, int default_val) {
-    if (val < min_val || val > max_val) return default_val;
-    return val;
-}
-
-static float clamp_float(float val, float min_val, float max_val, float default_val) {
-    if (val < min_val || val > max_val) return default_val;
-    return val;
+static bool parse_color_mode(const std::string& s, ColorMode& mode) {
+    if (s == "none") mode = ColorMode::None;
+    else if (s == "16") mode = ColorMode::Ansi16;
+    else if (s == "256") mode = ColorMode::Ansi256;
+    else if (s == "truecolor") mode = ColorMode::Truecolor;
+    else if (s == "blockart") mode = ColorMode::BlockArt;
+    else return false;
+    return true;
 }
 
 static bool validate_path(const std::string& path) {
     if (path.empty()) return false;
     if (path.find("..") != std::string::npos) return false;
     if (path.find('\0') != std::string::npos) return false;
+    return true;
+}
+
+static bool parse_int(const char* text, int min_value, int max_value, int& value) {
+    if (!text || *text == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' ||
+        parsed < min_value || parsed > max_value) {
+        return false;
+    }
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+static bool parse_float(const char* text, float min_value, float max_value, float& value) {
+    if (!text || *text == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    const float parsed = std::strtof(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0' || !std::isfinite(parsed) ||
+        parsed < min_value || parsed > max_value) {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+static bool take_value(int argc, char* argv[], int& i, Args& args, const char* option, const char*& value) {
+    if (i + 1 >= argc) {
+        args.valid = false;
+        args.error = std::string("Missing value for ") + option;
+        return false;
+    }
+    value = argv[++i];
+    return true;
+}
+
+static bool set_path(const char* value, std::string& destination, Args& args, const char* option) {
+    if (!validate_path(value)) {
+        args.valid = false;
+        args.error = std::string("Invalid path for ") + option + ": " + value;
+        return false;
+    }
+    destination = value;
     return true;
 }
 
@@ -42,131 +83,110 @@ Args parse_args(int argc, char* argv[]) {
             return args;
         }
         
+        const char* value = nullptr;
         if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
-            if (i + 1 < argc) {
-                args.output = argv[++i];
-                if (!validate_path(args.output)) {
-                    args.output.clear();
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value) || !set_path(value, args.output, args, arg)) break;
         }
         else if (strcmp(arg, "--config") == 0) {
-            if (i + 1 < argc) {
-                args.config_path = argv[++i];
-                if (!validate_path(args.config_path)) {
-                    args.config_path.clear();
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value) || !set_path(value, args.config_path, args, arg)) break;
         }
         else if (strcmp(arg, "--replay") == 0) {
-            if (i + 1 < argc) {
-                args.replay_path = argv[++i];
-                if (!validate_path(args.replay_path)) {
-                    args.replay_path.clear();
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value) || !set_path(value, args.replay_path, args, arg)) break;
         }
         else if (strcmp(arg, "--inspect-replay") == 0) {
-            if (i + 1 < argc) {
-                args.inspect_replay_path = argv[++i];
-                if (!validate_path(args.inspect_replay_path)) {
-                    args.inspect_replay_path.clear();
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value) || !set_path(value, args.inspect_replay_path, args, arg)) break;
         }
         else if (strcmp(arg, "--play-replay") == 0) {
-            if (i + 1 < argc) {
-                args.play_replay_path = argv[++i];
-                if (!validate_path(args.play_replay_path)) {
-                    args.play_replay_path.clear();
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value) || !set_path(value, args.play_replay_path, args, arg)) break;
         }
         else if (strcmp(arg, "-f") == 0 || strcmp(arg, "--fps") == 0) {
-            if (i + 1 < argc) args.fps = clamp_int(std::atoi(argv[++i]), 1, 120, 30);
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            if (!parse_int(value, 1, 120, args.fps)) { args.valid = false; args.error = std::string("Invalid value for ") + arg + ": " + value; break; }
+            args.fps_set = true;
         }
         else if (strcmp(arg, "-c") == 0 || strcmp(arg, "--cols") == 0) {
-            if (i + 1 < argc) args.cols = clamp_int(std::atoi(argv[++i]), 1, 500, 0);
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            if (!parse_int(value, 1, 500, args.cols)) { args.valid = false; args.error = std::string("Invalid value for ") + arg + ": " + value; break; }
+            args.cols_set = true;
         }
         else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--rows") == 0) {
-            if (i + 1 < argc) args.rows = clamp_int(std::atoi(argv[++i]), 1, 200, 0);
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            if (!parse_int(value, 1, 200, args.rows)) { args.valid = false; args.error = std::string("Invalid value for ") + arg + ": " + value; break; }
+            args.rows_set = true;
         }
         else if (strcmp(arg, "--char-set") == 0) {
-            if (i + 1 < argc) {
-                std::string cs = argv[++i];
-                if (cs == "basic" || cs == "blocks" || cs == "line-art") {
-                    args.char_set = cs;
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            std::string cs = value;
+            if (cs != "basic" && cs != "blocks" && cs != "line-art") { args.valid = false; args.error = "Invalid value for --char-set: " + cs; break; }
+            args.char_set = cs;
+            args.char_set_set = true;
         }
         else if (strcmp(arg, "--profile") == 0) {
-            if (i + 1 < argc) {
-                std::string p = argv[++i];
-                if (p == "natural" || p == "anime" || p == "ui") {
-                    args.profile = p;
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            std::string p = value;
+            if (p != "natural" && p != "anime" && p != "ui") { args.valid = false; args.error = "Invalid value for --profile: " + p; break; }
+            args.profile = p;
         }
         else if (strcmp(arg, "--color") == 0) {
-            if (i + 1 < argc) {
-                args.color_mode = parse_color_mode(argv[++i]);
-                args.color_mode_set = true;
-            }
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            if (!parse_color_mode(value, args.color_mode)) { args.valid = false; args.error = std::string("Invalid value for --color: ") + value; break; }
+            args.color_mode_set = true;
         }
         else if (strcmp(arg, "--edge-thresh") == 0) {
-            if (i + 1 < argc) args.edge_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, 0.1f);
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            if (!parse_float(value, 0.0f, 1.0f, args.edge_threshold)) { args.valid = false; args.error = std::string("Invalid value for --edge-thresh: ") + value; break; }
+            args.edge_threshold_set = true;
         }
         else if (strcmp(arg, "--contour-thresh") == 0) {
-            if (i + 1 < argc) args.contour_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_float(value, 0.0f, 1.0f, args.contour_threshold)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --contour-thresh: ") + (value ? value : ""); } break; }
         }
         else if (strcmp(arg, "--blur") == 0) {
-            if (i + 1 < argc) args.blur_sigma = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.1f, 10.0f, 1.0f);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_float(value, 0.1f, 10.0f, args.blur_sigma)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --blur: ") + (value ? value : ""); } break; }
+            args.blur_sigma_set = true;
         }
         else if (strcmp(arg, "--temporal") == 0) {
-            if (i + 1 < argc) args.temporal_alpha = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, 0.3f);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_float(value, 0.0f, 1.0f, args.temporal_alpha)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --temporal: ") + (value ? value : ""); } break; }
+            args.temporal_alpha_set = true;
         }
         else if (strcmp(arg, "--motion-solve-div") == 0) {
-            if (i + 1 < argc) args.motion_solve_divisor = clamp_int(std::atoi(argv[++i]), 1, 8, 0);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_int(value, 1, 8, args.motion_solve_divisor)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --motion-solve-div: ") + (value ? value : ""); } break; }
         }
         else if (strcmp(arg, "--motion-reuse") == 0) {
-            if (i + 1 < argc) args.motion_max_reuse_frames = clamp_int(std::atoi(argv[++i]), 0, 32, -1);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_int(value, 0, 32, args.motion_max_reuse_frames)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --motion-reuse: ") + (value ? value : ""); } break; }
         }
         else if (strcmp(arg, "--motion-reuse-thresh") == 0) {
-            if (i + 1 < argc) args.motion_reuse_scene_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_float(value, 0.0f, 1.0f, args.motion_reuse_scene_threshold)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --motion-reuse-thresh: ") + (value ? value : ""); } break; }
         }
         else if (strcmp(arg, "--motion-reuse-decay") == 0) {
-            if (i + 1 < argc) args.motion_reuse_confidence_decay = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_float(value, 0.0f, 1.0f, args.motion_reuse_confidence_decay)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --motion-reuse-decay: ") + (value ? value : ""); } break; }
         }
         else if (strcmp(arg, "--phase-interval") == 0) {
-            if (i + 1 < argc) args.motion_phase_interval = clamp_int(std::atoi(argv[++i]), 1, 64, 0);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_int(value, 1, 64, args.motion_phase_interval)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --phase-interval: ") + (value ? value : ""); } break; }
         }
         else if (strcmp(arg, "--phase-scene-trigger") == 0) {
-            if (i + 1 < argc) args.motion_phase_scene_trigger = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_float(value, 0.0f, 1.0f, args.motion_phase_scene_trigger)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --phase-scene-trigger: ") + (value ? value : ""); } break; }
         }
         else if (strcmp(arg, "--motion-still-thresh") == 0) {
-            if (i + 1 < argc) args.motion_still_scene_threshold = clamp_float(static_cast<float>(std::atof(argv[++i])), 0.0f, 1.0f, -1.0f);
+            if (!take_value(argc, argv, i, args, arg, value) || !parse_float(value, 0.0f, 1.0f, args.motion_still_scene_threshold)) { if (args.valid) { args.valid = false; args.error = std::string("Invalid value for --motion-still-thresh: ") + (value ? value : ""); } break; }
         }
         else if (strcmp(arg, "--scale") == 0) {
-            if (i + 1 < argc) {
-                std::string sm = argv[++i];
-                if (sm == "fit" || sm == "fill" || sm == "stretch") {
-                    args.scale_mode = sm;
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            std::string sm = value;
+            if (sm != "fit" && sm != "fill" && sm != "stretch") { args.valid = false; args.error = "Invalid value for --scale: " + sm; break; }
+            args.scale_mode = sm;
+            args.scale_mode_set = true;
         }
         else if (strcmp(arg, "--font") == 0) {
-            if (i + 1 < argc) {
-                args.font_path = argv[++i];
-                if (!validate_path(args.font_path)) {
-                    args.font_path.clear();
-                }
-            }
+            if (!take_value(argc, argv, i, args, arg, value) || !set_path(value, args.font_path, args, arg)) break;
+            args.font_path_set = true;
         }
         else if (strcmp(arg, "--no-audio") == 0) {
             args.no_audio = true;
+            args.no_audio_set = true;
         }
         else if (strcmp(arg, "--no-hysteresis") == 0) {
             args.use_hysteresis = false;
+            args.use_hysteresis_set = true;
         }
         else if (strcmp(arg, "--no-contours") == 0) {
             args.contours_enabled = false;
@@ -174,30 +194,52 @@ Args parse_args(int argc, char* argv[]) {
         }
         else if (strcmp(arg, "--no-orientation") == 0) {
             args.use_orientation_matching = false;
+            args.use_simple_orientation = false;
+            args.orientation_mode_set = true;
         }
         else if (strcmp(arg, "--simple-orientation") == 0) {
             args.use_simple_orientation = true;
             args.use_orientation_matching = false;
+            args.orientation_mode_set = true;
         }
         else if (strcmp(arg, "--debug") == 0) {
-            if (i + 1 < argc) {
-                args.debug_mode = argv[++i];
+            if (!take_value(argc, argv, i, args, arg, value)) break;
+            const std::string mode = value;
+            if (mode != "grayscale" && mode != "edges" && mode != "orientation") {
+                args.valid = false;
+                args.error = "Invalid value for --debug: " + mode;
+                break;
             }
+            args.debug_mode = mode;
         }
         else if (strcmp(arg, "--profile-live") == 0) {
             args.profile_live = true;
+            args.profile_live_set = true;
         }
         else if (strcmp(arg, "--strict-memory") == 0) {
             args.strict_memory = true;
+            args.strict_memory_set = true;
         }
         else if (strcmp(arg, "--fast") == 0) {
             args.fast_mode = true;
         }
         else if (arg[0] != '-') {
+            if (!args.input.empty()) {
+                args.valid = false;
+                args.error = std::string("Unexpected positional argument: ") + arg;
+                break;
+            }
             args.input = arg;
             if (!validate_path(args.input)) {
-                args.input.clear();
+                args.valid = false;
+                args.error = std::string("Invalid input path: ") + arg;
+                break;
             }
+        }
+        else {
+            args.valid = false;
+            args.error = std::string("Unknown option: ") + arg;
+            break;
         }
     }
     
@@ -207,7 +249,7 @@ Args parse_args(int argc, char* argv[]) {
 void print_help(const char* prog) {
     printf("Usage: %s [OPTIONS] <INPUT>\n\n", prog);
     printf("INPUT:\n");
-    printf("  Path to video file, image, or \"webcam\" for live capture\n\n");
+    printf("  Path to video/image; \"webcam\" requires an optional OpenCV build\n\n");
     printf("OPTIONS:\n");
     printf("  -o, --output <FILE>     Output file (.txt frames, video, or still image)\n");
     printf("      --config <FILE>     Config file path (default: platform-specific)\n");

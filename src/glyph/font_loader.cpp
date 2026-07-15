@@ -219,6 +219,9 @@ GlyphBitmap FontLoader::render_glyph(uint32_t codepoint) const {
     
     int w = x1 - x0;
     int h = y1 - y0;
+    if (w < 0 || h < 0 || static_cast<uint64_t>(w) * static_cast<uint64_t>(h) > 1000000ull) {
+        return GlyphBitmap();
+    }
     
     GlyphBitmap bitmap;
     bitmap.width = w;
@@ -226,7 +229,7 @@ GlyphBitmap FontLoader::render_glyph(uint32_t codepoint) const {
     bitmap.advance = static_cast<int>(advance * scale_);
     bitmap.bearing_x = x0;
     bitmap.bearing_y = y0;
-    bitmap.pixels.resize(w * h, 0);
+    bitmap.pixels.resize(checked_image_size(w, h), 0);
     
     stbtt_MakeCodepointBitmap(&font_info_->info, bitmap.pixels.data(), w, h, w, scale_, scale_, codepoint);
     

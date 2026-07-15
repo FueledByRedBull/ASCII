@@ -109,19 +109,10 @@ MultiScaleGradientData EdgeDetector::compute_multi_scale_gradients(const FloatIm
     // Lindeberg-style normalized Laplacian scale selection over a small geometric scale stack.
     const float sigma0 = std::max(0.1f, config_.scale_sigma_0);
     const float sigmaN = std::max(sigma0 + 1e-4f, config_.scale_sigma_1);
-    const int pixel_count = w * h;
-    const int kScaleLevels =
-        (pixel_count >= 1280 * 720) ? 5 :
-        (pixel_count >= 960 * 540) ? 3 : 2;
-
-    std::vector<float> sigmas(kScaleLevels, sigma0);
-    if (kScaleLevels > 1) {
-        const float ratio = sigmaN / sigma0;
-        for (int s = 0; s < kScaleLevels; ++s) {
-            float t = static_cast<float>(s) / static_cast<float>(kScaleLevels - 1);
-            sigmas[s] = sigma0 * std::pow(ratio, t);
-        }
-    }
+    // The public configuration defines two scales; keep the analysis stack tied
+    // to those endpoints instead of silently adding resolution-dependent levels.
+    constexpr int kScaleLevels = 2;
+    const std::vector<float> sigmas = {sigma0, sigmaN};
 
     std::vector<FloatImage> blurred(kScaleLevels);
     std::vector<FloatImage> gx(kScaleLevels);
@@ -130,6 +121,7 @@ MultiScaleGradientData EdgeDetector::compute_multi_scale_gradients(const FloatIm
     std::vector<FloatImage> orient(kScaleLevels);
     std::vector<FloatImage> lap(kScaleLevels);
     std::vector<FloatImage> norm_lap(kScaleLevels);
+    const FloatImage variance = local_variance_3x3(working);
 
     auto compute_laplacian = [](const FloatImage& img) {
         FloatImage out(img.width(), img.height(), 0.0f);
@@ -147,7 +139,9 @@ MultiScaleGradientData EdgeDetector::compute_multi_scale_gradients(const FloatIm
     };
 
     for (int s = 0; s < kScaleLevels; ++s) {
-        blurred[s] = gaussian_blur(working, sigmas[s]);
+        const float effective_sigma = std::sqrt(
+            sigmas[s] * sigmas[s] + config_.blur_sigma * config_.blur_sigma);
+        blurred[s] = gaussian_blur(working, effective_sigma);
         sobel(blurred[s], gx[s], gy[s]);
         mag[s] = FloatImage(w, h);
         orient[s] = FloatImage(w, h);
@@ -207,6 +201,17 @@ MultiScaleGradientData EdgeDetector::compute_multi_scale_gradients(const FloatIm
                             best_scale = s;
                         }
                     }
+                }
+
+                const float variance_span = std::max(
+                    config_.scale_variance_ceil - config_.scale_variance_floor, 1e-8f);
+                const float detail = std::clamp(
+                    (variance.get(x, y) - config_.scale_variance_floor) / variance_span,
+                    0.0f, 1.0f);
+                const int variance_scale = static_cast<int>(std::lround(
+                    (1.0f - detail) * static_cast<float>(kScaleLevels - 1)));
+                if (detail <= 0.33f || detail >= 0.67f) {
+                    best_scale = variance_scale;
                 }
             } else {
                 // Backward-compatible non-adaptive mode.
@@ -284,11 +289,9 @@ float EdgeDetector::compute_global_percentile_threshold(const FloatImage& magnit
     
     if (values.empty()) return 0.1f;
     
-    std::sort(values.begin(), values.end());
-    
     size_t idx = static_cast<size_t>(values.size() * percentile);
     if (idx >= values.size()) idx = values.size() - 1;
-    
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(idx), values.end());
     return values[idx];
 }
 
@@ -311,11 +314,9 @@ float EdgeDetector::compute_tile_threshold(const FloatImage& magnitude, int x0, 
     
     if (values.empty()) return 0.1f;
     
-    std::sort(values.begin(), values.end());
-    
     size_t idx = static_cast<size_t>(values.size() * percentile);
     if (idx >= values.size()) idx = values.size() - 1;
-    
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(idx), values.end());
     return values[idx];
 }
 
@@ -327,27 +328,24 @@ FloatImage EdgeDetector::compute_adaptive_threshold_map(const FloatImage& magnit
     
     int tw = result.width();
     int th = result.height();
-    
-    float global_thresh = compute_global_percentile_threshold(magnitude, percentile);
-    
-    for (int ty = 0; ty < th; ++ty) {
-        for (int tx = 0; tx < tw; ++tx) {
-            int x0 = tx * tile_size;
-            int y0 = ty * tile_size;
-            
-            float local_thresh = compute_tile_threshold(magnitude, x0, y0, tile_size, w, h, percentile);
-            
-            float combined = std::max(local_thresh, global_thresh * 0.5f);
-            combined = std::max(combined, floor);
-            
-            result.set(tx, ty, combined);
-        }
+
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int tile = 0; tile < tw * th; ++tile) {
+        const int tx = tile % tw;
+        const int ty = tile / tw;
+        const int x0 = tx * tile_size;
+        const int y0 = ty * tile_size;
+        const float local_thresh = compute_tile_threshold(
+            magnitude, x0, y0, tile_size, w, h, percentile);
+        result.set(tx, ty, std::max(local_thresh, floor));
     }
     
     return result;
 }
 
-EdgeData EdgeDetector::detect(const FloatImage& input) {
+EdgeData EdgeDetector::detect(const FloatImage& input, GradientData* selected_gradients) {
     EdgeData result;
     
     GradientData grad;
@@ -357,10 +355,18 @@ EdgeData EdgeDetector::detect(const FloatImage& input) {
         ms_grad = compute_multi_scale_gradients(input);
         result.magnitude = std::move(ms_grad.magnitude);
         result.orientation = std::move(ms_grad.orientation);
+        if (selected_gradients) {
+            selected_gradients->gx = std::move(ms_grad.gx);
+            selected_gradients->gy = std::move(ms_grad.gy);
+        }
     } else {
         grad = compute_gradients(input);
         result.magnitude = std::move(grad.magnitude);
         result.orientation = std::move(grad.orientation);
+        if (selected_gradients) {
+            selected_gradients->gx = std::move(grad.gx);
+            selected_gradients->gy = std::move(grad.gy);
+        }
     }
     
     FloatImage nms = non_maximum_suppression(result.magnitude, result.orientation);
@@ -376,9 +382,12 @@ EdgeData EdgeDetector::detect(const FloatImage& input) {
         high_thresh = std::max(high_thresh, config_.dark_scene_floor);
         low_thresh = high_thresh * 0.5f;
     } else if (config_.adaptive_mode == "local" || config_.adaptive_mode == "hybrid") {
+        const float configured_floor = std::max(config_.dark_scene_floor, config_.high_threshold);
         FloatImage thresh_map = compute_adaptive_threshold_map(nms, config_.tile_size,
                                                                 config_.global_percentile,
-                                                                config_.dark_scene_floor);
+                                                                configured_floor);
+        const float global_high = std::max(
+            compute_global_percentile_threshold(nms, config_.global_percentile), configured_floor);
         
         result.edge_mask.resize(w * h, false);
         
@@ -390,6 +399,9 @@ EdgeData EdgeDetector::detect(const FloatImage& input) {
                 if (ty >= thresh_map.height()) ty = thresh_map.height() - 1;
                 
                 float local_high = thresh_map.get(tx, ty);
+                if (config_.adaptive_mode == "hybrid") {
+                    local_high = 0.5f * local_high + 0.5f * global_high;
+                }
                 
                 float mag = nms.get(x, y);
                 result.edge_mask[y * w + x] = mag >= local_high;
@@ -409,6 +421,9 @@ EdgeData EdgeDetector::detect(const FloatImage& input) {
                     if (ty >= thresh_map.height()) ty = thresh_map.height() - 1;
                     
                     float local_high = thresh_map.get(tx, ty);
+                    if (config_.adaptive_mode == "hybrid") {
+                        local_high = 0.5f * local_high + 0.5f * global_high;
+                    }
                     float local_low = local_high * 0.5f;
                     
                     float mag = nms.get(x, y);
@@ -811,19 +826,27 @@ FloatImage EdgeDetector::non_maximum_suppression(const FloatImage& magnitude, co
 #endif
     for (int y = 1; y < h - 1; ++y) {
         for (int x = 1; x < w - 1; ++x) {
-            float mag = magnitude.get(x, y);
+            const float mag = magnitude.get(x, y);
             float angle = orientation.get(x, y);
-            
-            float nx = std::cos(angle);
-            float ny = std::sin(angle);
-            
-            int x1 = std::max(0, std::min(w - 1, static_cast<int>(x + nx + 0.5f)));
-            int y1 = std::max(0, std::min(h - 1, static_cast<int>(y + ny + 0.5f)));
-            int x2 = std::max(0, std::min(w - 1, static_cast<int>(x - nx + 0.5f)));
-            int y2 = std::max(0, std::min(h - 1, static_cast<int>(y - ny + 0.5f)));
-            
-            float mag1 = magnitude.get(x1, y1);
-            float mag2 = magnitude.get(x2, y2);
+            constexpr float kPi = 3.14159265358979323846f;
+            if (angle < 0.0f) angle += kPi;
+            if (angle >= kPi) angle -= kPi;
+
+            float mag1 = 0.0f;
+            float mag2 = 0.0f;
+            if (angle < kPi / 8.0f || angle >= 7.0f * kPi / 8.0f) {
+                mag1 = magnitude.get(x - 1, y);
+                mag2 = magnitude.get(x + 1, y);
+            } else if (angle < 3.0f * kPi / 8.0f) {
+                mag1 = magnitude.get(x - 1, y - 1);
+                mag2 = magnitude.get(x + 1, y + 1);
+            } else if (angle < 5.0f * kPi / 8.0f) {
+                mag1 = magnitude.get(x, y - 1);
+                mag2 = magnitude.get(x, y + 1);
+            } else {
+                mag1 = magnitude.get(x + 1, y - 1);
+                mag2 = magnitude.get(x - 1, y + 1);
+            }
             
             if (mag >= mag1 && mag >= mag2) {
                 result.set(x, y, mag);

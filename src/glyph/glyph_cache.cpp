@@ -9,6 +9,62 @@ namespace {
 constexpr int kFreqBins = 8;
 constexpr int kTextureBins = 8;
 
+constexpr std::array<uint32_t, 15> kRendererGlyphs = {
+    0x0020, 0x2580, 0x2584, 0x2588, 0x258C, 0x2590, 0x2591,
+    0x2592, 0x2593, 0x2596, 0x2597, 0x2598, 0x2599, 0x259D, 0x259F
+};
+
+uint8_t bilinear_sample(const ascii::GlyphBitmap& src, float x, float y) {
+    if (src.pixels.empty() || src.width <= 0 || src.height <= 0) return 0;
+    x = std::clamp(x, 0.0f, static_cast<float>(src.width - 1));
+    y = std::clamp(y, 0.0f, static_cast<float>(src.height - 1));
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int x1 = std::min(x0 + 1, src.width - 1);
+    const int y1 = std::min(y0 + 1, src.height - 1);
+    const float fx = x - x0;
+    const float fy = y - y0;
+    const float top = src.pixels[y0 * src.width + x0] * (1.0f - fx) +
+                      src.pixels[y0 * src.width + x1] * fx;
+    const float bottom = src.pixels[y1 * src.width + x0] * (1.0f - fx) +
+                         src.pixels[y1 * src.width + x1] * fx;
+    return static_cast<uint8_t>(std::lround(top * (1.0f - fy) + bottom * fy));
+}
+
+ascii::GlyphBitmap procedural_block(uint32_t codepoint, int width, int height) {
+    ascii::GlyphBitmap bitmap;
+    bitmap.width = width;
+    bitmap.height = height;
+    bitmap.advance = width;
+    bitmap.pixels.assign(static_cast<size_t>(width) * height, 0);
+    const int half_x = width / 2;
+    const int half_y = height / 2;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            bool on = false;
+            switch (codepoint) {
+                case 0x2580: on = y < half_y; break;
+                case 0x2584: on = y >= half_y; break;
+                case 0x2588: on = true; break;
+                case 0x258C: on = x < half_x; break;
+                case 0x2590: on = x >= half_x; break;
+                case 0x2591: on = ((x + 2 * y) % 4) == 0; break;
+                case 0x2592: on = ((x + y) % 2) == 0; break;
+                case 0x2593: on = ((x + 2 * y) % 4) != 0; break;
+                case 0x2596: on = x < half_x && y >= half_y; break;
+                case 0x2597: on = x >= half_x && y >= half_y; break;
+                case 0x2598: on = x < half_x && y < half_y; break;
+                case 0x259D: on = x >= half_x && y < half_y; break;
+                case 0x2599: on = x < half_x || y >= half_y; break;
+                case 0x259F: on = x >= half_x || y >= half_y; break;
+                default: break;
+            }
+            bitmap.pixels[static_cast<size_t>(y) * width + x] = on ? 255 : 0;
+        }
+    }
+    return bitmap;
+}
+
 std::vector<float> compute_frequency_signature(const ascii::GlyphBitmap& bmp) {
     std::vector<float> signature(kFreqBins, 0.0f);
     if (bmp.width <= 0 || bmp.height <= 0 || bmp.pixels.empty()) {
@@ -138,7 +194,13 @@ bool GlyphCache::initialize(FontLoader* loader, const std::vector<uint32_t>& cod
     brightness_sorted_.clear();
     edge_glyphs_.clear();
     
-    for (uint32_t cp : codepoints) {
+    std::vector<uint32_t> all_codepoints = codepoints;
+    for (uint32_t cp : kRendererGlyphs) {
+        if (std::find(all_codepoints.begin(), all_codepoints.end(), cp) == all_codepoints.end()) {
+            all_codepoints.push_back(cp);
+        }
+    }
+    for (uint32_t cp : all_codepoints) {
         render_and_analyze(cp);
     }
     
@@ -150,7 +212,8 @@ bool GlyphCache::initialize(FontLoader* loader, const std::vector<uint32_t>& cod
     std::sort(brightness_sorted_.begin(), brightness_sorted_.end(), [this](uint32_t a, uint32_t b) {
         auto* sa = get_stats(a);
         auto* sb = get_stats(b);
-        if (!sa || !sb) return false;
+        if (!sa || !sb) return a < b;
+        if (sa->brightness == sb->brightness) return a < b;
         return sa->brightness < sb->brightness;
     });
     
@@ -184,29 +247,45 @@ std::vector<uint32_t> GlyphCache::get_edge_glyphs() const {
 
 void GlyphCache::render_and_analyze(uint32_t codepoint) {
     if (!loader_) return;
-    
+
     GlyphBitmap src = loader_->render_glyph(codepoint);
-    if (src.empty()) return;
-    
+    const bool is_renderer_block = std::find(kRendererGlyphs.begin() + 1, kRendererGlyphs.end(), codepoint) !=
+                                   kRendererGlyphs.end();
+    if (src.empty() && codepoint != 0x0020 && !is_renderer_block) return;
+
     GlyphBitmap scaled;
     scaled.width = cell_width_;
     scaled.height = cell_height_;
-    scaled.advance = cell_width_;
-    scaled.bearing_x = 0;
-    scaled.bearing_y = 0;
-    scaled.pixels.resize(cell_width_ * cell_height_, 0);
-    
-    float scale_x = static_cast<float>(src.width) / cell_width_;
-    float scale_y = static_cast<float>(src.height) / cell_height_;
-    
-    for (int y = 0; y < cell_height_; ++y) {
-        for (int x = 0; x < cell_width_; ++x) {
-            int sx = static_cast<int>(x * scale_x);
-            int sy = static_cast<int>(y * scale_y);
-            sx = std::min(sx, src.width - 1);
-            sy = std::min(sy, src.height - 1);
-            scaled.pixels[y * cell_width_ + x] = src.pixels[sy * src.width + sx];
+    scaled.advance = src.advance > 0 ? src.advance : cell_width_;
+    scaled.bearing_x = src.bearing_x;
+    scaled.bearing_y = src.bearing_y;
+    scaled.pixels.assign(static_cast<size_t>(cell_width_) * cell_height_, 0);
+
+    if (!src.empty()) {
+        const float shrink = std::min({1.0f,
+            static_cast<float>(cell_width_) / std::max(1, src.width),
+            static_cast<float>(cell_height_) / std::max(1, src.height)});
+        const int draw_width = std::max(1, static_cast<int>(std::lround(src.width * shrink)));
+        const int draw_height = std::max(1, static_cast<int>(std::lround(src.height * shrink)));
+        const int advance = std::max(1, static_cast<int>(std::lround(src.advance * shrink)));
+        const int pen_x = (cell_width_ - advance) / 2;
+        const int origin_x = pen_x + static_cast<int>(std::lround(src.bearing_x * shrink));
+        const int baseline = std::clamp(loader_->ascent_pixels(), 0, cell_height_ - 1);
+        const int origin_y = baseline + static_cast<int>(std::lround(src.bearing_y * shrink));
+
+        for (int y = 0; y < draw_height; ++y) {
+            const int dy = origin_y + y;
+            if (dy < 0 || dy >= cell_height_) continue;
+            for (int x = 0; x < draw_width; ++x) {
+                const int dx = origin_x + x;
+                if (dx < 0 || dx >= cell_width_) continue;
+                const float sx = ((x + 0.5f) * src.width / draw_width) - 0.5f;
+                const float sy = ((y + 0.5f) * src.height / draw_height) - 0.5f;
+                scaled.pixels[static_cast<size_t>(dy) * cell_width_ + dx] = bilinear_sample(src, sx, sy);
+            }
         }
+    } else if (is_renderer_block) {
+        scaled = procedural_block(codepoint, cell_width_, cell_height_);
     }
     
     bitmaps_[codepoint] = std::move(scaled);

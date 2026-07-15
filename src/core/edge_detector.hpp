@@ -48,7 +48,7 @@ public:
     
     GradientData compute_gradients(const FloatImage& input);
     MultiScaleGradientData compute_multi_scale_gradients(const FloatImage& input);
-    EdgeData detect(const FloatImage& input);
+    EdgeData detect(const FloatImage& input, GradientData* selected_gradients = nullptr);
     
     static FloatImage gaussian_blur(const FloatImage& input, float sigma);
     static void sobel(const FloatImage& input, FloatImage& gx, FloatImage& gy);

@@ -37,6 +37,11 @@ struct ReplayCellData {
 
 constexpr uint32_t REPLAY_FRAME_FULL = 1u << 0;
 constexpr uint32_t REPLAY_FRAME_DELTA = 1u << 1;
+constexpr uint32_t REPLAY_VERSION = 1;
+constexpr uint32_t REPLAY_MAX_COLS = 500;
+constexpr uint32_t REPLAY_MAX_ROWS = 200;
+constexpr uint32_t REPLAY_MAX_CELLS = REPLAY_MAX_COLS * REPLAY_MAX_ROWS;
+constexpr uint32_t REPLAY_MAX_FPS = 120;
 
 class ReplayWriter {
 public:
@@ -47,7 +52,7 @@ public:
     bool write_frame(uint32_t frame_index, const std::vector<ASCIICell>& cells);
     bool write_frame_delta(uint32_t frame_index, const std::vector<ASCIICell>& cells, 
                            const std::vector<ASCIICell>& prev_cells);
-    void close();
+    bool close();
     
     uint32_t frame_count() const { return frame_count_; }
     bool is_open() const { return file_ != nullptr; }
@@ -59,6 +64,9 @@ private:
     int rows_ = 0;
     std::vector<uint8_t> compress_buffer_;
     std::vector<ASCIICell> last_cells_;
+    std::string target_path_;
+    std::string temporary_path_;
+    bool failed_ = false;
     
     bool write_header(const std::string& config_hash);
     bool write_compressed_block(const void* data, size_t size);
@@ -89,10 +97,12 @@ private:
     std::vector<uint8_t> decompress_buffer_;
     std::vector<ASCIICell> last_cells_;
     std::vector<uint64_t> frame_offsets_;
+    int64_t decoded_frame_index_ = -1;
     
     bool read_header();
     bool read_compressed_block(std::vector<uint8_t>& out, size_t expected_size);
     bool build_frame_index();
+    bool decode_indexed_frame(uint32_t frame_index, std::vector<ASCIICell>& cells);
 };
 
 }

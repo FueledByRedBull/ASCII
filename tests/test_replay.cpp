@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <cstddef>
 
 #include "../src/core/replay.hpp"
 
@@ -37,7 +38,7 @@ void test_full_frame_round_trip() {
         cell('D', 255, 255, 255),
     };
     assert(writer.write_frame(0, input));
-    writer.close();
+    assert(writer.close());
 
     ReplayReader reader;
     assert(reader.open(path.string()));
@@ -78,7 +79,7 @@ void test_delta_frame_round_trip() {
     assert(writer.open(path.string(), 2, 2, 30, "12345678"));
     assert(writer.write_frame(0, frame0));
     assert(writer.write_frame_delta(1, frame1, frame0));
-    writer.close();
+    assert(writer.close());
 
     ReplayReader reader;
     assert(reader.open(path.string()));
@@ -118,7 +119,103 @@ void write_deterministic_fixture(const std::filesystem::path& path) {
     assert(writer.open(path.string(), 2, 2, 24, "abcd1234"));
     assert(writer.write_frame(0, frame0));
     assert(writer.write_frame_delta(1, frame1, frame0));
-    writer.close();
+    assert(writer.close());
+}
+
+void patch_u32(const std::filesystem::path& path, std::streamoff offset, uint32_t value) {
+    std::fstream io(path, std::ios::binary | std::ios::in | std::ios::out);
+    assert(io);
+    io.seekp(offset);
+    io.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    assert(io);
+}
+
+void patch_byte(const std::filesystem::path& path, std::streamoff offset) {
+    std::fstream io(path, std::ios::binary | std::ios::in | std::ios::out);
+    assert(io);
+    io.seekg(offset);
+    char value = 0;
+    io.read(&value, 1);
+    value ^= static_cast<char>(0x5A);
+    io.seekp(offset);
+    io.write(&value, 1);
+    assert(io);
+}
+
+void test_unicode_random_access_and_validation() {
+    auto path = temp_replay_path("ascii_engine_replay_validation.areplay");
+    std::filesystem::remove(path);
+
+    std::vector<ASCIICell> frame0{
+        cell(0x1F642, 1, 2, 3), cell('B', 4, 5, 6),
+        cell('C', 7, 8, 9), cell('D', 10, 11, 12),
+    };
+    std::vector<ASCIICell> frame1 = frame0;
+    frame1[3] = cell(0x1F680, 20, 21, 22);
+
+    ReplayWriter writer;
+    assert(writer.open(path.string(), 2, 2, 30, "unicode1"));
+    assert(writer.write_frame(0, frame0));
+    assert(writer.write_frame_delta(1, frame1, frame0));
+    assert(writer.close());
+
+    ReplayReader reader;
+    assert(reader.open(path.string()));
+    std::vector<ASCIICell> output;
+    assert(reader.read_frame(1, output));
+    assert(output[0].codepoint == 0x1F642);
+    assert(output[3].codepoint == 0x1F680);
+    assert(reader.read_frame(0, output));
+    assert(output[3].codepoint == static_cast<uint32_t>('D'));
+    reader.close();
+
+    auto invalid_version = temp_replay_path("ascii_engine_replay_invalid_version.areplay");
+    std::filesystem::copy_file(path, invalid_version, std::filesystem::copy_options::overwrite_existing);
+    patch_u32(invalid_version, offsetof(ReplayHeader, version), 2);
+    assert(!reader.open(invalid_version.string()));
+
+    auto invalid_dimensions = temp_replay_path("ascii_engine_replay_invalid_dimensions.areplay");
+    std::filesystem::copy_file(path, invalid_dimensions, std::filesystem::copy_options::overwrite_existing);
+    patch_u32(invalid_dimensions, offsetof(ReplayHeader, cols), REPLAY_MAX_COLS + 1);
+    assert(!reader.open(invalid_dimensions.string()));
+
+    auto invalid_reserved = temp_replay_path("ascii_engine_replay_invalid_reserved.areplay");
+    std::filesystem::copy_file(path, invalid_reserved, std::filesystem::copy_options::overwrite_existing);
+    patch_u32(invalid_reserved, offsetof(ReplayHeader, reserved), 1);
+    assert(!reader.open(invalid_reserved.string()));
+
+    auto invalid_flags = temp_replay_path("ascii_engine_replay_invalid_flags.areplay");
+    std::filesystem::copy_file(path, invalid_flags, std::filesystem::copy_options::overwrite_existing);
+    patch_u32(invalid_flags, sizeof(ReplayHeader) + offsetof(ReplayFrameHeader, flags), 0x80000000u);
+    assert(!reader.open(invalid_flags.string()));
+
+    auto invalid_size = temp_replay_path("ascii_engine_replay_invalid_size.areplay");
+    std::filesystem::copy_file(path, invalid_size, std::filesystem::copy_options::overwrite_existing);
+    patch_u32(invalid_size, sizeof(ReplayHeader) + offsetof(ReplayFrameHeader, data_size), 0xFFFFFFFFu);
+    assert(!reader.open(invalid_size.string()));
+
+    auto corrupt_payload = temp_replay_path("ascii_engine_replay_corrupt_payload.areplay");
+    std::filesystem::copy_file(path, corrupt_payload, std::filesystem::copy_options::overwrite_existing);
+    patch_byte(corrupt_payload, sizeof(ReplayHeader) + sizeof(ReplayFrameHeader) + 2);
+    assert(reader.open(corrupt_payload.string()));
+    assert(!reader.read_frame(0, output));
+    reader.close();
+
+    auto invalid_output = temp_replay_path("ascii_engine_replay_invalid_unicode.areplay");
+    std::filesystem::remove(invalid_output);
+    ReplayWriter invalid_writer;
+    assert(invalid_writer.open(invalid_output.string(), 1, 1, 30, "invalid1"));
+    assert(!invalid_writer.write_frame(0, {cell(0x110000, 0, 0, 0)}));
+    assert(!invalid_writer.close());
+    assert(!std::filesystem::exists(invalid_output));
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(invalid_version);
+    std::filesystem::remove(invalid_dimensions);
+    std::filesystem::remove(invalid_reserved);
+    std::filesystem::remove(invalid_flags);
+    std::filesystem::remove(invalid_size);
+    std::filesystem::remove(corrupt_payload);
 }
 
 void test_replay_bytes_are_deterministic() {
@@ -145,6 +242,7 @@ int main() {
     test_full_frame_round_trip();
     test_delta_frame_round_trip();
     test_replay_bytes_are_deterministic();
+    test_unicode_random_access_and_validation();
     std::cout << "Replay tests passed\n";
     return 0;
 }

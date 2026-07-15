@@ -404,16 +404,16 @@ TEST(simple_orientation_mode) {
     CharSelector selector(cfg);
     
     auto sel = selector.select_edge_simple(0.0f);
-    assert(sel.codepoint == static_cast<uint32_t>('-'));
-    
-    sel = selector.select_edge_simple(kPi / 2.0f);
     assert(sel.codepoint == static_cast<uint32_t>('|'));
     
+    sel = selector.select_edge_simple(kPi / 2.0f);
+    assert(sel.codepoint == static_cast<uint32_t>('-'));
+    
     sel = selector.select_edge_simple(kPi / 4.0f);
-    assert(sel.codepoint == static_cast<uint32_t>('/'));
+    assert(sel.codepoint == static_cast<uint32_t>('\\'));
     
     sel = selector.select_edge_simple(-kPi / 4.0f);
-    assert(sel.codepoint == static_cast<uint32_t>('\\'));
+    assert(sel.codepoint == static_cast<uint32_t>('/'));
 }
 
 TEST(result_type) {

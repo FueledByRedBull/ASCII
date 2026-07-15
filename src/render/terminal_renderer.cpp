@@ -7,6 +7,13 @@ namespace ascii {
 TerminalRenderer::TerminalRenderer(Terminal& term, ColorMode color_mode)
     : term_(term), color_mode_(color_mode) {}
 
+void TerminalRenderer::set_color_mode(ColorMode mode) {
+    if (mode == color_mode_) return;
+    color_mode_ = mode;
+    prev_buffer_.clear();
+    force_color_reset_ = true;
+}
+
 void TerminalRenderer::set_grid_size(int cols, int rows) {
     cols_ = cols;
     rows_ = rows;
@@ -27,6 +34,10 @@ void TerminalRenderer::render(const std::vector<ASCIICell>& cells) {
 
 std::string TerminalRenderer::render_to_string(const std::vector<ASCIICell>& cells) {
     out_buffer_.clear();
+    if (force_color_reset_) {
+        append_string("\033[0m");
+        force_color_reset_ = false;
+    }
     int cursor_x = -1;
     int cursor_y = -1;
     

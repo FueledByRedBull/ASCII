@@ -59,11 +59,32 @@ void test_blockart_background_change_emits_background_code() {
     assert(bg_changed.find("\033[48;2;10;20;30m") != std::string::npos);
 }
 
+void test_color_mode_change_forces_reset_and_repaint() {
+    Terminal terminal;
+    TerminalRenderer renderer(terminal, ColorMode::BlockArt);
+    renderer.set_grid_size(1, 1);
+    std::vector<ASCIICell> cells{make_cell(0x2580, 255, 0, 0, 0, 0, 255)};
+    assert(!renderer.render_to_string(cells).empty());
+    assert(renderer.render_to_string(cells).empty());
+
+    renderer.set_color_mode(ColorMode::None);
+    std::string none = renderer.render_to_string(cells);
+    assert(none.find("\033[0m") != std::string::npos);
+    assert(none.find("\033[48;2;") == std::string::npos);
+    assert(none.find("\xE2\x96\x80") != std::string::npos);
+
+    renderer.set_color_mode(ColorMode::Truecolor);
+    std::string truecolor = renderer.render_to_string(cells);
+    assert(truecolor.find("\033[0m") != std::string::npos);
+    assert(truecolor.find("\033[38;2;255;0;0m") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
     test_glyph_and_foreground_changes_emit();
     test_blockart_background_change_emits_background_code();
+    test_color_mode_change_forces_reset_and_repaint();
     std::cout << "Terminal renderer tests passed\n";
     return 0;
 }

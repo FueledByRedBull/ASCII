@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iomanip>
 #include <vector>
+#include <filesystem>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -137,9 +138,20 @@ bool ends_with_txt(const std::string& path) {
     return ext == ".txt";
 }
 
-void write_ascii_to_file(const std::string& path, const std::vector<ascii::ASCIICell>& cells, int cols, int rows) {
-    std::ofstream out(path);
-    if (!out) return;
+bool replace_output_file(const std::string& temporary, const std::string& target) {
+#ifdef _WIN32
+    return MoveFileExA(temporary.c_str(), target.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(temporary.c_str(), target.c_str()) == 0;
+#endif
+}
+
+bool write_ascii_to_file(const std::string& path, const std::vector<ascii::ASCIICell>& cells, int cols, int rows) {
+    const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    const std::string temporary = path + ".tmp-" + std::to_string(nonce);
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
     
     for (int y = 0; y < rows; ++y) {
         for (int x = 0; x < cols; ++x) {
@@ -150,30 +162,20 @@ void write_ascii_to_file(const std::string& path, const std::vector<ascii::ASCII
         }
         out << '\n';
     }
-}
-
-char luminance_to_ascii(float lum) {
-    static const char ramp[] = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
-    int len = sizeof(ramp) - 1;
-    int idx = static_cast<int>(lum * (len - 1));
-    if (idx < 0) idx = 0;
-    if (idx >= len) idx = len - 1;
-    return ramp[idx];
-}
-
-void write_ascii_to_file_simple(const std::string& path, const std::vector<float>& luminance, int cols, int rows) {
-    std::ofstream out(path);
-    if (!out) return;
-    
-    for (int y = 0; y < rows; ++y) {
-        for (int x = 0; x < cols; ++x) {
-            int idx = y * cols + x;
-            if (idx < static_cast<int>(luminance.size())) {
-                out << luminance_to_ascii(luminance[idx]);
-            }
-        }
-        out << '\n';
+    out.flush();
+    const bool written = out.good();
+    out.close();
+    if (!written || !out) {
+        std::error_code ec;
+        std::filesystem::remove(temporary, ec);
+        return false;
     }
+    if (!replace_output_file(temporary, path)) {
+        std::error_code ec;
+        std::filesystem::remove(temporary, ec);
+        return false;
+    }
+    return true;
 }
 
 }
@@ -291,11 +293,14 @@ int play_replay(const std::string& path, const std::string& output_target, ascii
                 std::cerr << "Error: Failed to read replay frame " << i << "\n";
                 return 1;
             }
-            ascii::input::write_ascii_to_file(
+            if (!ascii::input::write_ascii_to_file(
                 text_frame_path(output_target, i, single_frame),
                 cells,
                 reader.cols(),
-                reader.rows());
+                reader.rows())) {
+                std::cerr << "Error: Failed to write replay text frame " << i << "\n";
+                return 1;
+            }
         }
         std::cerr << "[REPLAY] exported " << reader.frame_count() << " text frame(s) to "
                   << output_target << "\n";
@@ -352,12 +357,16 @@ int play_replay(const std::string& path, const std::string& output_target, ascii
 
 }  // namespace
 
-int main(int argc, char* argv[]) {
+int run_main(int argc, char* argv[]) {
     ascii::Args args = ascii::parse_args(argc, argv);
     
     if (args.show_help) {
         ascii::print_help(argv[0]);
         return 0;
+    }
+    if (!args.valid) {
+        std::cerr << "Error: " << args.error << "\n";
+        return 1;
     }
     if (!args.inspect_replay_path.empty() && !args.play_replay_path.empty()) {
         std::cerr << "Error: --inspect-replay and --play-replay are mutually exclusive\n";
@@ -374,22 +383,24 @@ int main(int argc, char* argv[]) {
     auto term_info = terminal.get_info();
 
     ascii::Config config = ascii::Config::defaults();
+    std::optional<ascii::Config> loaded_config;
     if (!args.config_path.empty()) {
-        auto loaded = ascii::Config::load(args.config_path);
-        if (!loaded) {
+        loaded_config = ascii::Config::load(args.config_path);
+        if (!loaded_config) {
             std::cerr << "Error: Failed to load config file: " << args.config_path << "\n";
             return 1;
         }
-        config = ascii::merge_config(config, *loaded);
     } else {
-        if (auto loaded_default = ascii::Config::load_default()) {
-            config = ascii::merge_config(config, *loaded_default);
-        }
+        loaded_config = ascii::Config::load_default();
+    }
+
+    if (loaded_config) {
+        config = *loaded_config;
     }
     if (!args.profile.empty()) {
         config.profile = args.profile;
+        ascii::apply_content_profile(config);
     }
-    ascii::apply_content_profile(config);
     config = ascii::apply_cli_overrides(config, args);
     if (!args.replay_path.empty()) {
         config.output.replay_path = args.replay_path;
@@ -409,6 +420,13 @@ int main(int argc, char* argv[]) {
     std::string config_error;
     if (!config.validate(config_error)) {
         std::cerr << "Error: Invalid config: " << config_error << "\n";
+        return 1;
+    }
+
+    const std::string output_target = config.output.target;
+    const OutputKind output_kind = classify_output_target(output_target);
+    if (output_kind == OutputKind::Unsupported) {
+        std::cerr << "Error: Unsupported output extension for target: " << output_target << "\n";
         return 1;
     }
 
@@ -502,6 +520,7 @@ int main(int argc, char* argv[]) {
     temporal_cfg.use_wavelet_flicker = config.temporal.use_wavelet_flicker;
     temporal_cfg.wavelet_strength = config.temporal.wavelet_strength;
     temporal_cfg.wavelet_window = config.temporal.wavelet_window;
+    temporal_cfg.frame_rate = static_cast<float>(config.fps);
     ascii::TemporalSmoother smoother(temporal_cfg);
     
     ascii::CharSelector::Config selector_cfg;
@@ -543,14 +562,17 @@ int main(int argc, char* argv[]) {
     ascii::MotionEstimator::Config motion_cfg;
     motion_cfg.motion_cap = static_cast<float>(config.temporal.motion_cap_pixels);
     motion_cfg.solve_divisor = config.temporal.motion_solve_divisor;
-    motion_cfg.max_reuse_frames = config.temporal.motion_max_reuse_frames;
+    const float frame_rate_scale = std::max(config.fps, 1) / 30.0f;
+    motion_cfg.max_reuse_frames = std::max(0, static_cast<int>(std::lround(
+        config.temporal.motion_max_reuse_frames * frame_rate_scale)));
     motion_cfg.reuse_scene_threshold = config.temporal.motion_reuse_scene_threshold;
     motion_cfg.reuse_confidence_decay = config.temporal.motion_reuse_confidence_decay;
     motion_cfg.still_scene_threshold = config.temporal.motion_still_scene_threshold;
     motion_cfg.use_phase_correlation = config.temporal.use_phase_correlation;
     motion_cfg.phase_search_radius = config.temporal.phase_search_radius;
     motion_cfg.phase_blend = config.temporal.phase_blend;
-    motion_cfg.phase_interval = config.temporal.motion_phase_interval;
+    motion_cfg.phase_interval = std::max(1, static_cast<int>(std::lround(
+        config.temporal.motion_phase_interval * frame_rate_scale)));
     motion_cfg.phase_scene_trigger = config.temporal.motion_phase_scene_trigger;
     ascii::MotionEstimator motion(motion_cfg);
     
@@ -558,6 +580,16 @@ int main(int argc, char* argv[]) {
     if (!source->open(config.input.source)) {
         std::cerr << "Error: Failed to open input: " << config.input.source << "\n";
         return 1;
+    }
+    if (config.debug.strict_memory) {
+        constexpr uint64_t kStrictMemoryBudgetBytes = 512ull * 1024ull * 1024ull;
+        const auto source_size = source->frame_size();
+        const uint64_t source_pixels = static_cast<uint64_t>(std::max(0, source_size.width)) *
+                                       static_cast<uint64_t>(std::max(0, source_size.height));
+        if (source_pixels > kStrictMemoryBudgetBytes / 32ull) {
+            std::cerr << "Error: Source dimensions exceed strict memory budget\n";
+            return 1;
+        }
     }
     
     ascii::AudioPlayer audio;
@@ -571,12 +603,6 @@ int main(int argc, char* argv[]) {
     bitmap_renderer.set_cache(&glyph_cache);
     bitmap_renderer.set_cell_size(config.grid.cell_width, config.grid.cell_height);
     
-    const std::string output_target = config.output.target;
-    const OutputKind output_kind = classify_output_target(output_target);
-    if (output_kind == OutputKind::Unsupported) {
-        std::cerr << "Error: Unsupported output extension for target: " << output_target << "\n";
-        return 1;
-    }
     bool has_output = output_kind == OutputKind::EncodedVideo || output_kind == OutputKind::StillImage;
     if (has_output) {
         ascii::VideoEncoder::Config enc_cfg;
@@ -606,7 +632,9 @@ int main(int argc, char* argv[]) {
     if (!config.output.replay_path.empty()) {
         replay_enabled = replay_writer.open(config.output.replay_path, cols, rows, config.fps, config.compute_hash());
         if (!replay_enabled) {
-            std::cerr << "Warning: Failed to open replay output: " << config.output.replay_path << "\n";
+            std::cerr << "Error: Failed to open replay output: " << config.output.replay_path << "\n";
+            video_encoder.close();
+            return 1;
         }
     }
     
@@ -638,6 +666,9 @@ int main(int argc, char* argv[]) {
     double stage_encode_seconds = 0.0;
     int encoded_frame_count = 0;
     bool encode_failed = false;
+    bool decode_failed = false;
+    bool replay_failed = false;
+    bool text_failed = false;
     std::atomic<bool> paused{false};
     std::atomic<bool> running{true};
     float edge_threshold = config.edge.high_threshold;
@@ -646,7 +677,7 @@ int main(int argc, char* argv[]) {
     ascii::PipelineRuntimeCache pipeline_runtime_cache;
     ascii::FrameComposer frame_composer;
     
-    while (running && source->read(frame)) {
+    while (running) {
         auto start = std::chrono::high_resolution_clock::now();
         
         if (output_kind == OutputKind::Terminal) {
@@ -689,6 +720,20 @@ int main(int argc, char* argv[]) {
         if (paused) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
+        }
+
+        const auto read_status = ascii::read_frame_if_ready(*source, paused, frame);
+        if (read_status == ascii::FrameReadStatus::Paused) {
+            continue;
+        }
+        if (read_status == ascii::FrameReadStatus::End) {
+            break;
+        }
+        if (read_status == ascii::FrameReadStatus::Error) {
+            std::cerr << "Error: Input decode failed before clean end of stream: "
+                      << config.input.source << "\n";
+            decode_failed = true;
+            break;
         }
         
         auto stage_start = std::chrono::high_resolution_clock::now();
@@ -845,8 +890,10 @@ int main(int argc, char* argv[]) {
                     static_cast<uint32_t>(frame_count), cells, replay_prev_cells);
             }
             if (!replay_ok) {
-                std::cerr << "Warning: Replay write failed at frame " << frame_count << "\n";
+                std::cerr << "Error: Replay write failed at frame " << frame_count << "\n";
                 replay_enabled = false;
+                replay_failed = true;
+                running = false;
             } else {
                 replay_prev_cells = cells;
             }
@@ -857,7 +904,12 @@ int main(int argc, char* argv[]) {
                 output_target,
                 static_cast<uint32_t>(frame_count),
                 is_single_image);
-            ascii::input::write_ascii_to_file(frame_path, cells, result.grid_cols, result.grid_rows);
+            if (!ascii::input::write_ascii_to_file(
+                    frame_path, cells, result.grid_cols, result.grid_rows)) {
+                std::cerr << "Error: Failed to write text output: " << frame_path << "\n";
+                text_failed = true;
+                running = false;
+            }
         }
         
         if (output_kind == OutputKind::Terminal) {
@@ -884,9 +936,11 @@ int main(int argc, char* argv[]) {
                       << ",\"fps\":" << (ms > 0.0 ? 1000.0 / ms : 0.0)
                       << "}\n";
         }
-        auto remaining = frame_duration - elapsed;
-        if (remaining > std::chrono::nanoseconds(0)) {
-            std::this_thread::sleep_for(remaining);
+        if (output_kind == OutputKind::Terminal && !is_single_image) {
+            auto remaining = frame_duration - elapsed;
+            if (remaining > std::chrono::nanoseconds(0)) {
+                std::this_thread::sleep_for(remaining);
+            }
         }
         prev_luminance = result.luminance;
         have_prev_luminance = true;
@@ -906,7 +960,11 @@ int main(int argc, char* argv[]) {
     }
     
     const bool encoder_closed_ok = video_encoder.close();
-    replay_writer.close();
+    const bool replay_closed_ok = replay_writer.close();
+    if (!config.output.replay_path.empty() && !replay_closed_ok) {
+        std::cerr << "Error: Failed to finalize replay output: " << config.output.replay_path << "\n";
+        replay_failed = true;
+    }
     audio.close();
 
     if (has_output) {
@@ -967,5 +1025,19 @@ int main(int argc, char* argv[]) {
     if (has_output && (encode_failed || !encoder_closed_ok || encoded_frame_count == 0)) {
         return 1;
     }
+    if (decode_failed || replay_failed || text_failed) {
+        return 1;
+    }
     return 0;
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        return run_main(argc, argv);
+    } catch (const std::bad_alloc&) {
+        std::cerr << "Error: Memory allocation failed\n";
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << "\n";
+    }
+    return 1;
 }

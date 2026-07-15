@@ -88,6 +88,22 @@ TEST(cross_produces_plus) {
     assert(stats.contour_codepoint == '+');
 }
 
+TEST(inverted_polarity_preserves_line_orientation) {
+    for (const std::string mode : {"vertical", "horizontal", "rising", "falling"}) {
+        FloatImage normal = make_step(32, 32, mode);
+        FloatImage inverted(32, 32, 0.0f);
+        for (int y = 0; y < 32; ++y) {
+            for (int x = 0; x < 32; ++x) {
+                inverted.set(x, y, 1.0f - normal.get(x, y));
+            }
+        }
+        const CellStats a = extract_one_cell(normal);
+        const CellStats b = extract_one_cell(inverted);
+        assert(a.has_contour && b.has_contour);
+        assert(a.contour_codepoint == b.contour_codepoint);
+    }
+}
+
 TEST(low_occupancy_edge_produces_no_contour) {
     FloatImage img(32, 32, 0.0f);
     img.set(16, 16, 1.0f);
@@ -204,6 +220,7 @@ int main() {
     RUN_TEST(rising_diagonal_produces_slash);
     RUN_TEST(falling_diagonal_produces_backslash);
     RUN_TEST(cross_produces_plus);
+    RUN_TEST(inverted_polarity_preserves_line_orientation);
     RUN_TEST(low_occupancy_edge_produces_no_contour);
     RUN_TEST(tangent_conversion_keeps_vertical_split_unrotated);
     RUN_TEST(composer_contour_overrides_selection);
