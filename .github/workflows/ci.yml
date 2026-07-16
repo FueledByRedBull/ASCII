@@ -16,9 +16,9 @@ jobs:
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\.vcpkg-bincache,readwrite
       VCPKG_DOWNLOADS: ${{ github.workspace }}\.vcpkg-downloads
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Cache vcpkg artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .vcpkg-bincache
@@ -55,12 +55,40 @@ jobs:
       - name: Test
         shell: pwsh
         run: ctest --test-dir build --output-on-failure
+      - name: Package release bundle
+        shell: pwsh
+        run: .\package_windows_release.ps1 -BuildDirectory build -Version 1.0.0
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ascii-engine-1.0.0-windows-x64
+          path: output/ascii-engine-1.0.0-windows-x64.zip
+          if-no-files-found: error
+
+  windows-package-smoke:
+    needs: windows-msvc
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@v6
+        with:
+          name: ascii-engine-1.0.0-windows-x64
+          path: package
+      - name: Smoke test bundle on clean runner
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath package\ascii-engine-1.0.0-windows-x64.zip -DestinationPath package\unpacked
+          $executable = Get-ChildItem -LiteralPath package\unpacked -Filter ascii-engine.exe -File -Recurse | Select-Object -First 1
+          if (-not $executable) { throw "Packaged executable was not found." }
+          & $executable.FullName --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged executable smoke test failed with exit code $LASTEXITCODE." }
 
   linux:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -76,9 +104,9 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Cache Homebrew downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/Library/Caches/Homebrew
           key: macos-homebrew-${{ hashFiles('.github/workflows/ci.yml') }}
