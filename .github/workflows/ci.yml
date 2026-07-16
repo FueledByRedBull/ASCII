@@ -71,7 +71,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download release bundle
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: ascii-engine-1.0.0-windows-x64
           path: package

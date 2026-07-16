@@ -19,16 +19,17 @@ OpenCV, AVX2, webcam, audio polish, GPU compute paths, and richer packaging are 
 
 ## Current Status
 
-Locally complete and verified on Windows/MSVC as of 2026-07-16:
+Complete and verified for the v1 no-OpenCV, non-AVX2 baseline as of 2026-07-16:
 
 - A clean Release configure/build in `cmake-build-final-proof` passed all 34 no-OpenCV, no-AVX2 CTest cases.
 - Every Blocker, High, and Medium implementation finding below is fixed with focused regression coverage.
 - Generated real-video tests cover decode count/FPS, numbered text frames, encoded video, first-frame stills, block-art media, and truncated-input failure.
 - Replay coverage includes strict validation, random delta access, full Unicode, deterministic bytes, and deterministic golden text export.
 - Requested text, replay, and encoded outputs use failure-aware finalization and do not report success for absent/incomplete files.
-- A versioned Windows x64 ZIP built from the clean tree contains the executable, license, `README.md`, runtime notes, and required DLLs; its bundled `--help` smoke test passes on the build host.
+- A versioned Windows x64 ZIP built from the clean tree contains the executable, license, `README.md`, runtime notes, and required DLLs; its bundled `--help` smoke test passes both on the build host and after artifact transfer to a separate clean Windows runner.
+- [Hosted CI run 29510258100](https://github.com/FueledByRedBull/ASCII/actions/runs/29510258100) passed on Windows, Linux, and macOS and completed the independent Windows package smoke test.
 
-Release publication still needs two external evidence gates: green hosted CI runs on Windows/Linux/macOS and a bundle smoke test on a separate clean Windows machine. OpenCV and AVX2 remain optional follow-up baselines.
+The v1 release evidence gates are satisfied. OpenCV and AVX2 remain optional follow-up baselines.
 
 The reference workload is measured rather than assumed. On a Ryzen 7 7800X3D, full-quality processing reaches 10.86 FPS, while `--fast --no-contours` reaches 25.70 processing FPS. Both stay well below 512 MiB and startup is below 2 seconds. The full-quality path therefore retains a documented performance gap; the explicit speed path meets the throughput target.
 
@@ -112,7 +113,7 @@ Complete in this order; later phases depend on the earlier contracts being stabl
 5. **Release proof**
    - [x] Run a clean Windows/MSVC no-OpenCV configure, build, and full CTest suite.
    - [x] Record the documented 1080p `120x40` performance/memory workload after correctness fixes; performance shortcuts must pass visual regressions.
-   - [ ] Get green hosted CI runs on Windows, Linux, and macOS and record the run links/date.
+   - [x] Get green hosted CI runs on Windows, Linux, and macOS and record the run links/date: [2026-07-16 run 29510258100](https://github.com/FueledByRedBull/ASCII/actions/runs/29510258100).
    - [x] Produce a minimal versioned release bundle with the executable, license, `README.md`, and dependency/runtime notes.
 
 OpenCV, AVX2, webcam polish, audio polish, GPU compute, PNG output, and richer installers remain optional and are not v1 blockers unless they continue to be advertised as supported v1 behavior.
@@ -347,8 +348,8 @@ Baseline notes live in `tests/baseline/README.md`.
 - [x] Algorithm fixtures and golden outputs pass for space, edge direction, motion, temporal changes, and color.
 - [x] Requested output failures return non-zero and do not claim success.
 - [x] The documented performance and memory workload is measured after correctness fixes.
-- [ ] Hosted CI passes on supported platforms.
-- [ ] A minimal versioned release bundle is smoke-tested on a clean Windows machine.
+- [x] Hosted CI passes on supported platforms: [2026-07-16 run 29510258100](https://github.com/FueledByRedBull/ASCII/actions/runs/29510258100).
+- [x] A minimal versioned release bundle is smoke-tested on a separate clean Windows runner in [run 29510258100](https://github.com/FueledByRedBull/ASCII/actions/runs/29510258100).
 
 Optional follow-up, not a v1 release gate:
 
@@ -363,7 +364,6 @@ Optional follow-up, not a v1 release gate:
 - Webcam support is v2/deferred for the no-OpenCV baseline.
 - Audio is best-effort/deferred and not a v1 release gate.
 - OpenCV-enabled builds need separate validation with OpenCV installed.
-- Hosted CI must run before cross-platform claims are fully proven.
 - Full-quality processing is below the 24 FPS reference target on the measured workload; `--fast --no-contours` meets it.
 - Terminal output can select glyphs using a loaded font, but the terminal ultimately renders those codepoints with its own configured font. Known-font visual validation is therefore performed through bitmap/video outputs.
 - Content profiles are deterministic hand-tuned presets, not empirically ranked quality claims.

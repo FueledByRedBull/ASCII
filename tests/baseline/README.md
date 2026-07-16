@@ -8,7 +8,7 @@ Environment:
 - Visual Studio 2022 Build Tools, MSVC 19.44, OpenMP enabled.
 - Project-local vcpkg dependencies under `.tools/vcpkg`.
 - Build directory: `build-noopencv`.
-- Independent clean proof directory: `cmake-build-release-proof`.
+- Independent clean proof directory: `cmake-build-final-proof`.
 - Build flags: `ASCII_USE_OPENCV=OFF`, `ASCII_ENABLE_AVX2=OFF`, `CMAKE_BUILD_TYPE=Release`.
 
 Verified commands:
@@ -24,6 +24,8 @@ Observed validation:
 - A clean configure built 41 targets/objects without compiler warnings; CTest passed 34/34 tests.
 - Coverage includes strict CLI/config behavior, temporal/motion/edge/glyph regressions, deterministic replay/golden text, generated real-video decode/export, block-art still/video, requested-output failures, and truncated decode failure.
 - The versioned Windows x64 ZIP built from the clean tree passed a bundled `--help` smoke test on this host and contained the executable, license, README, runtime notes, SDL2, FFmpeg, and zstd DLLs.
+- Final local ZIP SHA-256: `FAEAED14B1E9E17EA250096D5B643FCED718D903DEFDB84B7AA3F2A6902085D3`.
+- [Hosted CI run 29510258100](https://github.com/FueledByRedBull/ASCII/actions/runs/29510258100) passed the same 34-test baseline on Windows, Linux, and macOS, then downloaded and launched the packaged ZIP on a separate clean Windows runner.
 
 Performance workload:
 
@@ -37,7 +39,5 @@ Performance workload:
 Known baseline limitations:
 
 - OpenCV-enabled configuration is not part of this baseline.
-- Hosted CI must still run before cross-platform status is considered proven.
-- The release ZIP still needs a smoke test on a separate clean Windows machine.
 - Full-quality processing remains below the 24 FPS reference target on this workload.
 - Verified still-image CLI targets are `.jpg`, `.jpeg`, and `.bmp`; `.png` is intentionally rejected in the no-OpenCV MSVC baseline until the FFmpeg still encoder path is fixed.

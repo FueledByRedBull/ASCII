@@ -1,6 +1,6 @@
 # ASCII Engine
 
-Status: the Windows/MSVC v1 implementation is locally complete for the no-OpenCV, non-AVX2 baseline and passes 34 clean-build tests. Hosted cross-platform CI and a separate clean-machine ZIP smoke test remain release-publication evidence gates tracked in `PROJECT.md`.
+Status: the no-OpenCV, non-AVX2 v1 baseline is complete. It passes 34 clean-build tests locally and in hosted Windows/Linux/macOS CI, and the Windows ZIP passes a separate clean-runner smoke test. Evidence is tracked in `PROJECT.md`.
 
 ASCII Engine is a deterministic, non-ML C++20 renderer that converts video and images into ANSI/ASCII output for terminal playback and file export.
 
