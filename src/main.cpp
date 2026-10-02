@@ -54,9 +54,8 @@ static bool console_modified = false;
 void setup_nonblocking_stdin() {
     h_stdin = GetStdHandle(STD_INPUT_HANDLE);
     if (h_stdin == INVALID_HANDLE_VALUE) return;
-    GetConsoleMode(h_stdin, &original_mode);
-    SetConsoleMode(h_stdin, original_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
-    console_modified = true;
+    if (!GetConsoleMode(h_stdin, &original_mode)) return;
+    console_modified = SetConsoleMode(h_stdin, original_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) != 0;
 }
 
 void restore_stdin() {
@@ -77,13 +76,12 @@ static termios original_termios;
 static bool termios_modified = false;
 
 void setup_nonblocking_stdin() {
-    tcgetattr(STDIN_FILENO, &original_termios);
+    if (tcgetattr(STDIN_FILENO, &original_termios) != 0) return;
     termios new_termios = original_termios;
     new_termios.c_lflag &= ~(ICANON | ECHO);
     new_termios.c_cc[VMIN] = 0;
     new_termios.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
-    termios_modified = true;
+    termios_modified = tcsetattr(STDIN_FILENO, TCSANOW, &new_termios) == 0;
 }
 
 void restore_stdin() {
@@ -108,6 +106,21 @@ int read_key() {
     return -1;
 }
 #endif
+
+bool is_interactive() {
+#ifdef _WIN32
+    DWORD mode;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) &&
+           GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode);
+#else
+    return isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+#endif
+}
+
+struct StdinGuard {
+    explicit StdinGuard(bool enabled) { if (enabled) setup_nonblocking_stdin(); }
+    ~StdinGuard() { restore_stdin(); }
+};
 
 std::string codepoint_to_utf8(uint32_t cp) {
     std::string result;
@@ -271,7 +284,37 @@ int inspect_replay(const std::string& path) {
     return 0;
 }
 
+bool same_local_path(const std::string& first, const std::string& second) {
+    if (first.empty() || second.empty()) return false;
+    std::error_code error;
+    if (std::filesystem::equivalent(first, second, error)) return true;
+    error.clear();
+    const auto a = std::filesystem::weakly_canonical(first, error);
+    if (error) return false;
+    const auto b = std::filesystem::weakly_canonical(second, error);
+    if (error) return false;
+#ifdef _WIN32
+    return _wcsicmp(a.c_str(), b.c_str()) == 0;
+#else
+    return a == b;
+#endif
+}
+
+bool validate_output_destination(const std::string& path) {
+    std::error_code error;
+    if (!path.empty() && std::filesystem::is_directory(path, error)) {
+        std::cerr << "Error: Output destination is a directory: " << path << "\n";
+        return false;
+    }
+    return true;
+}
+
 int play_replay(const std::string& path, const std::string& output_target, ascii::ColorMode color_mode) {
+    if (!validate_output_destination(output_target)) return 1;
+    if (same_local_path(path, output_target)) {
+        std::cerr << "Error: Input and output paths must be distinct\n";
+        return 1;
+    }
     ascii::ReplayReader reader;
     if (!reader.open(path)) {
         std::cerr << "Error: Failed to open replay: " << path << "\n";
@@ -293,8 +336,13 @@ int play_replay(const std::string& path, const std::string& output_target, ascii
                 std::cerr << "Error: Failed to read replay frame " << i << "\n";
                 return 1;
             }
+            const auto frame_path = text_frame_path(output_target, i, single_frame);
+            if (same_local_path(path, frame_path)) {
+                std::cerr << "Error: Input and output paths must be distinct\n";
+                return 1;
+            }
             if (!ascii::input::write_ascii_to_file(
-                text_frame_path(output_target, i, single_frame),
+                frame_path,
                 cells,
                 reader.cols(),
                 reader.rows())) {
@@ -311,10 +359,13 @@ int play_replay(const std::string& path, const std::string& output_target, ascii
     ascii::TerminalRenderer renderer(terminal, color_mode);
     renderer.set_grid_size(reader.cols(), reader.rows());
 
-    terminal.enter_alt_screen();
-    terminal.hide_cursor();
-    terminal.clear_screen();
-    ascii::input::setup_nonblocking_stdin();
+    const bool interactive = ascii::input::is_interactive();
+    ascii::input::StdinGuard stdin_guard(interactive);
+    if (interactive) {
+        terminal.enter_alt_screen();
+        terminal.hide_cursor();
+        terminal.clear_screen();
+    }
 
     const double fps = reader.header().fps > 0 ? static_cast<double>(reader.header().fps) : 30.0;
     const auto frame_duration = std::chrono::duration<double>(1.0 / fps);
@@ -323,7 +374,7 @@ int play_replay(const std::string& path, const std::string& output_target, ascii
     reader.reset_decode_state();
     for (uint32_t i = 0; i < reader.frame_count();) {
         const auto start = std::chrono::high_resolution_clock::now();
-        int key = ascii::input::read_key();
+        int key = interactive ? ascii::input::read_key() : -1;
         if (key == 'q' || key == 27) {
             break;
         }
@@ -405,11 +456,6 @@ int run_main(int argc, char* argv[]) {
     if (!args.replay_path.empty()) {
         config.output.replay_path = args.replay_path;
     }
-    if (!config.output.target.empty() &&
-        config.color.mode == ascii::ColorMode::None &&
-        !args.color_mode_set) {
-        config.color.mode = ascii::ColorMode::Truecolor;
-    }
 
     if (config.input.source.empty()) {
         std::cerr << "Error: No input specified\n";
@@ -424,6 +470,14 @@ int run_main(int argc, char* argv[]) {
     }
 
     const std::string output_target = config.output.target;
+    if (!validate_output_destination(output_target) ||
+        !validate_output_destination(config.output.replay_path)) return 1;
+    if (same_local_path(config.input.source, output_target) ||
+        same_local_path(config.input.source, config.output.replay_path) ||
+        same_local_path(output_target, config.output.replay_path)) {
+        std::cerr << "Error: Input, output, and replay paths must be distinct\n";
+        return 1;
+    }
     const OutputKind output_kind = classify_output_target(output_target);
     if (output_kind == OutputKind::Unsupported) {
         std::cerr << "Error: Unsupported output extension for target: " << output_target << "\n";
@@ -432,21 +486,30 @@ int run_main(int argc, char* argv[]) {
 
     int cols = config.grid.cols > 0 ? config.grid.cols : term_info.cols;
     int rows = config.grid.rows > 0 ? config.grid.rows : term_info.rows;
+    uint64_t source_memory_budget = 512ull * 1024ull * 1024ull;
+    const size_t audio_memory_limit = (config.debug.strict_memory ? 32ull : 256ull) * 1024ull * 1024ull;
     if (config.debug.strict_memory) {
         constexpr size_t kStrictMemoryBudgetBytes = 512ull * 1024ull * 1024ull;
         const size_t pixel_width = static_cast<size_t>(cols) * static_cast<size_t>(config.grid.cell_width);
         const size_t pixel_height = static_cast<size_t>(rows) * static_cast<size_t>(config.grid.cell_height);
         const size_t pixels = pixel_width * pixel_height;
         const size_t cells = static_cast<size_t>(cols) * static_cast<size_t>(rows);
-        const size_t estimated_bytes =
-            pixels * 96ull + cells * 256ull + static_cast<size_t>(config.temporal.motion_cap_pixels) * 64ull;
+        const size_t audio_reserve = !config.no_audio && output_kind == OutputKind::Terminal
+            ? audio_memory_limit * 3 : 0;
+        const size_t bilateral_reserve = config.color.use_bilateral_grid
+            ? static_cast<size_t>(std::min(cols, config.color.bilateral_spatial_bins)) *
+              std::min(rows, config.color.bilateral_spatial_bins) *
+              config.color.bilateral_range_bins * 5ull * sizeof(float)
+            : 0;
+        const size_t estimated_bytes = pixels * 96ull + cells * 256ull + audio_reserve + bilateral_reserve +
+            32ull * 1024ull * 1024ull;
         if (estimated_bytes > kStrictMemoryBudgetBytes) {
             std::cerr << "Error: Strict memory estimate exceeds 512 MiB budget (estimated "
                       << (estimated_bytes / (1024ull * 1024ull)) << " MiB)\n";
             return 1;
         }
+        source_memory_budget -= estimated_bytes;
     }
-
     ascii::ColorMode color_mode = config.color.mode;
     ascii::ColorSpace::init();
     
@@ -454,21 +517,17 @@ int run_main(int argc, char* argv[]) {
     if (!config.font_path.empty()) {
         auto font_result = font_loader.load(config.font_path, static_cast<float>(config.grid.cell_height));
         if (!font_result.success()) {
-            std::cerr << "Warning: Failed to load font: " << config.font_path << " - " << font_result.message << "\n";
+            std::cerr << "Error: Failed to load font: " << config.font_path << " - " << font_result.message << "\n";
+            return 1;
         }
     }
     
     if (!font_loader.is_loaded()) {
         auto fallback_result = font_loader.load_system_fallback(static_cast<float>(config.grid.cell_height));
         if (!fallback_result.success()) {
-            std::cerr << "Warning: " << fallback_result.message << " - character rendering may be limited\n";
+            std::cerr << "Error: " << fallback_result.message << "\n";
+            return 1;
         }
-    }
-    
-    ascii::GlyphCache glyph_cache;
-    auto codepoints = ascii::CharSet::get_set(config.selector.char_set);
-    if (!glyph_cache.initialize(&font_loader, codepoints, config.grid.cell_width, config.grid.cell_height)) {
-        std::cerr << "Warning: Failed to initialize glyph cache\n";
     }
     
     ascii::Pipeline::Config pipeline_cfg;
@@ -506,11 +565,21 @@ int run_main(int argc, char* argv[]) {
     pipeline_cfg.contour_intersection_ratio = config.edge.contour_intersection_ratio;
     pipeline_cfg.contour_dog_sigma_inner = config.edge.contour_dog_sigma_inner;
     pipeline_cfg.contour_dog_sigma_outer = config.edge.contour_dog_sigma_outer;
-    pipeline_cfg.enable_orientation_histogram = !(config.selector.use_simple_orientation || config.selector.mode == "simple");
+    const bool simple_orientation = config.selector.use_simple_orientation ||
+        (config.selector.use_orientation_matching && config.selector.mode == "simple");
+    pipeline_cfg.enable_orientation_histogram = config.selector.use_orientation_matching && !simple_orientation;
     pipeline_cfg.enable_frequency_signature = config.selector.enable_frequency_matching;
     pipeline_cfg.enable_texture_signature = config.selector.enable_gabor_texture;
     
     ascii::Pipeline pipeline(pipeline_cfg);
+
+    ascii::GlyphCache glyph_cache;
+    auto codepoints = ascii::CharSet::get_set(config.selector.char_set);
+    if (!glyph_cache.initialize(&font_loader, codepoints, config.grid.cell_width,
+                                config.grid.cell_height, pipeline.edge_config())) {
+        std::cerr << "Error: Failed to initialize glyph cache\n";
+        return 1;
+    }
     
     ascii::TemporalSmoother::Config temporal_cfg;
     temporal_cfg.alpha = config.temporal.alpha;
@@ -527,8 +596,8 @@ int run_main(int argc, char* argv[]) {
     selector_cfg.edge_threshold = config.edge.high_threshold;
     selector_cfg.use_orientation_matching =
         config.selector.use_orientation_matching && config.selector.mode == "histogram";
-    selector_cfg.use_simple_orientation = config.selector.use_simple_orientation || config.selector.mode == "simple";
-    selector_cfg.use_unified_loss = !selector_cfg.use_simple_orientation;
+    selector_cfg.use_simple_orientation = simple_orientation;
+    selector_cfg.use_unified_loss = config.selector.mode != "simple" && !selector_cfg.use_simple_orientation;
     selector_cfg.loss_weights.brightness = config.selector.weight_brightness;
     selector_cfg.loss_weights.orientation = config.selector.weight_orientation;
     selector_cfg.loss_weights.contrast = config.selector.weight_contrast;
@@ -577,22 +646,36 @@ int run_main(int argc, char* argv[]) {
     ascii::MotionEstimator motion(motion_cfg);
     
     auto source = ascii::create_source(config.input.source);
+    if (config.debug.strict_memory) source->set_pixel_limit(source_memory_budget / 32ull);
     if (!source->open(config.input.source)) {
         std::cerr << "Error: Failed to open input: " << config.input.source << "\n";
         return 1;
     }
+    const auto* sequence = dynamic_cast<const ascii::ImageSequenceSource*>(source.get());
+    const auto input_uses_path = [&](const std::string& path) {
+        if (path.empty()) return false;
+        if (!sequence) return same_local_path(config.input.source, path);
+        for (const auto& input : sequence->input_files()) {
+            if (same_local_path(input, path)) return true;
+        }
+        return false;
+    };
+    if (input_uses_path(output_target) || input_uses_path(config.output.replay_path)) {
+        std::cerr << "Error: Input, output, and replay paths must be distinct\n";
+        return 1;
+    }
     if (config.debug.strict_memory) {
-        constexpr uint64_t kStrictMemoryBudgetBytes = 512ull * 1024ull * 1024ull;
         const auto source_size = source->frame_size();
         const uint64_t source_pixels = static_cast<uint64_t>(std::max(0, source_size.width)) *
                                        static_cast<uint64_t>(std::max(0, source_size.height));
-        if (source_pixels > kStrictMemoryBudgetBytes / 32ull) {
+        if (source_pixels > source_memory_budget / 32ull) {
             std::cerr << "Error: Source dimensions exceed strict memory budget\n";
             return 1;
         }
     }
     
     ascii::AudioPlayer audio;
+    audio.set_memory_limit(audio_memory_limit);
     bool has_audio = false;
     if (!config.no_audio && config.output.target.empty()) {
         has_audio = audio.open(config.input.source);
@@ -640,12 +723,14 @@ int run_main(int argc, char* argv[]) {
     
     double source_fps = source->fps();
     bool is_single_image = (source_fps == 0.0);
+    const bool interactive = output_kind == OutputKind::Terminal &&
+        config.input.source.rfind("pipe:", 0) != 0 && ascii::input::is_interactive();
+    ascii::input::StdinGuard stdin_guard(interactive && !is_single_image);
     
-    if (output_kind == OutputKind::Terminal && !is_single_image) {
+    if (interactive && !is_single_image) {
         terminal.enter_alt_screen();
         terminal.hide_cursor();
         terminal.clear_screen();
-        ascii::input::setup_nonblocking_stdin();
     }
     
     if (has_audio) {
@@ -680,7 +765,7 @@ int run_main(int argc, char* argv[]) {
     while (running) {
         auto start = std::chrono::high_resolution_clock::now();
         
-        if (output_kind == OutputKind::Terminal) {
+        if (interactive) {
             int key = ascii::input::read_key();
             if (key == 'q' || key == 27) {
                 running = false;
@@ -740,10 +825,7 @@ int run_main(int argc, char* argv[]) {
         ascii::Pipeline::Result computed_result;
         const ascii::Pipeline::Result* result_ptr = nullptr;
 
-        const bool allow_mixed_block_mode = config.grid.quad_tree_adaptive &&
-                                            color_mode != ascii::ColorMode::BlockArt;
-        const bool need_color_buffer = (color_mode == ascii::ColorMode::BlockArt) ||
-                                       allow_mixed_block_mode;
+        const bool need_color_buffer = color_mode == ascii::ColorMode::BlockArt;
         const bool need_color_stats = need_color_buffer ||
                                       color_mode != ascii::ColorMode::None ||
                                       config.color.use_bilateral_grid;
@@ -759,7 +841,7 @@ int run_main(int argc, char* argv[]) {
         } else {
             computed_result = pipeline.process(frame, cache_decision.process_options);
             pipeline_runtime_cache.commit_processed_result(
-                computed_result, need_color_buffer, cache_decision.reuse_cell_stats);
+                computed_result, need_color_buffer, need_color_stats, cache_decision.reuse_cell_stats);
             result_ptr = &pipeline_runtime_cache.cached_result();
         }
 
@@ -789,45 +871,31 @@ int run_main(int argc, char* argv[]) {
             audio.sync_to_frame(frame_count, target_fps);
         }
         
-        if (!config.debug.mode.empty() && output_kind == OutputKind::Terminal) {
+        std::vector<ascii::ASCIICell> cells;
+        if (config.debug.enabled && !config.debug.mode.empty()) {
+            cells.resize(result.cell_stats.size());
             if (config.debug.mode == "grayscale") {
-                std::vector<ascii::ASCIICell> debug_cells(result.grid_cols * result.grid_rows);
-                for (int i = 0; i < static_cast<int>(debug_cells.size()); ++i) {
-                    int x = i % result.grid_cols;
-                    int y = i / result.grid_cols;
-                    int px0 = x * config.grid.cell_width;
-                    int py0 = y * config.grid.cell_height;
-                    float sum = 0;
-                    int cnt = 0;
-                    for (int dy = 0; dy < config.grid.cell_height && py0 + dy < result.luminance.height(); ++dy) {
-                        for (int dx = 0; dx < config.grid.cell_width && px0 + dx < result.luminance.width(); ++dx) {
-                            sum += result.luminance.get(px0 + dx, py0 + dy);
-                            cnt++;
-                        }
-                    }
-                    float lum = cnt > 0 ? sum / cnt : 0;
-                    auto& cell = debug_cells[i];
-                    cell.codepoint = static_cast<uint32_t>(' ');
-                    cell.fg_r = cell.fg_g = cell.fg_b = static_cast<uint8_t>(lum * 255);
+                constexpr char ramp[] = " .:-=+*#%@";
+                for (size_t i = 0; i < cells.size(); ++i) {
+                    const float lum = std::clamp(result.cell_stats[i].mean_luminance, 0.0f, 1.0f);
+                    auto& cell = cells[i];
+                    cell.codepoint = color_mode == ascii::ColorMode::None
+                        ? static_cast<uint32_t>(ramp[static_cast<size_t>(lum * 9.0f)]) : 0x2588;
+                    cell.fg_r = cell.fg_g = cell.fg_b = ascii::ColorSpace::linear_to_srgb(lum);
                 }
-                term_renderer.render(debug_cells);
-                terminal.flush();
             } else if (config.debug.mode == "edges") {
-                std::vector<ascii::ASCIICell> debug_cells(result.grid_cols * result.grid_rows);
-                for (int i = 0; i < static_cast<int>(debug_cells.size()); ++i) {
+                for (size_t i = 0; i < cells.size(); ++i) {
                     const auto& stats = result.cell_stats[i];
-                    auto& cell = debug_cells[i];
+                    auto& cell = cells[i];
                     cell.codepoint = static_cast<uint32_t>(stats.is_edge_cell ? '#' : ' ');
-                    cell.fg_r = cell.fg_g = cell.fg_b = static_cast<uint8_t>(stats.edge_strength * 255 * 4);
+                    cell.fg_r = cell.fg_g = cell.fg_b = static_cast<uint8_t>(
+                        std::clamp(stats.edge_strength * 255.0f * 4.0f, 0.0f, 255.0f));
                 }
-                term_renderer.render(debug_cells);
-                terminal.flush();
             } else if (config.debug.mode == "orientation") {
                 constexpr float kPi = 3.14159265358979323846f;
-                std::vector<ascii::ASCIICell> debug_cells(result.grid_cols * result.grid_rows);
-                for (int i = 0; i < static_cast<int>(debug_cells.size()); ++i) {
+                for (size_t i = 0; i < cells.size(); ++i) {
                     const auto& stats = result.cell_stats[i];
-                    auto& cell = debug_cells[i];
+                    auto& cell = cells[i];
                     float angle = stats.cell_orientation;
                     float hue = (angle + kPi) / (2.0f * kPi);
                     uint8_t r = static_cast<uint8_t>(std::abs(std::sin(hue * 6.28f)) * 255);
@@ -836,29 +904,36 @@ int run_main(int argc, char* argv[]) {
                     cell.codepoint = static_cast<uint32_t>(stats.is_edge_cell ? 'O' : '.');
                     cell.fg_r = r; cell.fg_g = g; cell.fg_b = b;
                 }
-                term_renderer.render(debug_cells);
-                terminal.flush();
             }
-            frame_count++;
-            continue;
+            if (color_mode == ascii::ColorMode::None || color_mode == ascii::ColorMode::Ansi16 ||
+                color_mode == ascii::ColorMode::Ansi256) {
+                for (size_t i = 0; i < cells.size(); ++i) {
+                    auto& cell = cells[i];
+                    const auto mapped = color_mapper.map_with_dither(
+                        static_cast<int>(i % result.grid_cols), static_cast<int>(i / result.grid_cols), 1,
+                        cell.fg_r / 255.0f, cell.fg_g / 255.0f, cell.fg_b / 255.0f,
+                        result.cell_stats[i].is_edge_cell);
+                    cell.fg_r = mapped.r; cell.fg_g = mapped.g; cell.fg_b = mapped.b;
+                }
+            }
+        } else {
+            stage_start = std::chrono::high_resolution_clock::now();
+            ascii::FrameComposer::Context compose_context{
+                smoother,
+                selector,
+                color_mapper,
+                bilateral_grid,
+                motion,
+                block_renderer,
+                config,
+                color_mode,
+                edge_threshold
+            };
+            auto composed = frame_composer.compose(result, compose_context);
+            cells = std::move(composed.cells);
+            stage_select_seconds += std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - stage_start).count();
         }
-        
-        stage_start = std::chrono::high_resolution_clock::now();
-        ascii::FrameComposer::Context compose_context{
-            smoother,
-            selector,
-            color_mapper,
-            bilateral_grid,
-            motion,
-            block_renderer,
-            config,
-            color_mode,
-            edge_threshold
-        };
-        auto composed = frame_composer.compose(result, compose_context);
-        std::vector<ascii::ASCIICell> cells = std::move(composed.cells);
-        stage_select_seconds += std::chrono::duration<double>(
-            std::chrono::high_resolution_clock::now() - stage_start).count();
         
         if (has_output) {
             auto encode_start = std::chrono::high_resolution_clock::now();
@@ -904,6 +979,12 @@ int run_main(int argc, char* argv[]) {
                 output_target,
                 static_cast<uint32_t>(frame_count),
                 is_single_image);
+            if (input_uses_path(frame_path) ||
+                same_local_path(config.output.replay_path, frame_path)) {
+                std::cerr << "Error: Input, output, and replay paths must be distinct\n";
+                text_failed = true;
+                break;
+            }
             if (!ascii::input::write_ascii_to_file(
                     frame_path, cells, result.grid_cols, result.grid_rows)) {
                 std::cerr << "Error: Failed to write text output: " << frame_path << "\n";
@@ -950,7 +1031,7 @@ int run_main(int argc, char* argv[]) {
     
     if (output_kind == OutputKind::Terminal) {
         ascii::input::restore_stdin();
-        if (is_single_image) {
+        if (is_single_image && interactive) {
             terminal.write("\n\nPress Enter to exit...");
             terminal.flush();
             std::cin.get();
@@ -959,8 +1040,14 @@ int run_main(int argc, char* argv[]) {
         terminal.exit_alt_screen();
     }
     
-    const bool encoder_closed_ok = video_encoder.close();
-    const bool replay_closed_ok = replay_writer.close();
+    const bool processing_failed = decode_failed || encode_failed || replay_failed || text_failed;
+    if (processing_failed) {
+        video_encoder.abort();
+        replay_writer.abort();
+    }
+    const bool encoder_closed_ok = !processing_failed && video_encoder.close();
+    if (!encoder_closed_ok) replay_writer.abort();
+    const bool replay_closed_ok = !processing_failed && encoder_closed_ok && replay_writer.close();
     if (!config.output.replay_path.empty() && !replay_closed_ok) {
         std::cerr << "Error: Failed to finalize replay output: " << config.output.replay_path << "\n";
         replay_failed = true;
@@ -968,7 +1055,7 @@ int run_main(int argc, char* argv[]) {
     audio.close();
 
     if (has_output) {
-        if (encode_failed || !encoder_closed_ok || encoded_frame_count == 0) {
+        if (processing_failed || !encoder_closed_ok || encoded_frame_count == 0) {
             std::cerr << "[OUTPUT] failed: " << output_target << "\n";
             if (!encoder_closed_ok && !video_encoder.last_error().empty()) {
                 std::cerr << "[OUTPUT] close error: " << video_encoder.last_error() << "\n";

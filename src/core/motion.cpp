@@ -3,7 +3,7 @@
 #include <cmath>
 #include <complex>
 #include <limits>
-#include <unordered_map>
+#include <array>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
@@ -42,10 +42,11 @@ struct FFTPlan {
 };
 
 const FFTPlan& get_fft_plan(int n) {
-    static std::unordered_map<int, FFTPlan> cache;
-    auto it = cache.find(n);
-    if (it != cache.end()) {
-        return it->second;
+    // Four pyramid levels need at most two axis lengths each.
+    static thread_local std::array<FFTPlan, 8> cache;
+    static thread_local size_t next = 0;
+    for (const auto& plan : cache) {
+        if (plan.n == n) return plan;
     }
 
     FFTPlan plan;
@@ -78,8 +79,9 @@ const FFTPlan& get_fft_plan(int n) {
         plan.twiddles_inv.push_back(std::move(inv));
     }
 
-    auto [inserted_it, _] = cache.emplace(n, std::move(plan));
-    return inserted_it->second;
+    auto& slot = cache[next++ % cache.size()];
+    slot = std::move(plan);
+    return slot;
 }
 
 #if defined(__AVX2__)
@@ -197,6 +199,9 @@ void fft_1d(std::complex<float>* data, int n, bool inverse) {
 
 void fft_2d(std::complex<float>* data, int w, int h, bool inverse,
             std::vector<std::complex<float>>& column_scratch) {
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static) if(static_cast<size_t>(w) * h >= 4096)
+#endif
     for (int y = 0; y < h; ++y) {
         fft_1d(data + static_cast<size_t>(y) * w, w, inverse);
     }
@@ -223,6 +228,9 @@ void fft_2d(std::complex<float>* data, int w, int h, bool inverse,
         }
     }
 
+#ifdef HAS_OPENMP
+    #pragma omp parallel for schedule(static) if(static_cast<size_t>(w) * h >= 4096)
+#endif
     for (int x = 0; x < w; ++x) {
         fft_1d(transposed + static_cast<size_t>(x) * h, h, inverse);
     }
@@ -241,11 +249,15 @@ void fft_2d(std::complex<float>* data, int w, int h, bool inverse,
     }
 }
 
-const std::vector<float>& hann_window(int n) {
-    static std::unordered_map<int, std::vector<float>> cache;
-    auto it = cache.find(n);
-    if (it != cache.end()) {
-        return it->second;
+const std::vector<float>& hann_window(int n, bool vertical) {
+    static thread_local std::array<std::vector<float>, 8> cache;
+    static thread_local std::array<size_t, 2> next{};
+    const size_t axis = vertical ? 1 : 0;
+    const size_t first = axis * 4;
+    // Separate axis slots keep the horizontal reference valid while fetching vertical weights.
+    for (size_t i = first; i < first + 4; ++i) {
+        const auto& weights = cache[i];
+        if (weights.size() == static_cast<size_t>(n)) return weights;
     }
 
     std::vector<float> weights(std::max(1, n), 1.0f);
@@ -257,8 +269,9 @@ const std::vector<float>& hann_window(int n) {
         }
     }
 
-    auto [inserted_it, _] = cache.emplace(n, std::move(weights));
-    return inserted_it->second;
+    auto& slot = cache[first + next[axis]++ % 4];
+    slot = std::move(weights);
+    return slot;
 }
 
 struct PhaseCorrelationWorkspace {
@@ -298,8 +311,8 @@ void load_zero_mean_hann(const FloatImage& img, std::complex<float>* out, int ff
     }
     const float mean = static_cast<float>(sum / static_cast<double>(w * h));
 
-    const auto& wx = hann_window(w);
-    const auto& wy = hann_window(h);
+    const auto& wx = hann_window(w, false);
+    const auto& wy = hann_window(h, true);
     for (int y = 0; y < h; ++y) {
         const float* src_row = src + static_cast<size_t>(y) * w;
         std::complex<float>* dst_row = out + static_cast<size_t>(y) * fft_w;
@@ -333,6 +346,16 @@ FloatImage upsample_flow_field(const FloatImage& src, int dst_w, int dst_h, floa
     const float sx_scale = static_cast<float>(src.width()) / static_cast<float>(std::max(1, dst_w));
     const float sy_scale = static_cast<float>(src.height()) / static_cast<float>(std::max(1, dst_h));
 
+    struct HorizontalSample { int x0, x1; float weight; };
+    std::vector<HorizontalSample> horizontal(dst_w);
+    for (int x = 0; x < dst_w; ++x) {
+        float sx = (static_cast<float>(x) + 0.5f) * sx_scale - 0.5f;
+        int x0 = static_cast<int>(std::floor(sx));
+        horizontal[x] = {std::clamp(x0, 0, src.width() - 1),
+                         std::clamp(x0 + 1, 0, src.width() - 1),
+                         sx - static_cast<float>(x0)};
+    }
+
 #ifdef HAS_OPENMP
     #pragma omp parallel for schedule(static)
 #endif
@@ -345,12 +368,9 @@ FloatImage upsample_flow_field(const FloatImage& src, int dst_w, int dst_h, floa
         y1 = std::clamp(y1, 0, src.height() - 1);
 
         for (int x = 0; x < dst_w; ++x) {
-            float sx = (static_cast<float>(x) + 0.5f) * sx_scale - 0.5f;
-            int x0 = static_cast<int>(std::floor(sx));
-            int x1 = x0 + 1;
-            float tx = sx - static_cast<float>(x0);
-            x0 = std::clamp(x0, 0, src.width() - 1);
-            x1 = std::clamp(x1, 0, src.width() - 1);
+            const auto& sample = horizontal[x];
+            const int x0 = sample.x0, x1 = sample.x1;
+            const float tx = sample.weight;
 
             float v00 = src.get(x0, y0);
             float v10 = src.get(x1, y0);
@@ -480,8 +500,8 @@ void compute_sparse_block_matching_flow(const FloatImage& prev,
     #pragma omp parallel for schedule(static)
 #endif
     for (int y = margin; y < h - margin; y += step) {
-        const int y0 = std::max(0, y - step / 2);
-        const int y1 = std::min(h, y + (step + 1) / 2);
+        const int y0 = y == margin ? 0 : y - step / 2;
+        const int y1 = y + step >= h - margin ? h : y + (step + 1) / 2;
         for (int x = margin; x < w - margin; x += step) {
             float best_cost = std::numeric_limits<float>::infinity();
             int best_dx = 0;
@@ -510,8 +530,8 @@ void compute_sparse_block_matching_flow(const FloatImage& prev,
 
             const float best_fx = std::clamp(static_cast<float>(best_dx), -motion_cap, motion_cap);
             const float best_fy = std::clamp(static_cast<float>(best_dy), -motion_cap, motion_cap);
-            const int x0 = std::max(0, x - step / 2);
-            const int x1 = std::min(w, x + (step + 1) / 2);
+            const int x0 = x == margin ? 0 : x - step / 2;
+            const int x1 = x + step >= w - margin ? w : x + (step + 1) / 2;
             for (int yy = y0; yy < y1; ++yy) {
                 float* row_fx = fx + static_cast<size_t>(yy) * w;
                 float* row_fy = fy + static_cast<size_t>(yy) * w;
@@ -523,37 +543,6 @@ void compute_sparse_block_matching_flow(const FloatImage& prev,
         }
     }
 
-    const int min_x = margin;
-    const int max_x = std::max(min_x, w - margin - 1);
-    const int min_y = margin;
-    const int max_y = std::max(min_y, h - margin - 1);
-    for (int y = 0; y < h; ++y) {
-        if (y >= min_y && y <= max_y) {
-            continue;
-        }
-        const int cy = std::clamp(y, min_y, max_y);
-        float* row_fx = fx + static_cast<size_t>(y) * w;
-        float* row_fy = fy + static_cast<size_t>(y) * w;
-        const float* src_fx = fx + static_cast<size_t>(cy) * w;
-        const float* src_fy = fy + static_cast<size_t>(cy) * w;
-        for (int x = 0; x < w; ++x) {
-            int cx = std::clamp(x, min_x, max_x);
-            row_fx[x] = src_fx[cx];
-            row_fy[x] = src_fy[cx];
-        }
-    }
-    for (int y = min_y; y <= max_y; ++y) {
-        float* row_fx = fx + static_cast<size_t>(y) * w;
-        float* row_fy = fy + static_cast<size_t>(y) * w;
-        for (int x = 0; x < min_x; ++x) {
-            row_fx[x] = row_fx[min_x];
-            row_fy[x] = row_fy[min_x];
-        }
-        for (int x = max_x + 1; x < w; ++x) {
-            row_fx[x] = row_fx[max_x];
-            row_fy[x] = row_fy[max_x];
-        }
-    }
 }
 
 MotionVector estimate_phase_correlation_shift(
@@ -590,7 +579,7 @@ MotionVector estimate_phase_correlation_shift(
     fft_2d(ws.curr_fft.data(), fft_w, fft_h, false, ws.scratch);
 
     for (size_t i = 0; i < ws.cross_power.size(); ++i) {
-        std::complex<float> cross = ws.prev_fft[i] * std::conj(ws.curr_fft[i]);
+        std::complex<float> cross = ws.curr_fft[i] * std::conj(ws.prev_fft[i]);
         float mag = std::abs(cross);
         if (mag > 1e-12f) {
             ws.cross_power[i] = cross / mag;
@@ -703,7 +692,17 @@ MotionVector estimate_phase_correlation_hierarchical(const FloatImage* prev_leve
 
 }  // namespace
 
-MotionEstimator::MotionEstimator(const Config& config) : config_(config) {}
+MotionEstimator::MotionEstimator(const Config& config) {
+    set_config(config);
+}
+
+void MotionEstimator::set_config(const Config& config) {
+    if (!std::isfinite(config.motion_cap) || config.motion_cap < 0.0f) {
+        throw std::invalid_argument("Motion limit must be finite and non-negative");
+    }
+    config_ = config;
+    reset();
+}
 
 void MotionEstimator::reset() {
     flow_.clear();
@@ -760,135 +759,14 @@ void MotionEstimator::build_pyramid(const FloatImage& img, FloatImage* pyramid, 
     }
 }
 
-void MotionEstimator::compute_farneback_level(const FloatImage& prev, const FloatImage& curr,
-                                               FloatImage& flow_x, FloatImage& flow_y) {
-    int w = prev.width();
-    int h = prev.height();
-    
-    flow_x = FloatImage(w, h, 0.0f);
-    flow_y = FloatImage(w, h, 0.0f);
-    
-    int half_win = config_.window_size / 2;
-    int poly_n = config_.poly_n;
-    float poly_sigma = config_.poly_sigma;
-    
-    std::vector<float> poly_prev(w * h * 6, 0.0f);
-    std::vector<float> poly_curr(w * h * 6, 0.0f);
-    
-    auto compute_poly_expansion = [&](const FloatImage& img, std::vector<float>& poly) {
-        int radius = poly_n / 2;
-        
-        for (int y = radius; y < h - radius; ++y) {
-            for (int x = radius; x < w - radius; ++x) {
-                float sum_xx = 0, sum_xy = 0, sum_yy = 0;
-                float sum_x = 0, sum_y = 0, sum_v = 0;
-                float sum_w = 0;
-                
-                for (int dy = -radius; dy <= radius; ++dy) {
-                    for (int dx = -radius; dx <= radius; ++dx) {
-                        float fdx = static_cast<float>(dx);
-                        float fdy = static_cast<float>(dy);
-                        float dist = fdx * fdx + fdy * fdy;
-                        float weight = std::exp(-dist / (2.0f * poly_sigma * poly_sigma));
-                        float v = img.get(x + dx, y + dy);
-                        
-                        sum_xx += weight * fdx * fdx;
-                        sum_xy += weight * fdx * fdy;
-                        sum_yy += weight * fdy * fdy;
-                        sum_x += weight * fdx * v;
-                        sum_y += weight * fdy * v;
-                        sum_v += weight * v;
-                        sum_w += weight;
-                    }
-                }
-                
-                float det = sum_xx * sum_yy - sum_xy * sum_xy;
-                if (std::abs(det) > 1e-6f) {
-                    int idx = (y * w + x) * 6;
-                    poly[idx + 0] = sum_v / sum_w;
-                    poly[idx + 1] = (sum_yy * sum_x - sum_xy * sum_y) / det;
-                    poly[idx + 2] = (sum_xx * sum_y - sum_xy * sum_x) / det;
-                    poly[idx + 3] = sum_xx / sum_w;
-                    poly[idx + 4] = sum_xy / sum_w;
-                    poly[idx + 5] = sum_yy / sum_w;
-                }
-            }
-        }
-    };
-    
-    compute_poly_expansion(prev, poly_prev);
-    compute_poly_expansion(curr, poly_curr);
-    
-    for (int y = half_win; y < h - half_win; ++y) {
-        for (int x = half_win; x < w - half_win; ++x) {
-            float sum_a00 = 0, sum_a01 = 0, sum_a11 = 0;
-            float sum_b0 = 0, sum_b1 = 0;
-            float sum_w = 0;
-            
-            for (int dy = -half_win; dy <= half_win; ++dy) {
-                for (int dx = -half_win; dx <= half_win; ++dx) {
-                    int nx = x + dx;
-                    int ny = y + dy;
-                    
-                    if (nx < poly_n/2 || nx >= w - poly_n/2 || 
-                        ny < poly_n/2 || ny >= h - poly_n/2) continue;
-                    
-                    int idx = (ny * w + nx) * 6;
-                    
-                    float r0 = poly_prev[idx + 0];
-                    float r1 = poly_prev[idx + 1];
-                    float r2 = poly_prev[idx + 2];
-                    float r3 = poly_prev[idx + 3];
-                    float r4 = poly_prev[idx + 4];
-                    float r5 = poly_prev[idx + 5];
-                    
-                    float s0 = poly_curr[idx + 0];
-                    float s1 = poly_curr[idx + 1];
-                    float s2 = poly_curr[idx + 2];
-                    
-                    float a00 = r1 * r1 + r2 * r2 + r3 * r3 + r4 * r4 + r5 * r5;
-                    float a01 = r1 * s1 + r2 * s2;
-                    float a11 = s1 * s1 + s2 * s2;
-                    float b0 = r1 * (s0 - r0);
-                    float b1 = s1 * (s0 - r0);
-                    
-                    float gw = 1.0f;
-                    sum_a00 += gw * a00;
-                    sum_a01 += gw * a01;
-                    sum_a11 += gw * a11;
-                    sum_b0 += gw * b0;
-                    sum_b1 += gw * b1;
-                    sum_w += gw;
-                }
-            }
-            
-            if (sum_w > 0) {
-                sum_a00 /= sum_w;
-                sum_a01 /= sum_w;
-                sum_a11 /= sum_w;
-                sum_b0 /= sum_w;
-                sum_b1 /= sum_w;
-            }
-            
-            float det = sum_a00 * sum_a11 - sum_a01 * sum_a01;
-            if (std::abs(det) > 1e-6f) {
-                float fx = (sum_a11 * sum_b0 - sum_a01 * sum_b1) / det;
-                float fy = (sum_a00 * sum_b1 - sum_a01 * sum_b0) / det;
-                
-                fx = std::clamp(fx, -config_.motion_cap, config_.motion_cap);
-                fy = std::clamp(fy, -config_.motion_cap, config_.motion_cap);
-                
-                flow_x.set(x, y, fx);
-                flow_y.set(x, y, fy);
-            }
-        }
-    }
-}
-
 void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& curr) {
-    if (prev.width() != curr.width() || prev.height() != curr.height()) {
+    if (prev.empty() || curr.empty() ||
+        prev.width() != curr.width() || prev.height() != curr.height()) {
         reset();
         return;
+    }
+    if (width_ != prev.width() || height_ != prev.height()) {
+        reset();
     }
     
     width_ = prev.width();
@@ -922,21 +800,13 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
     reused_frames_ = 0;
 
     int solve_div = std::clamp(config_.solve_divisor, 1, 8);
-    FloatImage prev_work = prev;
-    FloatImage curr_work = curr;
-    float flow_scale_to_full = 1.0f;
-    if (solve_div > 1) {
-        const int dst_w = std::max(1, width_ / solve_div);
-        const int dst_h = std::max(1, height_ / solve_div);
-        if (dst_w >= 16 && dst_h >= 16) {
-            prev_work = downsample_area_average(prev, dst_w, dst_h);
-            curr_work = downsample_area_average(curr, dst_w, dst_h);
-            flow_scale_to_full = 0.5f * (
-                static_cast<float>(width_) / static_cast<float>(prev_work.width()) +
-                static_cast<float>(height_) / static_cast<float>(prev_work.height())
-            );
-        }
-    }
+    const int dst_w = std::max(1, width_ / solve_div);
+    const int dst_h = std::max(1, height_ / solve_div);
+    const bool downsample = solve_div > 1 && dst_w >= 16 && dst_h >= 16;
+    FloatImage prev_work = downsample ? downsample_area_average(prev, dst_w, dst_h) : prev;
+    FloatImage curr_work = downsample ? downsample_area_average(curr, dst_w, dst_h) : curr;
+    float flow_scale_x = downsample ? static_cast<float>(width_) / prev_work.width() : 1.0f;
+    float flow_scale_y = downsample ? static_cast<float>(height_) / prev_work.height() : 1.0f;
 
     int requested_levels = std::clamp(config_.pyramid_levels, 1, 4);
     build_pyramid(prev_work, prev_pyramid_, requested_levels);
@@ -951,89 +821,15 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
     }
     
     FloatImage flow_x, flow_y;
-    if (config_.use_sparse_block_matching) {
-        const float work_scale = std::max(1e-6f, flow_scale_to_full);
-        const float work_motion_cap = std::max(1.0f, config_.motion_cap / work_scale);
-        int search_radius = static_cast<int>(std::ceil(work_motion_cap));
-        int max_search = std::max(1, std::min(prev_work.width(), prev_work.height()) / 6);
-        search_radius = std::clamp(search_radius, 1, max_search);
-        const int block_radius = std::clamp(config_.block_match_radius, 1, 8);
-        const int step = std::clamp(config_.block_match_step, 1, 16);
-        compute_sparse_block_matching_flow(
-            prev_work, curr_work,
-            search_radius,
-            block_radius,
-            step,
-            work_motion_cap,
-            flow_x,
-            flow_y
-        );
-    } else {
-        // Coarse-to-fine estimation: significantly cheaper than repeated full-resolution solves.
-        for (int l = levels_available - 1; l >= 0; --l) {
-            const FloatImage& p = prev_pyramid_[l];
-            const FloatImage& c = curr_pyramid_[l];
-            if (p.empty() || c.empty()) {
-                continue;
-            }
-
-            FloatImage level_fx, level_fy;
-            compute_farneback_level(p, c, level_fx, level_fy);
-
-            if (flow_x.empty()) {
-                flow_x = std::move(level_fx);
-                flow_y = std::move(level_fy);
-                continue;
-            }
-
-            float scale_x = static_cast<float>(p.width()) / static_cast<float>(std::max(1, flow_x.width()));
-            float scale_y = static_cast<float>(p.height()) / static_cast<float>(std::max(1, flow_y.height()));
-            float scale = 0.5f * (scale_x + scale_y);
-            FloatImage up_x = upsample_flow_field(flow_x, p.width(), p.height(), scale);
-            FloatImage up_y = upsample_flow_field(flow_y, p.width(), p.height(), scale);
-            const float refine_weight = (l == 0) ? 0.65f : 0.50f;
-            const float keep_weight = 1.0f - refine_weight;
-            const int n = p.width() * p.height();
-            float* up_x_data = up_x.data();
-            float* up_y_data = up_y.data();
-            const float* level_x_data = level_fx.data();
-            const float* level_y_data = level_fy.data();
-            for (int i = 0; i < n; ++i) {
-                up_x_data[i] = keep_weight * up_x_data[i] + refine_weight * level_x_data[i];
-                up_y_data[i] = keep_weight * up_y_data[i] + refine_weight * level_y_data[i];
-            }
-
-            flow_x = std::move(up_x);
-            flow_y = std::move(up_y);
-        }
-
-        if (flow_x.empty() || flow_y.empty()) {
-            flow_x = FloatImage(prev_work.width(), prev_work.height(), 0.0f);
-            flow_y = FloatImage(prev_work.width(), prev_work.height(), 0.0f);
-        }
-
-        int extra_iters = std::max(0, config_.iterations - levels_available);
-        for (int iter = 0; iter < extra_iters; ++iter) {
-            FloatImage fx, fy;
-            compute_farneback_level(prev_work, curr_work, fx, fy);
-            const float blend = 0.35f;
-            const float keep = 1.0f - blend;
-            const int n = prev_work.width() * prev_work.height();
-            float* flow_x_data = flow_x.data();
-            float* flow_y_data = flow_y.data();
-            const float* fx_data = fx.data();
-            const float* fy_data = fy.data();
-            for (int i = 0; i < n; ++i) {
-                flow_x_data[i] = keep * flow_x_data[i] + blend * fx_data[i];
-                flow_y_data[i] = keep * flow_y_data[i] + blend * fy_data[i];
-            }
-        }
-    }
-
-    if (flow_x.empty() || flow_y.empty()) {
-        flow_x = FloatImage(prev_work.width(), prev_work.height(), 0.0f);
-        flow_y = FloatImage(prev_work.width(), prev_work.height(), 0.0f);
-    }
+    const float work_scale = std::min(flow_scale_x, flow_scale_y);
+    const float work_motion_cap = std::max(1.0f, config_.motion_cap / work_scale);
+    const int max_search = std::max(1, std::min(prev_work.width(), prev_work.height()) / 6);
+    const int search_radius = static_cast<int>(std::min(std::ceil(work_motion_cap), static_cast<float>(max_search)));
+    const int block_radius = std::clamp(config_.block_match_radius, 1, 8);
+    const int step = std::clamp(config_.block_match_step, 1, 16);
+    compute_sparse_block_matching_flow(
+        prev_work, curr_work, search_radius, block_radius, step,
+        work_motion_cap, flow_x, flow_y);
 
     MotionVector phase_mv{};
     if (config_.use_phase_correlation) {
@@ -1055,10 +851,11 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
     }
 
     if (flow_x.width() != width_ || flow_x.height() != height_) {
-        const float scale = std::max(1e-6f, flow_scale_to_full);
-        flow_x = upsample_flow_field(flow_x, width_, height_, scale);
-        flow_y = upsample_flow_field(flow_y, width_, height_, scale);
+        flow_x = upsample_flow_field(flow_x, width_, height_, flow_scale_x);
+        flow_y = upsample_flow_field(flow_y, width_, height_, flow_scale_y);
     }
+    phase_mv.dx *= flow_scale_x;
+    phase_mv.dy *= flow_scale_y;
     
 #ifdef HAS_OPENMP
     #pragma omp parallel for schedule(static)
@@ -1102,7 +899,12 @@ void MotionEstimator::compute_flow(const FloatImage& prev, const FloatImage& cur
                 const int ny = y + offset[1];
                 if (nx < 0 || nx >= width_ || ny < 0 || ny >= height_) continue;
                 const auto& neighbor = flow_[ny * width_ + nx];
-                consistency_error += std::hypot(mv.dx - neighbor.dx, mv.dy - neighbor.dy);
+                const float delta_x = mv.dx - neighbor.dx;
+                const float delta_y = mv.dy - neighbor.dy;
+                // Axis-aligned differences have exact length without a hypot call.
+                consistency_error += delta_x == 0.0f ? std::abs(delta_y)
+                    : delta_y == 0.0f ? std::abs(delta_x)
+                    : std::hypot(delta_x, delta_y);
                 ++neighbors;
             }
             const float consistency = neighbors > 0
@@ -1130,7 +932,7 @@ const MotionVector& MotionEstimator::get_motion(int x, int y) const {
 }
 
 MotionVector MotionEstimator::get_motion_interpolated(float x, float y) const {
-    if (flow_.empty() || width_ == 0 || height_ == 0) {
+    if (flow_.empty() || width_ == 0 || height_ == 0 || !std::isfinite(x) || !std::isfinite(y)) {
         return MotionVector{};
     }
     
@@ -1161,7 +963,7 @@ MotionVector MotionEstimator::get_motion_interpolated(float x, float y) const {
 
 void MotionEstimator::average_flow_for_cell(int x0, int y0, int w, int h,
                                              float& dx, float& dy) const {
-    if (flow_.empty()) {
+    if (flow_.empty() || w <= 0 || h <= 0) {
         dx = 0.0f;
         dy = 0.0f;
         return;
@@ -1171,8 +973,10 @@ void MotionEstimator::average_flow_for_cell(int x0, int y0, int w, int h,
     float sum_confidence = 0.0f;
     int count = 0;
     
-    int x1 = std::min(x0 + w, width_);
-    int y1 = std::min(y0 + h, height_);
+    const int x1 = static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(x0) + w, 0, width_));
+    const int y1 = static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(y0) + h, 0, height_));
+    x0 = std::clamp(x0, 0, width_);
+    y0 = std::clamp(y0, 0, height_);
     
     for (int y = y0; y < y1; ++y) {
         for (int x = x0; x < x1; ++x) {

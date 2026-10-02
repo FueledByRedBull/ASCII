@@ -54,7 +54,6 @@ private:
     
     static OKLab palette16_oklab_[16];
     static OKLab palette256_oklab_[256];
-    static bool palettes_initialized_;
     
     static void init_palettes();
     

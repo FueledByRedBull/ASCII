@@ -21,9 +21,7 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
     output.cells.resize(static_cast<size_t>(result.grid_cols) * result.grid_rows);
     context.smoother.begin_frame();
 
-    const bool allow_mixed_block = context.config.grid.quad_tree_adaptive &&
-                                   context.color_mode != ColorMode::BlockArt;
-    if (context.color_mode == ColorMode::BlockArt || allow_mixed_block) {
+    if (context.color_mode == ColorMode::BlockArt) {
         output.block_cells.resize(output.cells.size());
     }
 
@@ -48,9 +46,11 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
 
         if (context.bilateral_grid.valid()) {
             auto smooth_rgb = context.bilateral_grid.sample(cell_x, cell_y, smoothed_lum);
-            effective_stats.mean_r = smooth_rgb.r;
-            effective_stats.mean_g = smooth_rgb.g;
-            effective_stats.mean_b = smooth_rgb.b;
+            if (smooth_rgb.has_support) {
+                effective_stats.mean_r = smooth_rgb.r;
+                effective_stats.mean_g = smooth_rgb.g;
+                effective_stats.mean_b = smooth_rgb.b;
+            }
         }
 
         const float adaptive_edge_margin = 0.02f * static_cast<float>(effective_stats.adaptive_level);
@@ -83,9 +83,7 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
             context.smoother.set_motion_offset(i, 0.0f, 0.0f);
         }
 
-        const bool use_block_cell = (context.color_mode == ColorMode::BlockArt) ||
-                                    (allow_mixed_block && effective_stats.adaptive_level >= 2);
-        if (use_block_cell) {
+        if (context.color_mode == ColorMode::BlockArt) {
             BlockRenderer::CellData block_data = context.block_renderer.analyze_cell(
                 result.luminance,
                 result.color_buffer,
@@ -95,58 +93,21 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
                 context.config.grid.cell_height,
                 effective_stats);
 
-            auto block_result = context.block_renderer.render_cell(block_data);
-            const float block_score = std::clamp(
-                1.0f - std::abs(block_data.top_left_lum - block_data.bottom_right_lum), 0.0f, 1.0f);
-            uint32_t final_cp = block_result.codepoint;
-            const uint32_t previous = context.smoother.reference_glyph(i);
-            if (previous == 0 || previous == block_result.codepoint ||
-                context.smoother.should_change_glyph(i, block_result.codepoint, block_score)) {
-                final_cp = block_result.codepoint;
-                context.smoother.update_glyph(i, block_result.codepoint, block_score);
-            } else {
-                final_cp = previous;
-                context.smoother.update_glyph(i, previous, block_score);
-            }
-            block_result.codepoint = final_cp;
+            const auto block_result = context.block_renderer.render_cell(block_data);
             output.block_cells[i] = block_result;
-            output.cells[i].codepoint = final_cp;
-
-            if (context.color_mode == ColorMode::BlockArt) {
-                output.cells[i].fg_r = block_result.fg_r;
-                output.cells[i].fg_g = block_result.fg_g;
-                output.cells[i].fg_b = block_result.fg_b;
-                output.cells[i].bg_r = block_result.bg_r;
-                output.cells[i].bg_g = block_result.bg_g;
-                output.cells[i].bg_b = block_result.bg_b;
-            } else {
-                const int row_dir = 1;
-                auto mapped = context.color_mapper.map_with_dither(
-                    cell_x,
-                    cell_y,
-                    row_dir,
-                    block_result.fg_r / 255.0f,
-                    block_result.fg_g / 255.0f,
-                    block_result.fg_b / 255.0f,
-                    effective_stats.is_edge_cell);
-                output.cells[i].fg_r = mapped.r;
-                output.cells[i].fg_g = mapped.g;
-                output.cells[i].fg_b = mapped.b;
-                output.cells[i].bg_r = 0;
-                output.cells[i].bg_g = 0;
-                output.cells[i].bg_b = 0;
-            }
+            output.cells[i].codepoint = block_result.codepoint;
+            output.cells[i].fg_r = block_result.fg_r;
+            output.cells[i].fg_g = block_result.fg_g;
+            output.cells[i].fg_b = block_result.fg_b;
+            output.cells[i].bg_r = block_result.bg_r;
+            output.cells[i].bg_g = block_result.bg_g;
+            output.cells[i].bg_b = block_result.bg_b;
             continue;
         }
 
         auto selection = context.selector.select(effective_stats, context.smoother, i);
-        if (context.config.edge.contours_enabled && effective_stats.has_contour &&
-            effective_stats.contour_codepoint != 0) {
-            selection.codepoint = effective_stats.contour_codepoint;
-            selection.score = std::clamp(0.85f + effective_stats.contour_strength, 0.0f, 1.0f);
-            selection.loss = std::max(0.0f, 0.15f - effective_stats.contour_strength);
-        }
-
+        const bool contour_override = context.config.edge.contours_enabled && effective_stats.has_contour &&
+                                      effective_stats.contour_codepoint != 0;
         if (context.selector.config().use_unified_loss) {
             const uint32_t previous = context.smoother.reference_glyph(i);
             const float transition_cost = context.selector.compute_transition_cost(
@@ -180,6 +141,9 @@ FrameComposer::Output FrameComposer::compose(const Pipeline::Result& result, Con
                     i, previous, 1.0f - std::min(keep_loss, 1.0f), keep_loss);
             }
         }
+
+        // Overlay contours without retaining them as normal glyph history.
+        if (contour_override) output.cells[i].codepoint = effective_stats.contour_codepoint;
 
         uint8_t sr = 0;
         uint8_t sg = 0;

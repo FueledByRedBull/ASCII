@@ -25,6 +25,8 @@ class Terminal {
 public:
     Terminal();
     ~Terminal();
+    Terminal(const Terminal&) = delete;
+    Terminal& operator=(const Terminal&) = delete;
     
     TerminalInfo get_info() const;
     Size get_size() const;
@@ -53,6 +55,14 @@ private:
     TerminalInfo info_;
     bool in_alt_screen_ = false;
     bool cursor_hidden_ = false;
+    bool output_written_ = false;
+#ifdef _WIN32
+    void* native_output_handle_ = nullptr;
+    uint32_t original_output_mode_ = 0;
+    unsigned int original_output_codepage_ = 0;
+    bool output_mode_changed_ = false;
+    bool output_codepage_changed_ = false;
+#endif
 };
 
 }

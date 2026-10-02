@@ -147,6 +147,8 @@ endif()
 if(MSVC)
     target_compile_options(ascii-engine-core PRIVATE /W4)
     target_compile_definitions(ascii-engine-core PUBLIC _CRT_SECURE_NO_WARNINGS)
+    # Keep narrow filesystem/CRT paths in the UTF-8 encoding used by FFmpeg.
+    target_sources(ascii-engine-core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src/windows.manifest)
 else()
     target_compile_options(ascii-engine-core PRIVATE -Wall -Wextra)
 endif()

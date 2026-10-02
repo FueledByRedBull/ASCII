@@ -28,10 +28,13 @@ public:
     virtual Size frame_size() const = 0;
     virtual bool is_open() const = 0;
     virtual void reset() = 0;
+    // Set before open; callers may lower the default 100-megapixel decode limit.
+    void set_pixel_limit(uint64_t pixels) { pixel_limit_ = std::min<uint64_t>(pixels, 100000000ull); }
 
 protected:
+    uint64_t pixel_limit_ = 100000000ull;
 #ifdef ASCII_USE_OPENCV
-    void convert_mat_to_framebuffer(const cv::Mat& mat, FrameBuffer& out);
+    bool convert_mat_to_framebuffer(const cv::Mat& mat, FrameBuffer& out);
 #endif
 };
 
@@ -115,6 +118,7 @@ public:
     Size frame_size() const override;
     bool is_open() const override;
     void reset() override;
+    const std::vector<std::string>& input_files() const { return files_; }
     
 private:
     std::vector<std::string> files_;
@@ -136,6 +140,8 @@ public:
     void reset() override;
     
 private:
+    void restore_stdin_mode();
+    int original_stdin_mode_ = -1;
     bool opened_ = false;
     int width_ = 0;
     int height_ = 0;

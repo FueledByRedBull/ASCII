@@ -19,6 +19,128 @@ OpenCV, AVX2, webcam, audio polish, GPU compute paths, and richer packaging are 
 
 ## Current Status
 
+### Completed correctness, algorithm and performance goal (2026-10-02)
+
+Ponytail full mode was used throughout. The goal was reordered into correctness
+and algorithm repair first, followed by measured optimization and final verification.
+Both phases are complete for the Windows/MSVC no-OpenCV, non-AVX2 baseline.
+This is evidence for the tested contracts and inputs, not a claim that all possible
+bugs or platform differences have been eliminated.
+
+- [x] Read all project-owned source, tests, documentation, scripts and TODOs,
+      plus all three vendored headers; retain the 80-file initial inventory.
+- [x] Freeze the initial source, reproduce confirmed defects, repair their root
+      causes, and add focused regression coverage.
+- [x] Review algorithm choices and integration independently; retain useful
+      features and reject optimizations without measured benefit.
+- [x] Run the full Release and AddressSanitizer suites after the final code change.
+- [x] Meet 24 FPS full-quality and 30 FPS fast-mode processing targets at 120x40
+      on the measured host, using repeated changing/static/cut/real-video workloads.
+- [x] Verify startup below 2 seconds, reference peak working set below 512 MiB,
+      240x80 scaling, strict-memory rejection, and deterministic replay/text bytes.
+- [x] Decode supported exports, verify malformed/truncated input and preservation
+      failures, and exercise Unicode filenames across Windows input/output paths.
+
+**Validation provenance:** the audited working tree was prepared on `main`,
+with pre-existing user changes preserved in the frozen starting baseline.
+Existing SDL2 2.32.10, FFmpeg 8.1.1 and zstd 1.5.7 dependencies were restored
+with user authorization. No dependency was added or upgraded.
+
+The unchanged starting source passed all 34 original tests, despite focused
+reproductions finding 13 configuration/CLI failures, nine analysis failures and
+21 mapping failures. Later reproductions exposed output replacement on failure,
+Windows pipe/path errors and FFmpeg buffer-contract violations. The original
+source, failures and subsequent proofs remain under `output/goal-audit/`;
+passing final checks do not erase those historical failures.
+
+**Main repairs and algorithm decisions**
+
+- Configuration rejects malformed/nonfinite/out-of-range values, applies explicit
+  flags consistently, and hashes rendering semantics into replay fingerprints.
+  Debug views now reach every output path and honor the chosen color palette.
+- Linear-light resampling, fit/fill geometry, color means, bitmap alpha blending,
+  adaptive thresholds, gradient orientation and cache invalidation have independent
+  references. Glyph descriptors use the same configured gradient processing as
+  the source. Frequency matching remains because removing it reduced exact matches.
+- Motion uses consistent forward displacement and per-axis full-resolution units,
+  complete border coverage, bounded thread-local FFT caches and deterministic
+  confidence. The invalid unused alternate dense solver was removed; supported
+  sparse block matching and hierarchical phase correlation remain.
+- Block art fits all 16 quadrant masks, caches every emitted primitive, and avoids
+  freezing glyphs with mismatched colors. The ineffective optional spectral palette
+  implementation was replaced with deterministic bounded OKLab clustering.
+- Decoder/encoder conversion uses FFmpeg-owned aligned, padded frames. Guarded
+  reproductions found old decoder tail writes; a focused ASan boundary harness
+  independently caught the encoder's undersized plane arrays and missing padding.
+  Source timing, format changes, clean EOF, binary stdin and geometry limits are tested.
+- Replay validates memory/index bounds and cleans up failed or closed state.
+  Writers preserve existing destinations when failure precedes finalization.
+  Directory, direct, numbered and sequence input/output collisions are rejected.
+  MSVC executables use a process-local UTF-8 manifest for Unicode paths; the new
+  regression covers media, text, replay, config, font and wildcard-sequence paths.
+- Empty geometry terminates promptly; font, palette, temporal and renderer state
+  resets correctly; terminal output sanitizes invalid/control codepoints and restores
+  changed console state. Audio ownership, synchronization and bounds are tested
+  with SDL's dummy driver; actual speaker playback remains outside this gate.
+- Equivalent optimizations remove full-image prefix passes and discarded copies,
+  fuse edge classification, retain only needed DCT work, vectorize independent
+  Gabor/Laplacian work and avoid redundant glyph scoring/temporary zero fills.
+  Slower SIMD NMS and row-scheduling candidates were rejected, as was a rounding
+  helper whose small measured gain did not justify added code.
+
+**Final verification**
+
+| Check | Result |
+|---|---|
+| MSVC Release configure/build/CTest | 58/58 pass; CTest 6.54 seconds |
+| MSVC AddressSanitizer configure/build/CTest | 58/58 pass; CTest 16.21 seconds; no sanitizer reports |
+| Full changing 1080p, 120x40, 12 threads | 27.40 processing / 26.60 external-wall FPS median; 113.51 MiB peak |
+| Fast changing 1080p, 120x40, 4 threads | 56.34 processing / 53.44 external-wall FPS median; 93.95 MiB peak |
+| Supplied real-video segment, full / fast | 37.11 / 66.52 processing FPS medians |
+| One-image startup/render/exit, three processes | 0.1004-0.1075 seconds; maximum 55.86 MiB |
+| 240x80 changing-video stress, one run per mode | Full 7.90 FPS / 265.57 MiB; fast 16.23 FPS / 189.96 MiB |
+| Replay/text determinism | Exact bytes across 1/8/12 threads for both 120-frame video fixtures; repeated benchmark text also identical |
+| Export matrix | All 18 supported image/video combinations decoded with expected geometry/frame count and clean EOF |
+| Input and admission failures | Truncated RGB/RGBA pipes and over-budget strict-memory requests rejected; existing outputs preserved |
+
+Measurements use a Ryzen 7 7800X3D, Windows 11, MSVC 19.44, Release/OpenMP,
+truecolor, no audio, no OpenCV and no AVX2. Normal benchmark values are medians
+of three independent 120-frame text-export processes; maximum measured memory
+is reported, not averaged. Full mode uses 12 OpenMP threads and fast mode uses
+4. The 8-thread intermediate checkpoint reached only 21.85 FPS full quality;
+thread-count tuning is part of the measured configuration, not a default-setting
+claim. The initial corrected diagnostic was 10.50 FPS. Static/cut/real-video
+results and exact commands are in [the validation snapshot](tests/baseline/README.md).
+The larger grid is a scaling observation, not a 24 FPS acceptance target.
+
+Meaningful quality/reference coverage includes 210 exact glyph references,
+12 directional grid fixtures, 8,064 bitwise DCT/Gabor cases, 42,192 moment-reference
+cells, and independent edge/motion equivalence corpora. Bitmap blending agrees
+with an independent sRGB reference within one byte; its tested RGB patch RMSE
+improved from 0.4443 to 0.3764. Ordinary ASCII remains limited by glyph coverage;
+block art is the foreground/background reconstruction mode. These finite corpora
+support the chosen algorithms without claiming universal visual optimality.
+
+Evidence: `output/goal-audit/final-58-*`, `asan-final58/`, `final-benchmarks/`,
+`final-scaling/`, `final-runtime/`, `final-formats/` and `final-raw-pipe/`.
+The final CLI SHA-256 is
+`A9F6E5F18FC9A3C86C004AB73B55E947E5DBA0C43EB1B8D6155B1D2887E5197C`.
+Source hashes stayed unchanged during each build/test gate, and executable/input
+hashes stayed unchanged during the final runtime checks. All 46 ASan compile
+commands carry `/fsanitize=address /Zi /O2`; prebuilt dependency DLLs are not
+instrumented, and ASan does not establish race freedom. Full original sample
+media decoding reached clean EOF at 1,874 MP4 frames and 52 GIF frames.
+
+OpenCV, AVX2, other-host performance, fresh hosted CI and packaging remain
+unverified by this goal. PNG output remains deliberately excluded. The installed
+FFmpeg lacks a usable WebM encoder; the CLI fails explicitly without leaving a
+partial destination. Strict-memory is a conservative admission estimate, not an
+OS quota. Startup measurements use independent processes, not forced cold caches.
+No source/build work remains for the defined baseline goal; optional future work
+is listed below. Historical July evidence is retained separately.
+
+### Historical v1 checkpoint (2026-07-16)
+
 Complete and verified for the v1 no-OpenCV, non-AVX2 baseline as of 2026-07-16:
 
 - A clean Release configure/build in `cmake-build-final-proof` passed all 34 no-OpenCV, no-AVX2 CTest cases.
@@ -31,7 +153,7 @@ Complete and verified for the v1 no-OpenCV, non-AVX2 baseline as of 2026-07-16:
 
 The v1 release evidence gates are satisfied. OpenCV and AVX2 remain optional follow-up baselines.
 
-The reference workload is measured rather than assumed. On a Ryzen 7 7800X3D, full-quality processing reaches 10.86 FPS, while `--fast --no-contours` reaches 25.70 processing FPS. Both stay well below 512 MiB and startup is below 2 seconds. The full-quality path therefore retains a documented performance gap; the explicit speed path meets the throughput target.
+At the July checkpoint, full-quality processing reached 10.86 FPS on a Ryzen 7 7800X3D, while `--fast --no-contours` reached 25.70 FPS. Both stayed below 512 MiB and startup was below 2 seconds. Full quality missed that snapshot's throughput target; the October results above supersede this performance limitation.
 
 ## v1 Completion Audit (2026-07-16)
 
@@ -234,6 +356,15 @@ Use `--profile` or `profile = "..."` in config.
 
 Profile values are applied before explicit CLI overrides.
 
+### Character Sets
+
+- `traditional`: compact plain-ASCII luminance ramp (` .:-=+*#%@`) for the classic, less noisy look.
+- `basic`: extended plain-ASCII vocabulary for finer tonal and structural matching.
+- `line-art`: ASCII plus Unicode box-drawing glyphs for graphic sources.
+- `blocks`: Unicode shade and block glyphs.
+
+Renderer-only block primitives remain cached for block-art output but are excluded from normal glyph selection unless the selected set contains them. Contour overrides use `-`, `|`, `/`, `\\`, and `+`.
+
 ## Algorithm Contract
 
 The core renderer is classical image processing, not ML.
@@ -288,23 +419,45 @@ Runtime summaries are emitted on exit:
 - `[PERF_STAGES]`
 - `[PERF_STAGES_PCT]`
 
-Reference baseline:
+Measured baseline (2026-10-02):
 
-- CPU: Intel Core i5-1240P / Ryzen 5 5600U class or better.
-- RAM: 16 GB.
-- Build: Release, no-OpenCV, OpenMP when available, no AVX2 requirement.
-- Workload: local 1080p video input, `120x40`, truecolor, audio disabled.
-- Target: at least 24 FPS processing throughput, startup under 2 seconds, resident memory under 512 MB.
+- CPU: Ryzen 7 7800X3D; Windows 11/MSVC 19.44. Other hardware needs its own measurements.
+- Build: Release, OpenMP enabled, OpenCV and AVX2 disabled.
+- Workload: 120-frame changing/static/cut video at 1920x1080/30 FPS and a real
+  portrait clip at 1080x1920/24 FPS; `120x40`, truecolor, audio disabled, offline
+  text export; three independent runs per case.
+- Targets: at least 24 processing FPS full quality and 30 FPS with
+  `--fast --no-contours`, startup/render/exit below 2 seconds, and peak working
+  set below 512 MiB on this host.
+- Results: all targets pass with `OMP_NUM_THREADS=12` for full quality and `4`
+  for fast mode. Changing-video medians are 27.40 and 56.34 FPS respectively;
+  the full-quality reference peak is 113.51 MiB. Threads are an explicit setting,
+  and terminal painting is outside the offline-export throughput measurement.
 
-Measured on 2026-07-16 with a deterministic 60-frame 1920x1080/30 FPS MKV, Release MSVC/OpenMP, no OpenCV, and no AVX2, on an AMD Ryzen 7 7800X3D:
+The complete current matrix, 240x80 stress result, commands and proof locations
+are in [tests/baseline/README.md](tests/baseline/README.md). Its separately dated
+July snapshot preserves the earlier performance miss and hosted release evidence.
 
-- Full-quality `120x40`, truecolor, no audio: 10.86 processing FPS, 136.43 MiB peak working set.
-- `--fast --no-contours` with the same workload: 25.70 processing FPS, 106.70 MiB peak working set.
-- One-image `120x40` startup/process/exit: 0.32 seconds, 75.91 MiB peak working set.
+`--strict-memory` rejects requests above a conservative 512 MiB estimate including
+analysis buffers, cells, the optional bilateral grid, decode headroom and audio.
+Strict-mode audio PCM is capped at 32 MiB; normal audio is capped at 256 MiB.
+Replay readers independently cap estimated index/decode working storage at
+256 MiB by default. These are allocation estimates, not an operating-system
+memory quota: FFmpeg may allocate while probing streams discovered after open,
+before their dimensions can be checked. Optional OpenCV allocations are unverified.
 
-The memory and startup targets pass. The throughput target passes in the explicit speed path; full-quality mode remains below target and is a known performance limitation rather than an unmeasured claim.
+Rendering uses linear-light area/bilinear resampling and bitmap alpha blending.
+ASCII color semantics are source-colored foreground strokes on black, preserving
+the explicitly selected charset. Sparse glyphs have limited coverage, so this mode
+does not promise whole-cell radiometric brightness reconstruction. Block art fits
+foreground/background colors to all 16 quadrant masks. Its optional historical
+`block_spectral_palette` setting now uses deterministic bounded OKLab clustering.
+Frequency matching is retained: the font-reference corpus showed a material loss
+of exact matches when it was disabled. Texture matching also remains available.
 
-`--strict-memory` enforces a conservative 512 MiB estimated-memory budget.
+Configuration accepts the implemented reserved modes only: `input.mode = "file"`,
+`output.mode = "terminal"`, and `color.quantization = "oklab"`. Output filenames
+still determine export behavior. Unsupported values fail instead of being ignored.
 
 ## Testing
 
@@ -328,7 +481,7 @@ cmd /c "call ""C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Co
 
 Baseline notes live in `tests/baseline/README.md`.
 
-## Release Checklist
+## Historical V1 Release Checklist (2026-07-16)
 
 - [x] Default no-OpenCV build configures locally.
 - [x] Default no-OpenCV build compiles `ascii-engine`.
@@ -364,7 +517,9 @@ Optional follow-up, not a v1 release gate:
 - Webcam support is v2/deferred for the no-OpenCV baseline.
 - Audio is best-effort/deferred and not a v1 release gate.
 - OpenCV-enabled builds need separate validation with OpenCV installed.
-- Full-quality processing is below the 24 FPS reference target on the measured workload; `--fast --no-contours` meets it.
+- Performance targets pass on the measured Windows/MSVC host with the documented thread counts; other hosts and larger grids need separate measurements.
+- Unicode Windows paths require the MSVC UTF-8 application manifest and Windows 10 version 1903 or later; local verification used Windows 11.
+- The installed FFmpeg has no usable WebM encoder; `.webm` output fails clearly rather than producing a partial file.
 - Terminal output can select glyphs using a loaded font, but the terminal ultimately renders those codepoints with its own configured font. Known-font visual validation is therefore performed through bitmap/video outputs.
 - Content profiles are deterministic hand-tuned presets, not empirically ranked quality claims.
 

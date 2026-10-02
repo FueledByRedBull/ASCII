@@ -11,16 +11,16 @@ DitherBuffer::DitherBuffer(int width, int height) {
 }
 
 void DitherBuffer::resize(int width, int height) {
+    const size_t pixels = checked_image_size(width, height);
     if (width == width_ && height == height_) {
         return;
     }
+    std::vector<float> r(pixels, 0.0f), g(pixels, 0.0f), b(pixels, 0.0f);
+    error_r_.swap(r);
+    error_g_.swap(g);
+    error_b_.swap(b);
     width_ = width;
     height_ = height;
-    stride_ = width + 2;
-    const size_t padded = static_cast<size_t>(height + 2) * stride_;
-    error_r_.assign(padded, 0.0f);
-    error_g_.assign(padded, 0.0f);
-    error_b_.assign(padded, 0.0f);
 }
 
 void DitherBuffer::reset() {
@@ -30,26 +30,29 @@ void DitherBuffer::reset() {
 }
 
 float DitherBuffer::get_error_r(int x, int y) const {
-    return error_r_[index(x, y)];
+    return contains(x, y) ? error_r_[index(x, y)] : 0.0f;
 }
 
 float DitherBuffer::get_error_g(int x, int y) const {
-    return error_g_[index(x, y)];
+    return contains(x, y) ? error_g_[index(x, y)] : 0.0f;
 }
 
 float DitherBuffer::get_error_b(int x, int y) const {
-    return error_b_[index(x, y)];
+    return contains(x, y) ? error_b_[index(x, y)] : 0.0f;
 }
 
-void DitherBuffer::add_error(int x, int y, float er, float eg, float eb) {
+void DitherBuffer::add_error(int x, int y, float er, float eg, float eb, float error_clamp) {
+    if (!contains(x, y)) return;
+    const float limit = std::max(0.0f, error_clamp);
     size_t idx = index(x, y);
-    error_r_[idx] = clamp_error(error_r_[idx] + er);
-    error_g_[idx] = clamp_error(error_g_[idx] + eg);
-    error_b_[idx] = clamp_error(error_b_[idx] + eb);
+    error_r_[idx] = std::clamp(error_r_[idx] + er, -limit, limit);
+    error_g_[idx] = std::clamp(error_g_[idx] + eg, -limit, limit);
+    error_b_[idx] = std::clamp(error_b_[idx] + eb, -limit, limit);
 }
 
 void DitherBuffer::distribute_error_serpentine(int x, int y, bool left_to_right,
                                                 float er, float eg, float eb) {
+    if (!contains(x, y)) return;
     int dx = left_to_right ? 1 : -1;
     
     add_error(x + dx, y,     er * 7.0f / 16.0f, eg * 7.0f / 16.0f, eb * 7.0f / 16.0f);
@@ -73,7 +76,7 @@ void Ditherer::begin_frame(int width, int height) {
 }
 
 void Ditherer::apply_dithering(int x, int y, float& r, float& g, float& b) {
-    if (!config_.enabled) return;
+    if (!config_.enabled || x < 0 || y < 0 || x >= buffer_.width() || y >= buffer_.height()) return;
     
     r = std::clamp(r + buffer_.get_error_r(x, y), 0.0f, 1.0f);
     g = std::clamp(g + buffer_.get_error_g(x, y), 0.0f, 1.0f);
@@ -99,11 +102,12 @@ void Ditherer::apply_dithering(int x, int y, float& r, float& g, float& b) {
 
 void Ditherer::distribute_error(int x, int y, int row_direction,
                                  float er, float eg, float eb) {
-    if (!config_.enabled) return;
+    if (!config_.enabled || x < 0 || y < 0 || x >= buffer_.width() || y >= buffer_.height()) return;
     
-    er = std::clamp(er, -config_.error_clamp, config_.error_clamp);
-    eg = std::clamp(eg, -config_.error_clamp, config_.error_clamp);
-    eb = std::clamp(eb, -config_.error_clamp, config_.error_clamp);
+    const float limit = std::max(0.0f, config_.error_clamp);
+    er = std::clamp(er, -limit, limit);
+    eg = std::clamp(eg, -limit, limit);
+    eb = std::clamp(eb, -limit, limit);
     
     bool left_to_right = (row_direction > 0);
     int dx = left_to_right ? 1 : -1;
@@ -113,10 +117,10 @@ void Ditherer::distribute_error(int x, int y, int row_direction,
     float e5 = er * config_.distribution_5;
     float e1 = er * config_.distribution_1;
     
-    buffer_.add_error(x + dx, y,     e7, eg * config_.distribution_7, eb * config_.distribution_7);
-    buffer_.add_error(x - dx, y + 1, e3, eg * config_.distribution_3, eb * config_.distribution_3);
-    buffer_.add_error(x,      y + 1, e5, eg * config_.distribution_5, eb * config_.distribution_5);
-    buffer_.add_error(x + dx, y + 1, e1, eg * config_.distribution_1, eb * config_.distribution_1);
+    buffer_.add_error(x + dx, y,     e7, eg * config_.distribution_7, eb * config_.distribution_7, limit);
+    buffer_.add_error(x - dx, y + 1, e3, eg * config_.distribution_3, eb * config_.distribution_3, limit);
+    buffer_.add_error(x,      y + 1, e5, eg * config_.distribution_5, eb * config_.distribution_5, limit);
+    buffer_.add_error(x + dx, y + 1, e1, eg * config_.distribution_1, eb * config_.distribution_1, limit);
 }
 
 bool Ditherer::should_dither_cell(bool is_edge_cell) const {

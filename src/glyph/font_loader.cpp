@@ -7,6 +7,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 
 namespace ascii {
 
@@ -14,15 +15,9 @@ struct FontInfoImpl {
     stbtt_fontinfo info;
 };
 
-static bool has_path_traversal(const std::string& path) {
-    if (path.find("..") != std::string::npos) return true;
-    if (path.find('\0') != std::string::npos) return true;
-    return false;
-}
-
 static bool is_safe_font_path(const std::string& path) {
     if (path.empty()) return false;
-    if (has_path_traversal(path)) return false;
+    if (path.find('\0') != std::string::npos) return false;
     
     size_t max_len = 4096;
     if (path.size() > max_len) return false;
@@ -101,51 +96,6 @@ float GlyphBitmap::brightness() const {
     return sum / pixels.size();
 }
 
-std::vector<float> GlyphBitmap::orientation_histogram(int bins) const {
-    std::vector<float> hist(bins, 0.0f);
-    if (width < 3 || height < 3) return hist;
-    constexpr float kPi = 3.14159265358979323846f;
-    
-    std::vector<float> blurred(pixels.size());
-    for (int y = 1; y < height - 1; ++y) {
-        for (int x = 1; x < width - 1; ++x) {
-            float sum = 0.0f;
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    sum += pixels[(y + dy) * width + (x + dx)] / 255.0f;
-                }
-            }
-            blurred[y * width + x] = sum / 9.0f;
-        }
-    }
-    
-    for (int y = 1; y < height - 1; ++y) {
-        for (int x = 1; x < width - 1; ++x) {
-            float gx = -blurred[(y-1)*width + (x-1)] + blurred[(y-1)*width + (x+1)]
-                     - 2*blurred[y*width + (x-1)] + 2*blurred[y*width + (x+1)]
-                     - blurred[(y+1)*width + (x-1)] + blurred[(y+1)*width + (x+1)];
-            float gy = -blurred[(y-1)*width + (x-1)] - 2*blurred[(y-1)*width + x] - blurred[(y-1)*width + (x+1)]
-                     + blurred[(y+1)*width + (x-1)] + 2*blurred[(y+1)*width + x] + blurred[(y+1)*width + (x+1)];
-            
-            float mag = std::sqrt(gx*gx + gy*gy);
-            if (mag > 0.05f) {
-                float angle = std::atan2(gy, gx);
-                float normalized = (angle + kPi) / (2.0f * kPi);
-                int bin = static_cast<int>(normalized * bins) % bins;
-                hist[bin] += mag;
-            }
-        }
-    }
-    
-    float total = 0.0f;
-    for (float v : hist) total += v;
-    if (total > 0.0f) {
-        for (float& v : hist) v /= total;
-    }
-    
-    return hist;
-}
-
 FontLoader::FontLoader() : font_info_(std::make_unique<FontInfoImpl>()) {}
 FontLoader::~FontLoader() = default;
 
@@ -170,36 +120,54 @@ Result FontLoader::load(const std::string& path, float pixel_height) {
         return ascii::Result::fail(ascii::ErrorCode::INVALID_FORMAT, "Font file is empty: " + path);
     }
     
-    font_data_.resize(fsize);
-    if (!file.read(reinterpret_cast<char*>(font_data_.data()), fsize)) {
+    std::vector<uint8_t> data(fsize);
+    if (!file.read(reinterpret_cast<char*>(data.data()), fsize)) {
         return ascii::Result::fail(ascii::ErrorCode::FILE_NOT_FOUND, "Failed to read font file: " + path);
     }
     
-    return load_from_memory(font_data_.data(), fsize, pixel_height);
+    return load_from_memory(data.data(), fsize, pixel_height);
 }
 
 Result FontLoader::load_from_memory(const uint8_t* data, size_t size, float pixel_height) {
+    if (!std::isfinite(pixel_height) || pixel_height <= 0.0f || pixel_height > 1024.0f) {
+        return Result::fail(ErrorCode::INVALID_ARGUMENT, "Font pixel height must be finite, > 0, and <= 1024");
+    }
     if (!validate_font_data(data, size)) {
         return ascii::Result::fail(ascii::ErrorCode::FONT_ERROR, "Invalid font data");
     }
     
-    if (!stbtt_InitFont(&font_info_->info, data, stbtt_GetFontOffsetForIndex(data, 0))) {
+    std::vector<uint8_t> font_data(data, data + size);
+    auto font_info = std::make_unique<FontInfoImpl>();
+    const int offset = stbtt_GetFontOffsetForIndex(font_data.data(), 0);
+    if (offset < 0 || !stbtt_InitFont(&font_info->info, font_data.data(), offset)) {
         return ascii::Result::fail(ascii::ErrorCode::FONT_ERROR, "Failed to initialize font");
     }
     
-    pixel_height_ = pixel_height;
-    scale_ = stbtt_ScaleForPixelHeight(&font_info_->info, pixel_height);
+    const float scale = stbtt_ScaleForPixelHeight(&font_info->info, pixel_height);
     
     int ascent, descent, line_gap;
-    stbtt_GetFontVMetrics(&font_info_->info, &ascent, &descent, &line_gap);
+    stbtt_GetFontVMetrics(&font_info->info, &ascent, &descent, &line_gap);
+    const double line_height = (ascent - descent + line_gap) * scale;
+
+    int advance, lsb;
+    stbtt_GetCodepointHMetrics(&font_info->info, 'M', &advance, &lsb);
+    const double max_advance = advance * scale;
+    if (!std::isfinite(scale) || scale <= 0.0f ||
+        !std::isfinite(line_height) || line_height < 0.0 || line_height > std::numeric_limits<int>::max() ||
+        !std::isfinite(max_advance) || max_advance < 0.0 || max_advance > std::numeric_limits<int>::max()) {
+        return Result::fail(ErrorCode::FONT_ERROR, "Font metrics exceed the supported rendering range");
+    }
+
+    font_data_ = std::move(font_data);
+    font_info_ = std::move(font_info);
+    pixel_height_ = pixel_height;
+    scale_ = scale;
     ascent_ = ascent;
     descent_ = descent;
     line_gap_ = line_gap;
-    line_height_ = static_cast<int>((ascent - descent + line_gap) * scale_);
-    
-    int advance, lsb;
-    stbtt_GetCodepointHMetrics(&font_info_->info, 'M', &advance, &lsb);
-    max_advance_ = static_cast<int>(advance * scale_);
+    line_height_ = static_cast<int>(line_height);
+    max_advance_ = static_cast<int>(max_advance);
+    cache_.clear();
     
     loaded_ = true;
     return ascii::Result::ok();

@@ -20,7 +20,6 @@ struct GlyphBitmap {
     
     bool empty() const { return pixels.empty(); }
     float brightness() const;
-    std::vector<float> orientation_histogram(int bins = 8) const;
 };
 
 class FontLoader {
@@ -28,6 +27,8 @@ public:
     FontLoader();
     ~FontLoader();
     
+    // Loads own their font bytes; failures preserve the previously loaded font.
+    // Pixel height must be finite and in (0, 1024].
     Result load(const std::string& path, float pixel_height = 16.0f);
     Result load_from_memory(const uint8_t* data, size_t size, float pixel_height = 16.0f);
     Result load_system_fallback(float pixel_height = 16.0f);

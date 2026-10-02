@@ -21,7 +21,7 @@ public:
     float get_error_g(int x, int y) const;
     float get_error_b(int x, int y) const;
     
-    void add_error(int x, int y, float er, float eg, float eb);
+    void add_error(int x, int y, float er, float eg, float eb, float error_clamp = 0.12f);
     
     void distribute_error_serpentine(int x, int y, bool left_to_right,
                                       float er, float eg, float eb);
@@ -32,16 +32,12 @@ private:
     std::vector<float> error_b_;
     int width_ = 0;
     int height_ = 0;
-    int stride_ = 0;
-    
-    static constexpr float ERROR_CLAMP = 0.12f;
-    
-    float clamp_error(float e) const {
-        return std::clamp(e, -ERROR_CLAMP, ERROR_CLAMP);
+    bool contains(int x, int y) const {
+        return x >= 0 && y >= 0 && x < width_ && y < height_;
     }
 
     size_t index(int x, int y) const {
-        return static_cast<size_t>(y + 1) * stride_ + static_cast<size_t>(x + 1);
+        return static_cast<size_t>(y) * width_ + static_cast<size_t>(x);
     }
 };
 

@@ -29,9 +29,10 @@ PipelineRuntimeCache::Decision PipelineRuntimeCache::begin_frame(const FrameBuff
 
     if (have_cached_pipeline_result_ && reuse_limit > 0) {
         const bool cached_color_ok = !query.need_color_buffer || cached_pipeline_has_color_buffer_;
+        const bool cached_stats_ok = !query.need_color_stats || cached_pipeline_has_color_stats_;
         if (identical &&
             pipeline_reuse_frames_ < reuse_limit &&
-            cached_color_ok) {
+            cached_color_ok && cached_stats_ok) {
             decision.reuse_pipeline_result = true;
             decision.reused_result = &cached_pipeline_result_;
             ++pipeline_reuse_frames_;
@@ -48,6 +49,7 @@ PipelineRuntimeCache::Decision PipelineRuntimeCache::begin_frame(const FrameBuff
         have_cached_cell_stats_ &&
         reuse_limit > 0 &&
         identical &&
+        (!query.need_color_stats || cached_cell_stats_have_color_) &&
         cell_stats_reuse_frames_ < reuse_limit;
     if (decision.reuse_cell_stats) {
         decision.process_options.reuse_cell_stats = &cached_cell_stats_;
@@ -58,10 +60,12 @@ PipelineRuntimeCache::Decision PipelineRuntimeCache::begin_frame(const FrameBuff
 
 void PipelineRuntimeCache::commit_processed_result(const Pipeline::Result& result,
                                                    bool has_color_buffer,
+                                                   bool has_color_stats,
                                                    bool reused_cell_stats) {
     cached_pipeline_result_ = result;
     have_cached_pipeline_result_ = true;
     cached_pipeline_has_color_buffer_ = has_color_buffer;
+    cached_pipeline_has_color_stats_ = has_color_stats || (reused_cell_stats && cached_cell_stats_have_color_);
     pipeline_reuse_frames_ = 0;
 
     if (reused_cell_stats) {
@@ -69,6 +73,7 @@ void PipelineRuntimeCache::commit_processed_result(const Pipeline::Result& resul
     } else {
         cached_cell_stats_ = result.cell_stats;
         have_cached_cell_stats_ = true;
+        cached_cell_stats_have_color_ = has_color_stats;
         cell_stats_reuse_frames_ = 0;
     }
 }
@@ -79,8 +84,10 @@ void PipelineRuntimeCache::invalidate() {
     previous_frame_height_ = 0;
     have_cached_pipeline_result_ = false;
     cached_pipeline_has_color_buffer_ = false;
+    cached_pipeline_has_color_stats_ = false;
     pipeline_reuse_frames_ = 0;
     have_cached_cell_stats_ = false;
+    cached_cell_stats_have_color_ = false;
     cell_stats_reuse_frames_ = 0;
     cached_cell_stats_.clear();
 }

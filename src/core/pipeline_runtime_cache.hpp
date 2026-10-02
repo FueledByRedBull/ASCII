@@ -27,6 +27,7 @@ public:
 
     void commit_processed_result(const Pipeline::Result& result,
                                  bool has_color_buffer,
+                                 bool has_color_stats,
                                  bool reused_cell_stats);
 
     const Pipeline::Result& cached_result() const { return cached_pipeline_result_; }
@@ -40,10 +41,12 @@ private:
     Pipeline::Result cached_pipeline_result_;
     bool have_cached_pipeline_result_ = false;
     bool cached_pipeline_has_color_buffer_ = false;
+    bool cached_pipeline_has_color_stats_ = false;
     int pipeline_reuse_frames_ = 0;
 
     std::vector<CellStats> cached_cell_stats_;
     bool have_cached_cell_stats_ = false;
+    bool cached_cell_stats_have_color_ = false;
     int cell_stats_reuse_frames_ = 0;
 
     bool is_identical_to_previous(const FrameBuffer& frame) const;

@@ -14,9 +14,13 @@ float TemporalSmoother::effective_alpha() const {
 }
 
 void TemporalSmoother::initialize(int grid_cols, int grid_rows) {
+    const size_t count = checked_image_size(grid_cols, grid_rows);
+    if (count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("Temporal grid exceeds supported cell count");
+    }
     cols_ = grid_cols;
     rows_ = grid_rows;
-    frame_state_.assign(static_cast<size_t>(grid_cols) * grid_rows, CellState{});
+    frame_state_.assign(count, CellState{});
     previous_frame_state_.assign(frame_state_.size(), CellState{});
 }
 

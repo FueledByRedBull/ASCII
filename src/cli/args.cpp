@@ -21,7 +21,6 @@ static bool parse_color_mode(const std::string& s, ColorMode& mode) {
 
 static bool validate_path(const std::string& path) {
     if (path.empty()) return false;
-    if (path.find("..") != std::string::npos) return false;
     if (path.find('\0') != std::string::npos) return false;
     return true;
 }
@@ -117,7 +116,7 @@ Args parse_args(int argc, char* argv[]) {
         else if (strcmp(arg, "--char-set") == 0) {
             if (!take_value(argc, argv, i, args, arg, value)) break;
             std::string cs = value;
-            if (cs != "basic" && cs != "blocks" && cs != "line-art") { args.valid = false; args.error = "Invalid value for --char-set: " + cs; break; }
+            if (cs != "basic" && cs != "traditional" && cs != "blocks" && cs != "line-art") { args.valid = false; args.error = "Invalid value for --char-set: " + cs; break; }
             args.char_set = cs;
             args.char_set_set = true;
         }
@@ -259,7 +258,7 @@ void print_help(const char* prog) {
     printf("  -f, --fps <N>           Target FPS (default: 30, range: 1-120)\n");
     printf("  -c, --cols <N>          Max columns (default: auto-detect, range: 1-500)\n");
     printf("  -r, --rows <N>          Max rows (default: auto-detect, range: 1-200)\n");
-    printf("      --char-set <NAME>   Character set: basic, blocks, line-art\n");
+    printf("      --char-set <NAME>   Character set: basic, traditional, blocks, line-art\n");
     printf("      --profile <NAME>    Content preset: natural, anime, ui\n");
     printf("      --color <MODE>      Color mode: none, 16, 256, truecolor, blockart\n");
     printf("      --edge-thresh <N>   Edge detection threshold (0.0-1.0)\n");
@@ -280,9 +279,9 @@ void print_help(const char* prog) {
     printf("      --no-contours       Disable default ASCII contour overlay\n");
     printf("      --no-orientation    Disable orientation-based glyph selection\n");
     printf("      --simple-orientation Use simple 8-direction orientation mapping\n");
-    printf("      --debug <MODE>      Debug view: grayscale, edges, orientation\n");
+    printf("      --debug <MODE>      Render grayscale, edges, orientation to terminal/files\n");
     printf("      --profile-live      Output per-frame profiling as JSONL to stderr\n");
-    printf("      --strict-memory     Fail if memory budget exceeded\n");
+    printf("      --strict-memory     Reject estimated render memory above 512 MiB\n");
     printf("      --fast              Fast preview mode (disables expensive analysis modules)\n");
     printf("  -h, --help              Show this help\n");
     printf("\nINTERACTIVE CONTROLS (during playback):\n");

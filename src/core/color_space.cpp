@@ -1,37 +1,13 @@
 #include "core/color_space.hpp"
 #include <cmath>
 #include <algorithm>
+#include <array>
 
 namespace ascii {
 
-float ColorSpace::srgb_decode_lut_[256];
-uint8_t ColorSpace::srgb_encode_lut_[4096];
-bool ColorSpace::initialized_ = false;
-
 void ColorSpace::init() {
-    if (initialized_) return;
-    
-    for (int i = 0; i < 256; ++i) {
-        float c = i / 255.0f;
-        if (c <= 0.04045f) {
-            srgb_decode_lut_[i] = c / 12.92f;
-        } else {
-            srgb_decode_lut_[i] = std::pow((c + 0.055f) / 1.055f, 2.4f);
-        }
-    }
-    
-    for (int i = 0; i < 4096; ++i) {
-        float c = i / 4095.0f;
-        float result;
-        if (c <= 0.0031308f) {
-            result = 12.92f * c;
-        } else {
-            result = 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
-        }
-        srgb_encode_lut_[i] = static_cast<uint8_t>(std::clamp(std::round(result * 255.0f), 0.0f, 255.0f));
-    }
-    
-    initialized_ = true;
+    (void)srgb_to_linear(0);
+    (void)linear_to_srgb(0.0f);
 }
 
 float ColorSpace::srgb_decode(uint8_t c) {
@@ -54,18 +30,22 @@ uint8_t ColorSpace::srgb_encode(float c) {
 }
 
 float ColorSpace::srgb_to_linear(uint8_t srgb) {
-    if (initialized_) {
-        return srgb_decode_lut_[srgb];
-    }
-    return srgb_decode(srgb);
+    static const auto lookup = [] {
+        std::array<float, 256> values;
+        for (size_t i = 0; i < values.size(); ++i) values[i] = srgb_decode(static_cast<uint8_t>(i));
+        return values;
+    }();
+    return lookup[srgb];
 }
 
 uint8_t ColorSpace::linear_to_srgb(float linear) {
-    if (initialized_) {
-        int idx = static_cast<int>(std::clamp(linear, 0.0f, 1.0f) * 4095.0f + 0.5f);
-        return srgb_encode_lut_[idx];
-    }
-    return srgb_encode(linear);
+    static const auto lookup = [] {
+        std::array<uint8_t, 4096> values;
+        for (size_t i = 0; i < values.size(); ++i) values[i] = srgb_encode(i / 4095.0f);
+        return values;
+    }();
+    int idx = static_cast<int>(std::clamp(linear, 0.0f, 1.0f) * 4095.0f + 0.5f);
+    return lookup[idx];
 }
 
 LinearColor ColorSpace::srgb_to_linear(uint8_t r, uint8_t g, uint8_t b) {

@@ -3,10 +3,8 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
-
-#ifdef ASCII_USE_OPENCV
-#include <opencv2/opencv.hpp>
-#endif
+#include <limits>
+#include <stdexcept>
 
 #ifdef HAS_OPENMP
 #include <omp.h>
@@ -17,51 +15,24 @@ namespace ascii {
 Pipeline::Pipeline(const Config& config) : config_(config) {
     ColorSpace::init();
     init_luminance_lut();
-    
-    EdgeDetector::Config edge_cfg;
-    edge_cfg.blur_sigma = config.blur_sigma;
-    edge_cfg.low_threshold = config.edge_low;
-    edge_cfg.high_threshold = config.edge_high;
-    edge_cfg.use_hysteresis = config.use_hysteresis;
-    edge_cfg.multi_scale = config.multi_scale;
-    edge_cfg.scale_sigma_0 = config.scale_sigma_0;
-    edge_cfg.scale_sigma_1 = config.scale_sigma_1;
-    edge_cfg.adaptive_scale_selection = config.adaptive_scale_selection;
-    edge_cfg.scale_variance_floor = config.scale_variance_floor;
-    edge_cfg.scale_variance_ceil = config.scale_variance_ceil;
-    edge_cfg.use_anisotropic_diffusion = config.use_anisotropic_diffusion;
-    edge_cfg.diffusion_iterations = config.diffusion_iterations;
-    edge_cfg.diffusion_kappa = config.diffusion_kappa;
-    edge_cfg.diffusion_lambda = config.diffusion_lambda;
-    edge_cfg.adaptive_mode = config.adaptive_mode;
-    edge_cfg.tile_size = config.tile_size;
-    edge_cfg.dark_scene_floor = config.dark_scene_floor;
-    edge_cfg.global_percentile = config.global_percentile;
-    edge_detector_.set_config(edge_cfg);
-    
-    CellStatsAggregator::Config cell_cfg;
-    cell_cfg.cell_width = config.cell_width;
-    cell_cfg.cell_height = config.cell_height;
-    cell_cfg.enable_orientation_histogram = config.enable_orientation_histogram;
-    cell_cfg.enable_frequency_signature = config.enable_frequency_signature;
-    cell_cfg.enable_texture_signature = config.enable_texture_signature;
-    cell_cfg.quad_tree_adaptive = config.quad_tree_adaptive;
-    cell_cfg.quad_tree_max_depth = config.quad_tree_max_depth;
-    cell_cfg.quad_tree_variance_threshold = config.quad_tree_variance_threshold;
-    cell_aggregator_.set_config(cell_cfg);
-
-    ContourExtractor::Config contour_cfg;
-    contour_cfg.enabled = config.contours_enabled;
-    contour_cfg.min_occupancy = config.contour_min_occupancy;
-    contour_cfg.min_pixels = config.contour_min_pixels;
-    contour_cfg.dominance_ratio = config.contour_dominance_ratio;
-    contour_cfg.intersection_ratio = config.contour_intersection_ratio;
-    contour_cfg.dog_sigma_inner = config.contour_dog_sigma_inner;
-    contour_cfg.dog_sigma_outer = config.contour_dog_sigma_outer;
-    contour_extractor_.set_config(contour_cfg);
+    set_config(config);
 }
 
 void Pipeline::set_config(const Config& config) {
+    if (config.target_cols <= 0 || config.target_rows <= 0 ||
+        config.cell_width <= 0 || config.cell_height <= 0 ||
+        !std::isfinite(config.char_aspect) || config.char_aspect <= 0.0f ||
+        config.tile_size <= 0 ||
+        (config.scale_mode != "fit" && config.scale_mode != "fill" && config.scale_mode != "stretch")) {
+        throw std::invalid_argument("Invalid pipeline geometry or resize configuration");
+    }
+    const int64_t width = static_cast<int64_t>(config.target_cols) * config.cell_width;
+    const int64_t height = static_cast<int64_t>(config.target_rows) * config.cell_height;
+    // Keep the same 100-million-pixel analysis limit as the public configuration.
+    if (width > std::numeric_limits<int>::max() || height > std::numeric_limits<int>::max() ||
+        width > 100000000 / height) {
+        throw std::length_error("Pipeline analysis dimensions are too large");
+    }
     config_ = config;
     
     EdgeDetector::Config edge_cfg;
@@ -122,15 +93,15 @@ void Pipeline::to_grayscale(const FrameBuffer& input, FloatImage& output) const 
         output = FloatImage(input.width(), input.height());
     }
 
-    const int total_pixels = input.width() * input.height();
+    const int64_t total_pixels = static_cast<int64_t>(input.width()) * input.height();
     const uint8_t* src = input.data();
     float* dst = output.data();
     
 #ifdef HAS_OPENMP
     #pragma omp parallel for
 #endif
-    for (int i = 0; i < total_pixels; ++i) {
-        int idx = i * 4;
+    for (int64_t i = 0; i < total_pixels; ++i) {
+        const size_t idx = static_cast<size_t>(i) * 4;
         dst[i] = lum_r_lut_[src[idx]] + lum_g_lut_[src[idx + 1]] + lum_b_lut_[src[idx + 2]];
     }
 }
@@ -140,8 +111,17 @@ Pipeline::ResizePlan Pipeline::compute_resize_plan(int src_w, int src_h) const {
     plan.target_w = config_.target_cols * config_.cell_width;
     plan.target_h = config_.target_rows * config_.cell_height;
     
-    float src_aspect = static_cast<float>(src_w) / src_h;
-    float dst_aspect = static_cast<float>(config_.target_cols) / config_.target_rows / config_.char_aspect;
+    // Convert the source's physical aspect to analysis-raster coordinates.
+    const double src_aspect = static_cast<double>(src_w) / src_h *
+                              (static_cast<double>(config_.char_aspect) * config_.cell_width / config_.cell_height);
+    const double dst_aspect = static_cast<double>(plan.target_w) / plan.target_h;
+    const auto scaled_extent = [](double extent, bool cover) {
+        extent = cover ? std::ceil(extent) : std::floor(extent);
+        if (!std::isfinite(extent) || extent > std::numeric_limits<int>::max()) {
+            throw std::length_error("Pipeline resize extent is too large");
+        }
+        return static_cast<int>(std::max(1.0, extent));
+    };
     
     if (config_.scale_mode == "stretch") {
         plan.scale_w = plan.target_w;
@@ -149,18 +129,18 @@ Pipeline::ResizePlan Pipeline::compute_resize_plan(int src_w, int src_h) const {
     } else if (config_.scale_mode == "fill") {
         if (src_aspect > dst_aspect) {
             plan.scale_h = plan.target_h;
-            plan.scale_w = static_cast<int>(plan.scale_h * src_aspect);
+            plan.scale_w = scaled_extent(plan.scale_h * src_aspect, true);
         } else {
             plan.scale_w = plan.target_w;
-            plan.scale_h = static_cast<int>(plan.scale_w / src_aspect);
+            plan.scale_h = scaled_extent(plan.scale_w / src_aspect, true);
         }
     } else {
         if (src_aspect > dst_aspect) {
             plan.scale_w = plan.target_w;
-            plan.scale_h = static_cast<int>(plan.scale_w / src_aspect);
+            plan.scale_h = scaled_extent(plan.scale_w / src_aspect, false);
         } else {
             plan.scale_h = plan.target_h;
-            plan.scale_w = static_cast<int>(plan.scale_h * src_aspect);
+            plan.scale_w = scaled_extent(plan.scale_h * src_aspect, false);
         }
     }
     
@@ -178,35 +158,7 @@ Pipeline::ResizePlan Pipeline::compute_resize_plan(int src_w, int src_h) const {
 void Pipeline::resize_for_cells(const FloatImage& input, FloatImage& output) const {
     ResizePlan plan = compute_resize_plan(input.width(), input.height());
     
-#ifdef ASCII_USE_OPENCV
-    cv::Mat input_mat(input.height(), input.width(), CV_32F, 
-                      const_cast<float*>(input.data()));
-    
-    cv::Mat scaled_mat;
-    cv::Size scale_size(plan.scale_w, plan.scale_h);
-    const int interpolation = (plan.scale_w < input.width() || plan.scale_h < input.height())
-        ? cv::INTER_AREA : cv::INTER_LINEAR;
-    cv::resize(input_mat, scaled_mat, scale_size, 0, 0, interpolation);
-    
-    if (output.width() != plan.target_w || output.height() != plan.target_h) {
-        output = FloatImage(plan.target_w, plan.target_h, 0.0f);
-    } else {
-        output.fill(0.0f);
-    }
-    
-#ifdef HAS_OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
-    for (int y = 0; y < plan.scale_h; ++y) {
-        int dst_y = y + plan.offset_y;
-        if (dst_y < 0 || dst_y >= plan.target_h) continue;
-        for (int x = 0; x < plan.scale_w; ++x) {
-            int dst_x = x + plan.offset_x;
-            if (dst_x < 0 || dst_x >= plan.target_w) continue;
-            output.set(dst_x, dst_y, scaled_mat.at<float>(y, x));
-        }
-    }
-#else
+
     if (output.width() != plan.target_w || output.height() != plan.target_h) {
         output = FloatImage(plan.target_w, plan.target_h, 0.0f);
     } else {
@@ -219,7 +171,7 @@ void Pipeline::resize_for_cells(const FloatImage& input, FloatImage& output) con
 #ifdef HAS_OPENMP
     #pragma omp parallel for schedule(static)
 #endif
-    for (int y = 0; y < plan.scale_h; ++y) {
+    for (int y = std::max(0, -plan.offset_y); y < std::min(plan.scale_h, plan.target_h - plan.offset_y); ++y) {
         int dst_y = y + plan.offset_y;
         if (dst_y < 0 || dst_y >= plan.target_h) continue;
         float src_y = (y + 0.5f) * y_ratio - 0.5f;
@@ -229,7 +181,7 @@ void Pipeline::resize_for_cells(const FloatImage& input, FloatImage& output) con
         y0 = std::clamp(y0, 0, input.height() - 1);
         y1 = std::clamp(y1, 0, input.height() - 1);
         
-        for (int x = 0; x < plan.scale_w; ++x) {
+        for (int x = std::max(0, -plan.offset_x); x < std::min(plan.scale_w, plan.target_w - plan.offset_x); ++x) {
             int dst_x = x + plan.offset_x;
             if (dst_x < 0 || dst_x >= plan.target_w) continue;
             if (x_ratio > 1.0f || y_ratio > 1.0f) {
@@ -272,7 +224,7 @@ void Pipeline::resize_for_cells(const FloatImage& input, FloatImage& output) con
             output.set(dst_x, dst_y, v);
         }
     }
-#endif
+
 }
 
 void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, int target_h, FrameBuffer& output) const {
@@ -282,33 +234,7 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
         return;
     }
     
-#ifdef ASCII_USE_OPENCV
-    cv::Mat input_mat(input.height(), input.width(), CV_8UC4, 
-                      const_cast<uint8_t*>(input.data()));
-    
-    cv::Mat scaled_mat;
-    cv::Size scale_size(plan.scale_w, plan.scale_h);
-    const int interpolation = (plan.scale_w < input.width() || plan.scale_h < input.height())
-        ? cv::INTER_AREA : cv::INTER_LINEAR;
-    cv::resize(input_mat, scaled_mat, scale_size, 0, 0, interpolation);
-    
-    if (output.width() != target_w || output.height() != target_h) {
-        output = FrameBuffer(target_w, target_h, Color(0, 0, 0, 255));
-    } else {
-        output.fill(Color(0, 0, 0, 255));
-    }
-    
-    for (int y = 0; y < plan.scale_h; ++y) {
-        int dst_y = y + plan.offset_y;
-        if (dst_y < 0 || dst_y >= plan.target_h) continue;
-        for (int x = 0; x < plan.scale_w; ++x) {
-            int dst_x = x + plan.offset_x;
-            if (dst_x < 0 || dst_x >= plan.target_w) continue;
-            cv::Vec4b pixel = scaled_mat.at<cv::Vec4b>(y, x);
-            output.set_pixel(dst_x, dst_y, Color(pixel[0], pixel[1], pixel[2], pixel[3]));
-        }
-    }
-#else
+
     if (output.width() != target_w || output.height() != target_h) {
         output = FrameBuffer(target_w, target_h, Color(0, 0, 0, 255));
     } else {
@@ -322,7 +248,7 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
     const float x_ratio = static_cast<float>(src_w) / plan.scale_w;
     const float y_ratio = static_cast<float>(src_h) / plan.scale_h;
 
-    for (int y = 0; y < plan.scale_h; ++y) {
+    for (int y = std::max(0, -plan.offset_y); y < std::min(plan.scale_h, plan.target_h - plan.offset_y); ++y) {
         int dst_y = y + plan.offset_y;
         if (dst_y < 0 || dst_y >= plan.target_h) continue;
         const float src_y = (y + 0.5f) * y_ratio - 0.5f;
@@ -337,7 +263,7 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
         const size_t row1 = static_cast<size_t>(y1) * src_w * 4;
         const size_t dst_row = static_cast<size_t>(dst_y) * target_w * 4;
 
-        for (int x = 0; x < plan.scale_w; ++x) {
+        for (int x = std::max(0, -plan.offset_x); x < std::min(plan.scale_w, plan.target_w - plan.offset_x); ++x) {
             int dst_x = x + plan.offset_x;
             if (dst_x < 0 || dst_x >= plan.target_w) continue;
             if (x_ratio > 1.0f || y_ratio > 1.0f) {
@@ -355,14 +281,16 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
                         const float wx = std::max(0.0f, std::min(sx1, sx + 1.0f) - std::max(sx0, static_cast<float>(sx)));
                         const float weight = wx * wy;
                         const size_t source_index = (static_cast<size_t>(sy) * src_w + sx) * 4;
-                        for (int c = 0; c < 4; ++c) sums[c] += src[source_index + c] * weight;
+                        for (int c = 0; c < 3; ++c) sums[c] += linear_lut_[src[source_index + c]] * weight;
+                        sums[3] += src[source_index + 3] * weight;
                         weight_sum += weight;
                     }
                 }
                 const size_t output_index = dst_row + static_cast<size_t>(dst_x) * 4;
                 for (int c = 0; c < 4; ++c) {
-                    dst[output_index + c] = weight_sum > 0.0
-                        ? static_cast<uint8_t>(std::clamp(sums[c] / weight_sum, 0.0, 255.0)) : 0;
+                    const float value = weight_sum > 0.0 ? static_cast<float>(sums[c] / weight_sum) : 0.0f;
+                    dst[output_index + c] = c < 3 ? ColorSpace::linear_to_srgb(value)
+                        : static_cast<uint8_t>(std::round(std::clamp(value, 0.0f, 255.0f)));
                 }
                 continue;
             }
@@ -381,18 +309,19 @@ void Pipeline::resize_color_for_cells(const FrameBuffer& input, int target_w, in
             const size_t odx = dst_row + static_cast<size_t>(dst_x) * 4;
 
             for (int c = 0; c < 4; ++c) {
-                const float p00 = static_cast<float>(src[i00 + static_cast<size_t>(c)]);
-                const float p10 = static_cast<float>(src[i10 + static_cast<size_t>(c)]);
-                const float p01 = static_cast<float>(src[i01 + static_cast<size_t>(c)]);
-                const float p11 = static_cast<float>(src[i11 + static_cast<size_t>(c)]);
+                const float p00 = c < 3 ? linear_lut_[src[i00 + c]] : src[i00 + c];
+                const float p10 = c < 3 ? linear_lut_[src[i10 + c]] : src[i10 + c];
+                const float p01 = c < 3 ? linear_lut_[src[i01 + c]] : src[i01 + c];
+                const float p11 = c < 3 ? linear_lut_[src[i11 + c]] : src[i11 + c];
                 const float v0 = p00 * wx0 + p10 * fx;
                 const float v1 = p01 * wx0 + p11 * fx;
-                dst[odx + static_cast<size_t>(c)] =
-                    static_cast<uint8_t>(std::clamp(v0 * wy0 + v1 * fy, 0.0f, 255.0f));
+                const float value = v0 * wy0 + v1 * fy;
+                dst[odx + static_cast<size_t>(c)] = c < 3 ? ColorSpace::linear_to_srgb(value)
+                    : static_cast<uint8_t>(std::round(std::clamp(value, 0.0f, 255.0f)));
             }
         }
     }
-#endif
+
 }
 
 void Pipeline::compute_cell_mean_colors(const FrameBuffer& input,
@@ -454,7 +383,10 @@ void Pipeline::compute_cell_mean_colors(const FrameBuffer& input,
             }
         }
         if (weight_sum > 0.0) {
-            const float inv = static_cast<float>(1.0 / weight_sum);
+            // Uncovered fit padding contributes black to the entire cell.
+            const double cell_area = static_cast<double>(dst_x1 - dst_x0) * (dst_y1 - dst_y0);
+            const double image_area = static_cast<double>(image_x1 - image_x0) * (image_y1 - image_y0);
+            const float inv = static_cast<float>(image_area / (cell_area * weight_sum));
             means[static_cast<size_t>(cell)][0] = static_cast<float>(sums[0]) * inv;
             means[static_cast<size_t>(cell)][1] = static_cast<float>(sums[1]) * inv;
             means[static_cast<size_t>(cell)][2] = static_cast<float>(sums[2]) * inv;
@@ -464,6 +396,7 @@ void Pipeline::compute_cell_mean_colors(const FrameBuffer& input,
 
 Pipeline::Result Pipeline::process(const FrameBuffer& input, const ProcessOptions& options) {
     Result result;
+    if (input.empty()) return result;
 
     to_grayscale(input, gray_buffer_);
     resize_for_cells(gray_buffer_, result.luminance);
@@ -488,28 +421,22 @@ Pipeline::Result Pipeline::process(const FrameBuffer& input, const ProcessOption
         return result;
     }
 
-    if (options.need_color_buffer) {
-        const FrameBuffer* color_ptr = options.need_color_stats ? &result.color_buffer : nullptr;
-        result.cell_stats = cell_aggregator_.compute(
-            result.luminance, result.edges, color_ptr, &result.gradients);
-    } else {
-        result.cell_stats = cell_aggregator_.compute(
-            result.luminance, result.edges, nullptr, &result.gradients);
+    result.cell_stats = cell_aggregator_.compute(
+        result.luminance, result.edges, nullptr, &result.gradients);
 
-        if (options.need_color_stats) {
-            std::vector<std::array<float, 3>> means;
-            compute_cell_mean_colors(input,
-                                     result.luminance.width(),
-                                     result.luminance.height(),
-                                     result.grid_cols,
-                                     result.grid_rows,
-                                     means);
-            const size_t n = std::min(result.cell_stats.size(), means.size());
-            for (size_t i = 0; i < n; ++i) {
-                result.cell_stats[i].mean_r = means[i][0];
-                result.cell_stats[i].mean_g = means[i][1];
-                result.cell_stats[i].mean_b = means[i][2];
-            }
+    if (options.need_color_stats) {
+        std::vector<std::array<float, 3>> means;
+        compute_cell_mean_colors(input,
+                                 result.luminance.width(),
+                                 result.luminance.height(),
+                                 result.grid_cols,
+                                 result.grid_rows,
+                                 means);
+        const size_t n = std::min(result.cell_stats.size(), means.size());
+        for (size_t i = 0; i < n; ++i) {
+            result.cell_stats[i].mean_r = means[i][0];
+            result.cell_stats[i].mean_g = means[i][1];
+            result.cell_stats[i].mean_b = means[i][2];
         }
     }
 

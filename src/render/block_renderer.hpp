@@ -20,7 +20,7 @@ public:
         bool use_half_blocks = true;
         bool use_quarter_blocks = true;
         bool use_eighth_blocks = false;
-        int color_quantization_levels = 16;
+        int color_quantization_levels = 16;  // Nonpositive disables; positive values are clamped to 2-256.
     };
     
     BlockRenderer() = default;
@@ -61,6 +61,7 @@ public:
     BlockCell render_cell(const CellData& data) const;
     
     std::vector<BlockCell> render_frame(const std::vector<CellData>& cells) const;
+    // Uses bounded deterministic OKLab clustering; the existing API name is retained.
     void spectral_quantize_frame(std::vector<BlockCell>& cells, int palette_size,
                                  int max_samples, int iterations) const;
     
@@ -74,39 +75,6 @@ private:
     Config config_;
     int cols_ = 80;
     int rows_ = 24;
-    mutable std::vector<BlockCell> prev_cells_;
-    
-    static constexpr uint32_t BLOCK_FULL = 0x2588;
-    static constexpr uint32_t BLOCK_DARK = 0x2593;
-    static constexpr uint32_t BLOCK_MEDIUM = 0x2592;
-    static constexpr uint32_t BLOCK_LIGHT = 0x2591;
-    static constexpr uint32_t BLOCK_UPPER = 0x2580;
-    static constexpr uint32_t BLOCK_LOWER = 0x2584;
-    static constexpr uint32_t BLOCK_LEFT = 0x258C;
-    static constexpr uint32_t BLOCK_RIGHT = 0x2590;
-    static constexpr uint32_t BLOCK_QUARTER_LL = 0x2596;
-    static constexpr uint32_t BLOCK_QUARTER_LR = 0x2597;
-    static constexpr uint32_t BLOCK_QUARTER_UL = 0x2598;
-    static constexpr uint32_t BLOCK_QUARTER_UR = 0x259D;
-    static constexpr uint32_t BLOCK_QUARTER_LEFT = 0x2599;
-    static constexpr uint32_t BLOCK_QUARTER_RIGHT = 0x259F;
-    static constexpr uint32_t BLOCK_SPACE = 0x0020;
-    
-    struct ColorPair {
-        LinearColor fg;
-        LinearColor bg;
-        float error;
-    };
-    
-    ColorPair find_best_color_pair(const CellData& data, float coverage) const;
-    
-    float compute_color_error(const LinearColor& c1, const LinearColor& target) const;
-    
-    uint32_t select_block_glyph(float coverage) const;
-    
-    uint32_t select_half_block(float top_lum, float bottom_lum) const;
-    
-    uint32_t select_quarter_block(const CellData& data) const;
     
     void quantize_colors(uint8_t& r, uint8_t& g, uint8_t& b) const;
     

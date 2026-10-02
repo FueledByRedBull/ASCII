@@ -3,9 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
-#include <iomanip>
+#include <array>
 #include <limits>
-#include <tuple>
 #include <vector>
 
 namespace ascii {
@@ -84,122 +83,10 @@ BlockRenderer::CellData BlockRenderer::analyze_cell(const FloatImage& luminance,
     return data;
 }
 
-BlockRenderer::ColorPair BlockRenderer::find_best_color_pair(const CellData& data, float coverage) const {
-    ColorPair result;
-    
-    LinearColor cell_color(data.mean_r, data.mean_g, data.mean_b);
-    
-    result.fg = cell_color;
-    result.bg = LinearColor(0.0f, 0.0f, 0.0f);
-    
-    if (coverage > 0.9f) {
-        result.bg = result.fg;
-        result.error = 0.0f;
-        return result;
-    }
-    
-    if (coverage < 0.1f) {
-        result.fg = result.bg;
-        result.error = 0.0f;
-        return result;
-    }
-    
-    float target_fg_r = data.mean_r / coverage;
-    float target_fg_g = data.mean_g / coverage;
-    float target_fg_b = data.mean_b / coverage;
-    
-    if (data.mean_r > coverage * 0.5f && data.mean_g > coverage * 0.5f && data.mean_b > coverage * 0.5f) {
-        result.fg = LinearColor(
-            std::clamp(target_fg_r, 0.0f, 1.0f),
-            std::clamp(target_fg_g, 0.0f, 1.0f),
-            std::clamp(target_fg_b, 0.0f, 1.0f)
-        );
-    }
-    
-    result.error = compute_color_error(result.fg * coverage + result.bg * (1.0f - coverage), cell_color);
-    
-    return result;
-}
-
-float BlockRenderer::compute_color_error(const LinearColor& c1, const LinearColor& c2) const {
-    OKLab lab1 = ColorSpace::to_oklab(c1);
-    OKLab lab2 = ColorSpace::to_oklab(c2);
-    return OKLab::distance(lab1, lab2);
-}
-
-uint32_t BlockRenderer::select_block_glyph(float coverage) const {
-    if (coverage < 0.0625f) return BLOCK_SPACE;
-    if (coverage < 0.1875f) return BLOCK_LIGHT;
-    if (coverage < 0.4375f) return BLOCK_MEDIUM;
-    if (coverage < 0.6875f) return BLOCK_DARK;
-    return BLOCK_FULL;
-}
-
-uint32_t BlockRenderer::select_half_block(float top_lum, float bottom_lum) const {
-    float diff = top_lum - bottom_lum;
-    
-    if (std::abs(diff) < 0.05f) {
-        float avg = (top_lum + bottom_lum) / 2.0f;
-        return select_block_glyph(avg);
-    }
-    
-    if (diff > 0.0f) {
-        return BLOCK_UPPER;
-    } else {
-        return BLOCK_LOWER;
-    }
-}
-
-uint32_t BlockRenderer::select_quarter_block(const CellData& data) const {
-    if (!config_.use_quarter_blocks) {
-        return select_half_block(
-            (data.top_left_lum + data.top_right_lum) / 2.0f,
-            (data.bottom_left_lum + data.bottom_right_lum) / 2.0f
-        );
-    }
-    
-    float tl = data.top_left_lum;
-    float tr = data.top_right_lum;
-    float bl = data.bottom_left_lum;
-    float br = data.bottom_right_lum;
-    
-    float avg = (tl + tr + bl + br) / 4.0f;
-    
-    bool tl_high = tl > avg;
-    bool tr_high = tr > avg;
-    bool bl_high = bl > avg;
-    bool br_high = br > avg;
-    
-    int high_count = (tl_high ? 1 : 0) + (tr_high ? 1 : 0) + (bl_high ? 1 : 0) + (br_high ? 1 : 0);
-    
-    if (high_count == 0 || high_count == 4) {
-        return select_block_glyph(avg);
-    }
-    
-    if (high_count == 1) {
-        if (tl_high) return BLOCK_QUARTER_UL;
-        if (tr_high) return BLOCK_QUARTER_UR;
-        if (bl_high) return BLOCK_QUARTER_LL;
-        if (br_high) return BLOCK_QUARTER_LR;
-    }
-    
-    if (high_count == 3) {
-        if (!tl_high) return BLOCK_QUARTER_LR;
-        if (!tr_high) return BLOCK_QUARTER_LL;
-        if (!bl_high) return BLOCK_QUARTER_UR;
-        if (!br_high) return BLOCK_QUARTER_UL;
-    }
-    
-    if (tl_high && bl_high) return BLOCK_QUARTER_LEFT;
-    if (tr_high && br_high) return BLOCK_QUARTER_RIGHT;
-    
-    return select_half_block((tl + tr) / 2.0f, (bl + br) / 2.0f);
-}
-
 void BlockRenderer::quantize_colors(uint8_t& r, uint8_t& g, uint8_t& b) const {
     if (config_.color_quantization_levels <= 0) return;
     
-    int levels = config_.color_quantization_levels;
+    int levels = std::clamp(config_.color_quantization_levels, 2, 256);
     float step = 255.0f / (levels - 1);
     
     auto quantize = [levels, step](uint8_t v) -> uint8_t {
@@ -214,6 +101,10 @@ void BlockRenderer::quantize_colors(uint8_t& r, uint8_t& g, uint8_t& b) const {
 }
 
 std::string BlockRenderer::codepoint_to_utf8(uint32_t cp) const {
+    if (cp < 0x20 || (cp >= 0x7F && cp <= 0x9F) ||
+        (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) {
+        cp = 0xFFFD;
+    }
     std::string result;
     if (cp < 0x80) {
         result += static_cast<char>(cp);
@@ -234,93 +125,57 @@ std::string BlockRenderer::codepoint_to_utf8(uint32_t cp) const {
 }
 
 BlockCell BlockRenderer::render_cell(const CellData& data) const {
-    BlockCell result;
-
-    auto to_srgb8 = [](float lr, float lg, float lb, uint8_t& r, uint8_t& g, uint8_t& b) {
-        ColorSpace::linear_to_srgb({lr, lg, lb}, r, g, b);
+    // Bits describe top-left, top-right, bottom-left, and bottom-right coverage.
+    static constexpr std::array<uint32_t, 16> glyphs = {
+        0x0020, 0x2598, 0x259D, 0x2580, 0x2596, 0x258C, 0x259E, 0x259B,
+        0x2597, 0x259A, 0x2590, 0x259C, 0x2584, 0x2599, 0x259F, 0x2588
     };
-    
-    if (config_.use_quarter_blocks && 
-        std::abs(data.top_left_lum - data.top_right_lum) > 0.1f &&
-        std::abs(data.top_left_lum - data.bottom_left_lum) > 0.1f) {
-        
-        result.codepoint = select_quarter_block(data);
-        
-        float fg_r = 0.0f, fg_g = 0.0f, fg_b = 0.0f;
-        float bg_r = 0.0f, bg_g = 0.0f, bg_b = 0.0f;
-        int fg_count = 0, bg_count = 0;
-        
-        float avg = (data.top_left_lum + data.top_right_lum + 
-                    data.bottom_left_lum + data.bottom_right_lum) / 4.0f;
-        
-        auto add_color = [&](float r, float g, float b, float lum) {
-            if (lum > avg) {
-                fg_r += r; fg_g += g; fg_b += b;
-                fg_count++;
+    const std::array<LinearColor, 4> colors = {{
+        {data.top_left_r, data.top_left_g, data.top_left_b},
+        {data.top_right_r, data.top_right_g, data.top_right_b},
+        {data.bottom_left_r, data.bottom_left_g, data.bottom_left_b},
+        {data.bottom_right_r, data.bottom_right_g, data.bottom_right_b}
+    }};
+    BlockCell best;
+    float best_error = std::numeric_limits<float>::max();
+    for (unsigned mask = 0; mask < glyphs.size(); ++mask) {
+        const bool half = mask == 3 || mask == 5 || mask == 10 || mask == 12;
+        if (half && !config_.use_half_blocks) continue;
+        if (mask != 0 && mask != 15 && !half && !config_.use_quarter_blocks) continue;
+        LinearColor fg, bg;
+        int foreground_count = 0;
+        for (unsigned q = 0; q < colors.size(); ++q) {
+            if (mask & (1u << q)) {
+                fg = fg + colors[q];
+                ++foreground_count;
             } else {
-                bg_r += r; bg_g += g; bg_b += b;
-                bg_count++;
+                bg = bg + colors[q];
             }
-        };
-        
-        add_color(data.top_left_r, data.top_left_g, data.top_left_b, data.top_left_lum);
-        add_color(data.top_right_r, data.top_right_g, data.top_right_b, data.top_right_lum);
-        add_color(data.bottom_left_r, data.bottom_left_g, data.bottom_left_b, data.bottom_left_lum);
-        add_color(data.bottom_right_r, data.bottom_right_g, data.bottom_right_b, data.bottom_right_lum);
-        
-        if (fg_count > 0) {
-            to_srgb8(fg_r / fg_count, fg_g / fg_count, fg_b / fg_count, result.fg_r, result.fg_g, result.fg_b);
         }
-        
-        if (bg_count > 0) {
-            to_srgb8(bg_r / bg_count, bg_g / bg_count, bg_b / bg_count, result.bg_r, result.bg_g, result.bg_b);
+        if (foreground_count) fg = fg * (1.0f / foreground_count);
+        if (foreground_count < 4) bg = bg * (1.0f / (4 - foreground_count));
+        if (foreground_count == 0) fg = bg;
+        if (foreground_count == 4) bg = fg;
+
+        BlockCell candidate;
+        candidate.codepoint = glyphs[mask];
+        ColorSpace::linear_to_srgb(fg, candidate.fg_r, candidate.fg_g, candidate.fg_b);
+        ColorSpace::linear_to_srgb(bg, candidate.bg_r, candidate.bg_g, candidate.bg_b);
+        quantize_colors(candidate.fg_r, candidate.fg_g, candidate.fg_b);
+        quantize_colors(candidate.bg_r, candidate.bg_g, candidate.bg_b);
+        fg = ColorSpace::srgb_to_linear(candidate.fg_r, candidate.fg_g, candidate.fg_b);
+        bg = ColorSpace::srgb_to_linear(candidate.bg_r, candidate.bg_g, candidate.bg_b);
+        float error = 0.0f;
+        for (unsigned q = 0; q < colors.size(); ++q) {
+            const auto difference = colors[q] - ((mask & (1u << q)) ? fg : bg);
+            error += difference.r * difference.r + difference.g * difference.g + difference.b * difference.b;
         }
-    } else if (config_.use_half_blocks) {
-        float top_avg = (data.top_left_lum + data.top_right_lum) / 2.0f;
-        float bottom_avg = (data.bottom_left_lum + data.bottom_right_lum) / 2.0f;
-        
-        result.codepoint = select_half_block(top_avg, bottom_avg);
-        
-        float top_r = (data.top_left_r + data.top_right_r) / 2.0f;
-        float top_g = (data.top_left_g + data.top_right_g) / 2.0f;
-        float top_b = (data.top_left_b + data.top_right_b) / 2.0f;
-        
-        float bottom_r = (data.bottom_left_r + data.bottom_right_r) / 2.0f;
-        float bottom_g = (data.bottom_left_g + data.bottom_right_g) / 2.0f;
-        float bottom_b = (data.bottom_left_b + data.bottom_right_b) / 2.0f;
-        
-        if (result.codepoint == BLOCK_UPPER) {
-            to_srgb8(top_r, top_g, top_b, result.fg_r, result.fg_g, result.fg_b);
-            to_srgb8(bottom_r, bottom_g, bottom_b, result.bg_r, result.bg_g, result.bg_b);
-        } else if (result.codepoint == BLOCK_LOWER) {
-            to_srgb8(bottom_r, bottom_g, bottom_b, result.fg_r, result.fg_g, result.fg_b);
-            to_srgb8(top_r, top_g, top_b, result.bg_r, result.bg_g, result.bg_b);
-        } else {
-            to_srgb8(data.mean_r, data.mean_g, data.mean_b, result.fg_r, result.fg_g, result.fg_b);
-            result.bg_r = result.fg_r;
-            result.bg_g = result.fg_g;
-            result.bg_b = result.fg_b;
-        }
-    } else {
-        result.codepoint = select_block_glyph(data.mean_luminance);
-        
-        to_srgb8(data.mean_r, data.mean_g, data.mean_b, result.fg_r, result.fg_g, result.fg_b);
-        
-        if (result.codepoint == BLOCK_SPACE) {
-            result.bg_r = result.bg_g = result.bg_b = 0;
-        } else if (result.codepoint == BLOCK_FULL) {
-            result.bg_r = result.fg_r;
-            result.bg_g = result.fg_g;
-            result.bg_b = result.fg_b;
-        } else {
-            result.bg_r = result.bg_g = result.bg_b = 0;
+        if (error < best_error) {
+            best_error = error;
+            best = candidate;
         }
     }
-    
-    quantize_colors(result.fg_r, result.fg_g, result.fg_b);
-    quantize_colors(result.bg_r, result.bg_g, result.bg_b);
-    
-    return result;
+    return best;
 }
 
 std::vector<BlockCell> BlockRenderer::render_frame(const std::vector<CellData>& cells) const {
@@ -339,161 +194,77 @@ void BlockRenderer::spectral_quantize_frame(std::vector<BlockCell>& cells, int p
     palette_size = std::clamp(palette_size, 2, 32);
     max_samples = std::clamp(max_samples, 8, 2048);
     iterations = std::clamp(iterations, 1, 64);
+    const auto& first = cells.front();
+    if (std::all_of(cells.begin(), cells.end(), [&](const BlockCell& cell) {
+        return cell.fg_r == first.fg_r && cell.fg_g == first.fg_g && cell.fg_b == first.fg_b &&
+               cell.bg_r == first.fg_r && cell.bg_g == first.fg_g && cell.bg_b == first.fg_b;
+    })) return;
 
-    struct ColorPoint {
-        float r = 0.0f, g = 0.0f, b = 0.0f;
-    };
-    std::vector<ColorPoint> samples;
-    samples.reserve(static_cast<size_t>(max_samples));
-
-    int stride = std::max(1, static_cast<int>((cells.size() * 2) / max_samples));
-    int counter = 0;
-    for (const auto& c : cells) {
-        if (counter % stride == 0) {
-            samples.push_back({c.fg_r / 255.0f, c.fg_g / 255.0f, c.fg_b / 255.0f});
-            if (static_cast<int>(samples.size()) >= max_samples) break;
-            samples.push_back({c.bg_r / 255.0f, c.bg_g / 255.0f, c.bg_b / 255.0f});
-            if (static_cast<int>(samples.size()) >= max_samples) break;
-        }
-        counter++;
+    const size_t total_colors = cells.size() * 2;
+    const size_t sample_count = std::min(total_colors, static_cast<size_t>(max_samples));
+    std::vector<OKLab> samples;
+    samples.reserve(sample_count);
+    for (size_t i = 0; i < sample_count; ++i) {
+        const size_t index = i * (total_colors - 1) / (sample_count - 1);
+        const auto& cell = cells[index / 2];
+        samples.push_back(index % 2 == 0
+            ? ColorSpace::srgb_to_oklab(cell.fg_r, cell.fg_g, cell.fg_b)
+            : ColorSpace::srgb_to_oklab(cell.bg_r, cell.bg_g, cell.bg_b));
     }
-
-    int n = static_cast<int>(samples.size());
-    if (n < palette_size) return;
-
-    const float sigma2 = 2.0f * 0.20f * 0.20f;
-    std::vector<float> w(static_cast<size_t>(n) * n, 0.0f);
-    std::vector<float> d(n, 0.0f);
-    for (int i = 0; i < n; ++i) {
-        for (int j = i; j < n; ++j) {
-            float dr = samples[i].r - samples[j].r;
-            float dg = samples[i].g - samples[j].g;
-            float db = samples[i].b - samples[j].b;
-            float dist2 = dr * dr + dg * dg + db * db;
-            float a = std::exp(-dist2 / sigma2);
-            w[static_cast<size_t>(i) * n + j] = a;
-            w[static_cast<size_t>(j) * n + i] = a;
-            d[i] += a;
-            if (i != j) d[j] += a;
-        }
-    }
-
-    std::vector<float> principal(n, 1.0f / std::sqrt(static_cast<float>(n)));
-    std::vector<float> fiedler(n, 0.0f);
-    for (int i = 0; i < n; ++i) {
-        float v = (samples[i].r + samples[i].g + samples[i].b) / 3.0f;
-        fiedler[i] = v - 0.5f;
-    }
-
-    auto mat_vec = [&](const std::vector<float>& x, std::vector<float>& y) {
-        std::fill(y.begin(), y.end(), 0.0f);
-        for (int i = 0; i < n; ++i) {
-            float di = 1.0f / std::sqrt(std::max(d[i], 1e-6f));
-            float sum = 0.0f;
-            for (int j = 0; j < n; ++j) {
-                float dj = 1.0f / std::sqrt(std::max(d[j], 1e-6f));
-                sum += (di * w[static_cast<size_t>(i) * n + j] * dj) * x[j];
-            }
-            y[i] = sum;
-        }
+    const auto distance_squared = [](const OKLab& a, const OKLab& b) {
+        const float dL = a.L - b.L, da = a.a - b.a, db = a.b - b.b;
+        return dL * dL + da * da + db * db;
     };
 
-    std::vector<float> tmp(n, 0.0f);
-    for (int it = 0; it < 18; ++it) {
-        mat_vec(principal, tmp);
-        float norm = 0.0f;
-        for (float v : tmp) norm += v * v;
-        norm = std::sqrt(std::max(norm, 1e-8f));
-        for (int i = 0; i < n; ++i) principal[i] = tmp[i] / norm;
-    }
-
-    for (int it = 0; it < 24; ++it) {
-        mat_vec(fiedler, tmp);
-        float dot = 0.0f;
-        for (int i = 0; i < n; ++i) dot += tmp[i] * principal[i];
-        for (int i = 0; i < n; ++i) tmp[i] -= dot * principal[i];
-        float norm = 0.0f;
-        for (float v : tmp) norm += v * v;
-        norm = std::sqrt(std::max(norm, 1e-8f));
-        for (int i = 0; i < n; ++i) fiedler[i] = tmp[i] / norm;
-    }
-
-    float min_e = *std::min_element(fiedler.begin(), fiedler.end());
-    float max_e = *std::max_element(fiedler.begin(), fiedler.end());
-    if (max_e - min_e < 1e-6f) return;
-
-    std::vector<float> center_e(palette_size, 0.0f);
-    std::vector<ColorPoint> center_c(palette_size);
-    for (int k = 0; k < palette_size; ++k) {
-        float t = (k + 0.5f) / palette_size;
-        center_e[k] = min_e + t * (max_e - min_e);
-    }
-    std::vector<int> assign(n, 0);
-
-    for (int it = 0; it < iterations; ++it) {
-        for (int i = 0; i < n; ++i) {
-            int best = 0;
-            float best_dist = std::numeric_limits<float>::max();
-            for (int k = 0; k < palette_size; ++k) {
-                float dist = std::abs(fiedler[i] - center_e[k]);
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best = k;
-                }
-            }
-            assign[i] = best;
+    std::vector<OKLab> centers{samples.front()};
+    std::vector<float> nearest(samples.size(), std::numeric_limits<float>::max());
+    while (centers.size() < static_cast<size_t>(palette_size)) {
+        size_t farthest = 0;
+        for (size_t i = 0; i < samples.size(); ++i) {
+            nearest[i] = std::min(nearest[i], distance_squared(samples[i], centers.back()));
+            if (nearest[i] > nearest[farthest]) farthest = i;
         }
-
-        std::vector<float> sum_e(palette_size, 0.0f);
-        std::vector<float> sum_r(palette_size, 0.0f);
-        std::vector<float> sum_g(palette_size, 0.0f);
-        std::vector<float> sum_b(palette_size, 0.0f);
-        std::vector<int> count(palette_size, 0);
-        for (int i = 0; i < n; ++i) {
-            int k = assign[i];
-            sum_e[k] += fiedler[i];
-            sum_r[k] += samples[i].r;
-            sum_g[k] += samples[i].g;
-            sum_b[k] += samples[i].b;
-            count[k]++;
-        }
-        for (int k = 0; k < palette_size; ++k) {
-            if (count[k] > 0) {
-                float inv = 1.0f / count[k];
-                center_e[k] = sum_e[k] * inv;
-                center_c[k] = {sum_r[k] * inv, sum_g[k] * inv, sum_b[k] * inv};
-            }
-        }
+        if (nearest[farthest] <= 1e-12f) break;
+        centers.push_back(samples[farthest]);
     }
-
-    auto nearest_palette = [&](uint8_t r8, uint8_t g8, uint8_t b8) -> std::tuple<uint8_t, uint8_t, uint8_t> {
-        float r = r8 / 255.0f;
-        float g = g8 / 255.0f;
-        float b = b8 / 255.0f;
-        int best = 0;
-        float best_dist = std::numeric_limits<float>::max();
-        for (int k = 0; k < palette_size; ++k) {
-            float dr = r - center_c[k].r;
-            float dg = g - center_c[k].g;
-            float db = b - center_c[k].b;
-            float dist = dr * dr + dg * dg + db * db;
-            if (dist < best_dist) {
-                best_dist = dist;
-                best = k;
-            }
+    const auto nearest_center = [&](const OKLab& sample) {
+        size_t best = 0;
+        for (size_t k = 1; k < centers.size(); ++k) {
+            if (distance_squared(sample, centers[k]) < distance_squared(sample, centers[best])) best = k;
         }
-        return {
-            static_cast<uint8_t>(std::clamp(center_c[best].r * 255.0f, 0.0f, 255.0f)),
-            static_cast<uint8_t>(std::clamp(center_c[best].g * 255.0f, 0.0f, 255.0f)),
-            static_cast<uint8_t>(std::clamp(center_c[best].b * 255.0f, 0.0f, 255.0f))
-        };
+        return best;
     };
 
-    for (auto& c : cells) {
-        auto [fr, fg, fb] = nearest_palette(c.fg_r, c.fg_g, c.fg_b);
-        auto [br, bg, bb] = nearest_palette(c.bg_r, c.bg_g, c.bg_b);
-        c.fg_r = fr; c.fg_g = fg; c.fg_b = fb;
-        c.bg_r = br; c.bg_g = bg; c.bg_b = bb;
+    std::vector<size_t> assignments(samples.size(), centers.size());
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        std::vector<OKLab> sums(centers.size());
+        std::vector<int> counts(centers.size(), 0);
+        bool changed = false;
+        for (size_t i = 0; i < samples.size(); ++i) {
+            const size_t k = nearest_center(samples[i]);
+            changed |= assignments[i] != k;
+            assignments[i] = k;
+            sums[k].L += samples[i].L;
+            sums[k].a += samples[i].a;
+            sums[k].b += samples[i].b;
+            ++counts[k];
+        }
+        for (size_t k = 0; k < centers.size(); ++k) {
+            if (counts[k] > 0) {
+                const float inv = 1.0f / counts[k];
+                centers[k] = {sums[k].L * inv, sums[k].a * inv, sums[k].b * inv};
+            }
+        }
+        if (!changed) break;
+    }
+
+    const auto quantize = [&](uint8_t& r, uint8_t& g, uint8_t& b) {
+        const size_t k = nearest_center(ColorSpace::srgb_to_oklab(r, g, b));
+        ColorSpace::oklab_to_srgb(centers[k], r, g, b);
+    };
+    for (auto& cell : cells) {
+        quantize(cell.fg_r, cell.fg_g, cell.fg_b);
+        quantize(cell.bg_r, cell.bg_g, cell.bg_b);
     }
 }
 
@@ -513,7 +284,7 @@ std::string BlockRenderer::render_to_ansi(const std::vector<BlockCell>& cells, C
             const BlockCell& cell = cells[idx];
             
             bool skip = false;
-            if (prev_cells && idx < static_cast<int>(prev_cells->size())) {
+            if (mode != ColorMode::None && prev_cells && idx < static_cast<int>(prev_cells->size())) {
                 const BlockCell& prev = (*prev_cells)[idx];
                 skip = (cell.codepoint == prev.codepoint &&
                         cell.fg_r == prev.fg_r && cell.fg_g == prev.fg_g && cell.fg_b == prev.fg_b &&
@@ -521,7 +292,7 @@ std::string BlockRenderer::render_to_ansi(const std::vector<BlockCell>& cells, C
             }
             
             if (skip) {
-                out << " ";
+                out << "\033[1C";
                 continue;
             }
             
@@ -571,7 +342,8 @@ std::string BlockRenderer::render_to_ansi(const std::vector<BlockCell>& cells, C
             out << codepoint_to_utf8(cell.codepoint);
         }
         
-        out << "\033[0m\n";
+        if (mode != ColorMode::None) out << "\033[0m";
+        out << '\n';
         need_reset = true;
         last_fg_r = 255; last_fg_g = 255; last_fg_b = 255;
         last_bg_r = 0; last_bg_g = 0; last_bg_b = 0;

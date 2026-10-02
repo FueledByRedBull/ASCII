@@ -20,6 +20,60 @@ target_link_libraries(test_terminal_renderer PRIVATE ascii-engine-core)
 
 add_test(NAME TerminalRendererTest COMMAND test_terminal_renderer)
 
+add_executable(test_analysis_regressions test_analysis_regressions.cpp)
+target_link_libraries(test_analysis_regressions PRIVATE ascii-engine-core)
+add_test(NAME AnalysisRegressionsTest COMMAND test_analysis_regressions)
+
+add_executable(test_mapping_regressions test_mapping_regressions.cpp)
+target_link_libraries(test_mapping_regressions PRIVATE ascii-engine-core)
+add_test(NAME MappingRegressionsTest COMMAND test_mapping_regressions)
+
+add_executable(test_color_regressions test_color_regressions.cpp)
+target_link_libraries(test_color_regressions PRIVATE ascii-engine-core)
+add_test(NAME ColorRegressionsTest COMMAND test_color_regressions)
+
+add_executable(test_bitmap_regressions test_bitmap_regressions.cpp)
+target_link_libraries(test_bitmap_regressions PRIVATE ascii-engine-core)
+add_test(NAME BitmapRegressionsTest COMMAND test_bitmap_regressions)
+
+add_executable(test_boundary_regressions test_boundary_regressions.cpp)
+target_link_libraries(test_boundary_regressions PRIVATE ascii-engine-core)
+add_test(NAME BoundaryRegressionsTest COMMAND test_boundary_regressions)
+
+add_executable(test_descriptor_regressions test_descriptor_regressions.cpp)
+target_link_libraries(test_descriptor_regressions PRIVATE ascii-engine-core)
+add_test(NAME DescriptorRegressionsTest COMMAND test_descriptor_regressions)
+
+add_executable(test_aggregation_regressions test_aggregation_regressions.cpp)
+target_link_libraries(test_aggregation_regressions PRIVATE ascii-engine-core)
+add_test(NAME AggregationRegressionsTest COMMAND test_aggregation_regressions)
+
+add_executable(test_edge_regressions test_edge_regressions.cpp)
+target_link_libraries(test_edge_regressions PRIVATE ascii-engine-core)
+add_test(NAME EdgeRegressionsTest COMMAND test_edge_regressions)
+
+add_executable(test_motion_regressions test_motion_regressions.cpp)
+target_link_libraries(test_motion_regressions PRIVATE ascii-engine-core)
+add_test(NAME MotionRegressionsTest COMMAND test_motion_regressions)
+
+add_executable(test_state_regressions test_state_regressions.cpp)
+target_link_libraries(test_state_regressions PRIVATE ascii-engine-core)
+add_test(NAME StateRegressionsTest COMMAND test_state_regressions)
+
+add_executable(test_selector_regressions test_selector_regressions.cpp)
+target_link_libraries(test_selector_regressions PRIVATE ascii-engine-core)
+add_test(NAME SelectorRegressionsTest COMMAND test_selector_regressions)
+
+add_executable(test_source_regressions test_source_regressions.cpp)
+target_include_directories(test_source_regressions PRIVATE ${LIBAV_INCLUDE_DIRS})
+target_link_libraries(test_source_regressions PRIVATE ascii-engine-core)
+add_test(NAME SourceRegressionsTest COMMAND test_source_regressions)
+
+add_executable(test_audio_regressions test_audio_regressions.cpp)
+target_include_directories(test_audio_regressions PRIVATE ${SDL2_INCLUDE_DIRS} ${LIBAV_INCLUDE_DIRS})
+target_link_libraries(test_audio_regressions PRIVATE ascii-engine-core)
+add_test(NAME AudioRegressionsTest COMMAND test_audio_regressions)
+
 add_executable(test_contours test_contours.cpp)
 target_link_libraries(test_contours PRIVATE ascii-engine-core)
 
@@ -149,15 +203,44 @@ if(TARGET ascii-engine)
         ${media_truncated} --cols 16 --rows 8 --fast --no-audio -o ${CMAKE_CURRENT_BINARY_DIR}/truncated.txt)
     set_tests_properties(TruncatedMediaFailure PROPERTIES DEPENDS CreateTruncatedMedia)
 
+    function(add_runtime_contract name case input)
+        add_test(NAME ${name} COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:ascii-engine>"
+            "-DCASE=${case}" "-DINPUT=${input}"
+            "-DMEDIA_HELPER=$<TARGET_FILE:test_media_fixture>"
+            "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/${name}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime_contracts.cmake)
+    endfunction()
+    add_runtime_contract(InputOutputCollision collision ${media_fixture})
+    set_tests_properties(InputOutputCollision PROPERTIES DEPENDS GenerateMediaFixture)
+    add_runtime_contract(NumberedTextCollision numbered-collision ${media_fixture})
+    set_tests_properties(NumberedTextCollision PROPERTIES DEPENDS GenerateMediaFixture)
+    add_runtime_contract(FailedDecodePreservesOutput preserve ${media_truncated})
+    set_tests_properties(FailedDecodePreservesOutput PROPERTIES DEPENDS CreateTruncatedMedia)
+    add_runtime_contract(ConfigColorOutput config-color ${CMAKE_SOURCE_DIR}/images/potsepis.png)
+    add_runtime_contract(DebugReplayOutput debug-replay ${CMAKE_SOURCE_DIR}/images/potsepis.png)
+    add_runtime_contract(DirectoryOutputRejected destination-directory ${CMAKE_SOURCE_DIR}/images/potsepis.png)
+    add_runtime_contract(SequenceOutputCollision sequence-collision ${CMAKE_SOURCE_DIR}/images/potsepis.png)
+    add_runtime_contract(UnicodePathContracts unicode-paths ${media_fixture})
+    set_tests_properties(UnicodePathContracts PROPERTIES DEPENDS GenerateMediaFixture)
+
     add_test(NAME GenerateGoldenReplay
         COMMAND $<TARGET_FILE:test_media_fixture> generate-replay ${golden_replay})
     add_test(NAME GoldenReplayTextExport
         COMMAND $<TARGET_FILE:ascii-engine> --play-replay ${golden_replay} -o ${golden_replay_text})
     set_tests_properties(GoldenReplayTextExport PROPERTIES DEPENDS GenerateGoldenReplay)
+    add_runtime_contract(ReplayNumberedTextCollision replay-numbered-collision ${golden_replay})
+    set_tests_properties(ReplayNumberedTextCollision PROPERTIES DEPENDS GenerateGoldenReplay)
     add_test(NAME VerifyGoldenReplayText
         COMMAND $<TARGET_FILE:test_media_fixture> verify-replay-text ${golden_replay_text})
     set_tests_properties(VerifyGoldenReplayText PROPERTIES DEPENDS GoldenReplayTextExport)
     add_test(NAME EncoderPartialFailure
         COMMAND $<TARGET_FILE:test_media_fixture> verify-encoder-partial-failure
             ${CMAKE_CURRENT_BINARY_DIR}/partial_failure.mkv)
+    add_test(NAME EncoderUnfinishedOutput
+        COMMAND $<TARGET_FILE:test_media_fixture> verify-encoder-unfinished
+            ${CMAKE_CURRENT_BINARY_DIR}/unfinished.mkv)
+    add_test(NAME EncoderGeometry
+        COMMAND $<TARGET_FILE:test_media_fixture> verify-encoder-geometry
+            ${CMAKE_CURRENT_BINARY_DIR}/encoder_geometry.mkv)
 endif()

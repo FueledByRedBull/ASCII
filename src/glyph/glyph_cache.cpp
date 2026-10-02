@@ -1,4 +1,5 @@
 #include "glyph_cache.hpp"
+#include "core/cell_stats.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -9,9 +10,33 @@ namespace {
 constexpr int kFreqBins = 8;
 constexpr int kTextureBins = 8;
 
-constexpr std::array<uint32_t, 15> kRendererGlyphs = {
+std::vector<float> compute_orientation_signature(const ascii::GlyphBitmap& bitmap,
+                                                 const ascii::EdgeDetector::Config& config) {
+    ascii::FloatImage coverage(bitmap.width, bitmap.height);
+    for (size_t i = 0; i < bitmap.pixels.size(); ++i) coverage.data()[i] = bitmap.pixels[i] / 255.0f;
+    ascii::EdgeDetector detector(config);
+    ascii::GradientData gradients;
+    if (config.multi_scale) {
+        auto selected = detector.compute_multi_scale_gradients(coverage);
+        gradients.gx = std::move(selected.gx);
+        gradients.gy = std::move(selected.gy);
+    } else {
+        gradients = detector.compute_gradients(coverage);
+    }
+    ascii::CellStatsAggregator::Config cell_config;
+    cell_config.cell_width = bitmap.width;
+    cell_config.cell_height = bitmap.height;
+    cell_config.enable_frequency_signature = false;
+    cell_config.enable_texture_signature = false;
+    const auto stats = ascii::CellStatsAggregator(cell_config).compute(coverage, {}, nullptr, &gradients);
+    return {stats[0].orientation_histogram, stats[0].orientation_histogram + 8};
+}
+
+constexpr std::array<uint32_t, 32> kRendererGlyphs = {
     0x0020, 0x2580, 0x2584, 0x2588, 0x258C, 0x2590, 0x2591,
-    0x2592, 0x2593, 0x2596, 0x2597, 0x2598, 0x2599, 0x259D, 0x259F
+    0x2592, 0x2593, 0x2596, 0x2597, 0x2598, 0x2599, 0x259A,
+    0x259B, 0x259C, 0x259D, 0x259E, 0x259F, '-', '|', '/', '\\', '+',
+    '.', ':', '=', '*', '#', '%', '@', 'O'
 };
 
 uint8_t bilinear_sample(const ascii::GlyphBitmap& src, float x, float y) {
@@ -56,6 +81,10 @@ ascii::GlyphBitmap procedural_block(uint32_t codepoint, int width, int height) {
                 case 0x2598: on = x < half_x && y < half_y; break;
                 case 0x259D: on = x >= half_x && y < half_y; break;
                 case 0x2599: on = x < half_x || y >= half_y; break;
+                case 0x259A: on = (x < half_x) == (y < half_y); break;
+                case 0x259B: on = x < half_x || y < half_y; break;
+                case 0x259C: on = x >= half_x || y < half_y; break;
+                case 0x259E: on = (x < half_x) != (y < half_y); break;
                 case 0x259F: on = x >= half_x || y >= half_y; break;
                 default: break;
             }
@@ -182,12 +211,15 @@ namespace ascii {
 
 GlyphCache::GlyphCache() = default;
 
-bool GlyphCache::initialize(FontLoader* loader, const std::vector<uint32_t>& codepoints, int target_width, int target_height) {
-    if (!loader) return false;
+bool GlyphCache::initialize(FontLoader* loader, const std::vector<uint32_t>& codepoints, int target_width, int target_height,
+                            const EdgeDetector::Config& orientation_config) {
+    if (!loader || !loader->is_loaded() || target_width <= 0 || target_height <= 0 ||
+        target_width > 1024 || target_height > 1024) return false;
     
     loader_ = loader;
     cell_width_ = target_width;
     cell_height_ = target_height;
+    orientation_config_ = orientation_config;
     
     bitmaps_.clear();
     stats_.clear();
@@ -204,9 +236,12 @@ bool GlyphCache::initialize(FontLoader* loader, const std::vector<uint32_t>& cod
         render_and_analyze(cp);
     }
     
-    brightness_sorted_.reserve(stats_.size());
-    for (const auto& [cp, _] : stats_) {
-        brightness_sorted_.push_back(cp);
+    brightness_sorted_.reserve(codepoints.size());
+    for (uint32_t cp : codepoints) {
+        if (stats_.find(cp) != stats_.end() &&
+            std::find(brightness_sorted_.begin(), brightness_sorted_.end(), cp) == brightness_sorted_.end()) {
+            brightness_sorted_.push_back(cp);
+        }
     }
     
     std::sort(brightness_sorted_.begin(), brightness_sorted_.end(), [this](uint32_t a, uint32_t b) {
@@ -224,7 +259,7 @@ bool GlyphCache::initialize(FontLoader* loader, const std::vector<uint32_t>& cod
         }
     }
     
-    return true;
+    return !brightness_sorted_.empty();
 }
 
 const GlyphStats* GlyphCache::get_stats(uint32_t codepoint) const {
@@ -237,20 +272,21 @@ const GlyphBitmap* GlyphCache::get_bitmap(uint32_t codepoint) const {
     return it != bitmaps_.end() ? &it->second : nullptr;
 }
 
-std::vector<uint32_t> GlyphCache::get_by_brightness() const {
+const std::vector<uint32_t>& GlyphCache::get_by_brightness() const {
     return brightness_sorted_;
 }
 
-std::vector<uint32_t> GlyphCache::get_edge_glyphs() const {
+const std::vector<uint32_t>& GlyphCache::get_edge_glyphs() const {
     return edge_glyphs_;
 }
 
 void GlyphCache::render_and_analyze(uint32_t codepoint) {
     if (!loader_) return;
 
-    GlyphBitmap src = loader_->render_glyph(codepoint);
-    const bool is_renderer_block = std::find(kRendererGlyphs.begin() + 1, kRendererGlyphs.end(), codepoint) !=
-                                   kRendererGlyphs.end();
+    const bool is_renderer_block = codepoint >= 0x2580 && codepoint <= 0x259F &&
+        std::find(kRendererGlyphs.begin(), kRendererGlyphs.end(), codepoint) != kRendererGlyphs.end();
+    if (!is_renderer_block && codepoint != 0x0020 && !loader_->has_glyph(codepoint)) return;
+    GlyphBitmap src = is_renderer_block ? GlyphBitmap{} : loader_->render_glyph(codepoint);
     if (src.empty() && codepoint != 0x0020 && !is_renderer_block) return;
 
     GlyphBitmap scaled;
@@ -295,7 +331,7 @@ void GlyphCache::render_and_analyze(uint32_t codepoint) {
     GlyphStats stats;
     stats.codepoint = codepoint;
     stats.brightness = bitmaps_[codepoint].brightness();
-    stats.orientation_hist = bitmaps_[codepoint].orientation_histogram(8);
+    stats.orientation_hist = compute_orientation_signature(bitmaps_[codepoint], orientation_config_);
     stats.contrast = 0.0f;
     stats.frequency_signature = compute_frequency_signature(bitmaps_[codepoint]);
     stats.texture_signature = compute_texture_signature(bitmaps_[codepoint]);

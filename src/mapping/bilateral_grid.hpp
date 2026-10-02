@@ -9,22 +9,23 @@ class BilateralGrid {
 public:
     struct Config {
         bool enabled = false;
-        int spatial_bins = 32;
-        int range_bins = 16;
-        float spatial_sigma = 2.0f;
-        float range_sigma = 0.15f;
+        int spatial_bins = 32; // 2..256
+        int range_bins = 16; // 4..64
+        float spatial_sigma = 2.0f; // 0..16; zero disables spatial smoothing.
+        float range_sigma = 0.15f; // 0..1; zero disables range smoothing.
     };
 
     struct Sample {
         float r = 0.0f;
         float g = 0.0f;
         float b = 0.0f;
+        bool has_support = false;
     };
 
     BilateralGrid() = default;
     explicit BilateralGrid(const Config& cfg) : config_(cfg) {}
 
-    void set_config(const Config& cfg) { config_ = cfg; }
+    void set_config(const Config& cfg) { config_ = cfg; built_ = false; }
     const Config& config() const { return config_; }
 
     void build(const std::vector<CellStats>& cells, int cols, int rows);

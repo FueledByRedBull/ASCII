@@ -3,6 +3,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "../src/render/terminal_renderer.hpp"
 
@@ -79,12 +82,62 @@ void test_color_mode_change_forces_reset_and_repaint() {
     assert(truecolor.find("\033[38;2;255;0;0m") != std::string::npos);
 }
 
+void test_blank_cells_repaint_and_short_frames_extend() {
+    Terminal terminal;
+    TerminalRenderer renderer(terminal, ColorMode::None);
+    renderer.set_grid_size(2, 1);
+    const ASCIICell blank;
+    assert(renderer.render_to_string({blank}).find(' ') != std::string::npos);
+    auto extended = renderer.render_to_string({blank, make_cell('B', 255, 255, 255)});
+    assert(extended.find("\033[1;2HB") != std::string::npos);
+    assert(renderer.render_to_string({blank, make_cell('B', 255, 255, 255)}).empty());
+
+    renderer.set_color_mode(ColorMode::Truecolor);
+    const auto repaint = renderer.render_to_string({blank, blank});
+    assert(repaint.find("  ") != std::string::npos);
+    renderer.set_grid_size(1, 1);
+    assert(renderer.render_to_string({blank}).find(' ') != std::string::npos);
+}
+
+void test_nonprinting_codepoints_render_as_replacement_glyphs() {
+    Terminal terminal;
+    TerminalRenderer renderer(terminal, ColorMode::None);
+    renderer.set_grid_size(1, 1);
+    for (uint32_t codepoint : {0u, 9u, 10u, 13u, 27u, 127u, 128u, 159u, 0xD800u, 0x110000u}) {
+        const auto output = renderer.render_to_string({make_cell(codepoint, 255, 255, 255)});
+        assert(output == "\033[1;1H\xEF\xBF\xBD");
+    }
+}
+
+void test_console_state_is_restored() {
+#ifdef _WIN32
+    const HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD original_mode = 0;
+    if (!GetConsoleMode(handle, &original_mode)) return;
+    const auto original_codepage = GetConsoleOutputCP();
+    {
+        Terminal terminal;
+        DWORD active_mode = 0;
+        assert(GetConsoleMode(handle, &active_mode));
+        assert((active_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0);
+        assert(GetConsoleOutputCP() == CP_UTF8);
+    }
+    DWORD restored_mode = 0;
+    assert(GetConsoleMode(handle, &restored_mode));
+    assert(restored_mode == original_mode);
+    assert(GetConsoleOutputCP() == original_codepage);
+#endif
+}
+
 }  // namespace
 
 int main() {
     test_glyph_and_foreground_changes_emit();
     test_blockart_background_change_emits_background_code();
     test_color_mode_change_forces_reset_and_repaint();
+    test_blank_cells_repaint_and_short_frames_extend();
+    test_nonprinting_codepoints_render_as_replacement_glyphs();
+    test_console_state_is_restored();
     std::cout << "Terminal renderer tests passed\n";
     return 0;
 }

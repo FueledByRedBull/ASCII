@@ -7,6 +7,8 @@
 #include <iomanip>
 #include <functional>
 #include <cstring>
+#include <cmath>
+#include <type_traits>
 
 #ifdef _WIN32
     #include <shlobj.h>
@@ -100,6 +102,37 @@ std::string Config::default_config_path() {
 }
 
 bool Config::validate(std::string& error) const {
+    if (input.mode != "file") {
+        error = "input.mode must be 'file'; the source URI selects the input type";
+        return false;
+    }
+    if (output.mode != "terminal") {
+        error = "output.mode must be 'terminal'; the output target selects the output type";
+        return false;
+    }
+    if (color.quantization != "oklab") {
+        error = "color.quantization must be 'oklab'";
+        return false;
+    }
+    for (float value : {
+             grid.char_aspect, grid.quad_tree_variance_threshold,
+             edge.low_threshold, edge.high_threshold, edge.blur_sigma,
+             edge.scale_sigma_0, edge.scale_sigma_1, edge.scale_variance_floor, edge.scale_variance_ceil,
+             edge.diffusion_kappa, edge.diffusion_lambda, edge.dark_scene_floor, edge.global_percentile,
+             edge.contour_min_occupancy, edge.contour_dominance_ratio, edge.contour_intersection_ratio,
+             edge.contour_dog_sigma_inner, edge.contour_dog_sigma_outer,
+             temporal.alpha, temporal.transition_penalty, temporal.edge_enter_threshold, temporal.edge_exit_threshold,
+             temporal.motion_reuse_scene_threshold, temporal.motion_reuse_confidence_decay,
+             temporal.motion_still_scene_threshold, temporal.wavelet_strength, temporal.phase_blend,
+             temporal.motion_phase_scene_trigger, selector.weight_brightness, selector.weight_orientation,
+             selector.weight_contrast, selector.weight_frequency, selector.weight_texture,
+             color.dither_error_clamp, color.halftone_strength,
+             color.bilateral_spatial_sigma, color.bilateral_range_sigma}) {
+        if (!std::isfinite(value)) {
+            error = "floating-point configuration values must be finite";
+            return false;
+        }
+    }
     if (grid.cols < 0 || grid.cols > 1000) {
         error = "grid.cols must be between 0 and 1000";
         return false;
@@ -114,6 +147,10 @@ bool Config::validate(std::string& error) const {
     }
     if (grid.cell_height < 1 || grid.cell_height > 64) {
         error = "grid.cell_height must be between 1 and 64";
+        return false;
+    }
+    if (grid.char_aspect < 1.0f / 32.0f || grid.char_aspect > 64.0f) {
+        error = "grid.char_aspect must be between 1/32 and 64";
         return false;
     }
     const uint64_t pixel_width = static_cast<uint64_t>(grid.cols) * grid.cell_width;
@@ -150,8 +187,9 @@ bool Config::validate(std::string& error) const {
         error = "edge.low_threshold cannot exceed edge.high_threshold";
         return false;
     }
-    if (edge.scale_sigma_0 <= 0.0f || edge.scale_sigma_1 <= 0.0f) {
-        error = "edge.scale_sigma_0 and edge.scale_sigma_1 must be > 0";
+    if (edge.scale_sigma_0 <= 0.0f || edge.scale_sigma_0 > 10.0f ||
+        edge.scale_sigma_1 <= 0.0f || edge.scale_sigma_1 > 10.0f) {
+        error = "edge.scale_sigma_0 and edge.scale_sigma_1 must be > 0 and <= 10";
         return false;
     }
     if (edge.scale_variance_floor < 0.0f || edge.scale_variance_ceil <= edge.scale_variance_floor) {
@@ -194,9 +232,9 @@ bool Config::validate(std::string& error) const {
         error = "edge contour ratios must be >= 1.0";
         return false;
     }
-    if (edge.contour_dog_sigma_inner <= 0.0f || edge.contour_dog_sigma_outer <= 0.0f ||
+    if (edge.contour_dog_sigma_inner < 0.1f || edge.contour_dog_sigma_outer > 10.0f ||
         edge.contour_dog_sigma_inner >= edge.contour_dog_sigma_outer) {
-        error = "edge contour DoG sigmas must be > 0 and inner < outer";
+        error = "edge contour DoG sigmas must be between 0.1 and 10 with inner < outer";
         return false;
     }
     if (temporal.alpha < 0.0f || temporal.alpha > 1.0f) {
@@ -205,6 +243,11 @@ bool Config::validate(std::string& error) const {
     }
     if (temporal.transition_penalty < 0.0f || temporal.transition_penalty > 1.0f) {
         error = "temporal.transition_penalty must be between 0.0 and 1.0";
+        return false;
+    }
+    if (temporal.edge_exit_threshold < 0.0f || temporal.edge_enter_threshold > 1.0f ||
+        temporal.edge_exit_threshold > temporal.edge_enter_threshold) {
+        error = "temporal edge thresholds must be between 0 and 1 with exit <= enter";
         return false;
     }
     if (temporal.motion_solve_divisor < 1 || temporal.motion_solve_divisor > 8) {
@@ -227,8 +270,8 @@ bool Config::validate(std::string& error) const {
         error = "temporal.motion_still_scene_threshold must be between 0.0 and 1.0";
         return false;
     }
-    if (temporal.motion_cap_pixels < 0) {
-        error = "temporal.motion_cap_pixels must be non-negative";
+    if (temporal.motion_cap_pixels < 0 || temporal.motion_cap_pixels > 256) {
+        error = "temporal.motion_cap_pixels must be between 0 and 256";
         return false;
     }
     if (temporal.wavelet_strength < 0.0f || temporal.wavelet_strength > 1.0f) {
@@ -263,8 +306,8 @@ bool Config::validate(std::string& error) const {
     }
     float total_weight = selector.weight_brightness + selector.weight_orientation +
                          selector.weight_contrast + selector.weight_frequency + selector.weight_texture;
-    if (total_weight < 0.001f) {
-        error = "selector weights must sum to a positive value";
+    if (!std::isfinite(total_weight) || total_weight < 0.001f) {
+        error = "selector weights must sum to a finite positive value";
         return false;
     }
     if (grid.scale_mode != "fit" && grid.scale_mode != "fill" && grid.scale_mode != "stretch") {
@@ -279,9 +322,9 @@ bool Config::validate(std::string& error) const {
         error = "selector.mode must be 'simple' or 'histogram'";
         return false;
     }
-    if (selector.char_set != "basic" && selector.char_set != "blocks" &&
+    if (selector.char_set != "basic" && selector.char_set != "traditional" && selector.char_set != "blocks" &&
         selector.char_set != "line-art") {
-        error = "selector.char_set must be 'basic', 'blocks', or 'line-art'";
+        error = "selector.char_set must be 'basic', 'traditional', 'blocks', or 'line-art'";
         return false;
     }
     if (!debug.mode.empty() && debug.mode != "grayscale" && debug.mode != "edges" &&
@@ -404,6 +447,7 @@ std::string Config::compute_hash() const {
     h = hash_combine(h, hash_float(selector.weight_frequency));
     h = hash_combine(h, hash_float(selector.weight_texture));
     h = hash_combine(h, hash_int(static_cast<int>(selector.use_orientation_matching)));
+    h = hash_combine(h, hash_int(static_cast<int>(selector.use_simple_orientation)));
     h = hash_combine(h, hash_int(static_cast<int>(selector.enable_frequency_matching)));
     h = hash_combine(h, hash_int(static_cast<int>(selector.enable_gabor_texture)));
     h = hash_combine(h, hash_int(static_cast<int>(color.mode)));
@@ -420,6 +464,8 @@ std::string Config::compute_hash() const {
     h = hash_combine(h, hash_int(color.block_spectral_palette));
     h = hash_combine(h, hash_int(color.block_spectral_samples));
     h = hash_combine(h, hash_int(color.block_spectral_iterations));
+    h = hash_combine(h, hash_int(static_cast<int>(debug.enabled)));
+    h = hash_combine(h, hash_string(debug.mode));
     h = hash_combine(h, hash_string(profile));
     h = hash_combine(h, hash_int(fps));
     h = hash_combine(h, hash_string(font_path));
@@ -440,139 +486,156 @@ std::optional<Config> Config::load(const std::string& path) {
         
         Config cfg = defaults();
         cfg.config_path = path;
-
-        if (auto v = tbl["profile"].value<std::string>()) {
-            cfg.profile = *v;
-            apply_content_profile(cfg);
-        }
-        
-        if (auto v = tbl["config_version"].value<int>()) {
-            if (*v != CONFIG_VERSION) {
-                return std::nullopt;
+        bool valid = true;
+        const auto read = [&]<typename T>(toml::node_view<toml::node> node, T& destination) {
+            if (!node) return;
+            // TOML permits scalar coercions; application booleans and integers require their declared type.
+            if constexpr (std::is_same_v<T, bool>) {
+                if (!node.is_boolean()) { valid = false; return; }
+            } else if constexpr (std::is_same_v<T, int>) {
+                if (!node.is_integer()) { valid = false; return; }
             }
-        }
+            if (auto value = node.template value<T>()) destination = *value;
+            else valid = false;
+        };
+
+        read(tbl["profile"], cfg.profile);
+        apply_content_profile(cfg);
+        
+        read(tbl["config_version"], cfg.version);
+        if (!valid || cfg.version != CONFIG_VERSION) return std::nullopt;
         
         if (auto input = tbl["input"]) {
-            if (auto v = input["source"].value<std::string>()) cfg.input.source = *v;
-            if (auto v = input["mode"].value<std::string>()) cfg.input.mode = *v;
+            if (!input.is_table()) return std::nullopt;
+            read(input["source"], cfg.input.source);
+            read(input["mode"], cfg.input.mode);
         }
         
         if (auto output = tbl["output"]) {
-            if (auto v = output["target"].value<std::string>()) cfg.output.target = *v;
-            if (auto v = output["mode"].value<std::string>()) cfg.output.mode = *v;
-            if (auto v = output["replay_path"].value<std::string>()) cfg.output.replay_path = *v;
+            if (!output.is_table()) return std::nullopt;
+            read(output["target"], cfg.output.target);
+            read(output["mode"], cfg.output.mode);
+            read(output["replay_path"], cfg.output.replay_path);
         }
         
         if (auto grid = tbl["grid"]) {
-            if (auto v = grid["cols"].value<int>()) cfg.grid.cols = *v;
-            if (auto v = grid["rows"].value<int>()) cfg.grid.rows = *v;
-            if (auto v = grid["cell_width"].value<int>()) cfg.grid.cell_width = *v;
-            if (auto v = grid["cell_height"].value<int>()) cfg.grid.cell_height = *v;
-            if (auto v = grid["char_aspect"].value<double>()) cfg.grid.char_aspect = static_cast<float>(*v);
-            if (auto v = grid["scale_mode"].value<std::string>()) cfg.grid.scale_mode = *v;
-            if (auto v = grid["quad_tree_adaptive"].value<bool>()) cfg.grid.quad_tree_adaptive = *v;
-            if (auto v = grid["quad_tree_max_depth"].value<int>()) cfg.grid.quad_tree_max_depth = *v;
-            if (auto v = grid["quad_tree_variance_threshold"].value<double>()) cfg.grid.quad_tree_variance_threshold = static_cast<float>(*v);
+            if (!grid.is_table()) return std::nullopt;
+            read(grid["cols"], cfg.grid.cols);
+            read(grid["rows"], cfg.grid.rows);
+            read(grid["cell_width"], cfg.grid.cell_width);
+            read(grid["cell_height"], cfg.grid.cell_height);
+            read(grid["char_aspect"], cfg.grid.char_aspect);
+            read(grid["scale_mode"], cfg.grid.scale_mode);
+            read(grid["quad_tree_adaptive"], cfg.grid.quad_tree_adaptive);
+            read(grid["quad_tree_max_depth"], cfg.grid.quad_tree_max_depth);
+            read(grid["quad_tree_variance_threshold"], cfg.grid.quad_tree_variance_threshold);
         }
         
         if (auto edge = tbl["edge"]) {
-            if (auto v = edge["low_threshold"].value<double>()) cfg.edge.low_threshold = static_cast<float>(*v);
-            if (auto v = edge["high_threshold"].value<double>()) cfg.edge.high_threshold = static_cast<float>(*v);
-            if (auto v = edge["blur_sigma"].value<double>()) cfg.edge.blur_sigma = static_cast<float>(*v);
-            if (auto v = edge["use_hysteresis"].value<bool>()) cfg.edge.use_hysteresis = *v;
-            if (auto v = edge["multi_scale"].value<bool>()) cfg.edge.multi_scale = *v;
-            if (auto v = edge["scale_sigma_0"].value<double>()) cfg.edge.scale_sigma_0 = static_cast<float>(*v);
-            if (auto v = edge["scale_sigma_1"].value<double>()) cfg.edge.scale_sigma_1 = static_cast<float>(*v);
-            if (auto v = edge["adaptive_scale_selection"].value<bool>()) cfg.edge.adaptive_scale_selection = *v;
-            if (auto v = edge["scale_variance_floor"].value<double>()) cfg.edge.scale_variance_floor = static_cast<float>(*v);
-            if (auto v = edge["scale_variance_ceil"].value<double>()) cfg.edge.scale_variance_ceil = static_cast<float>(*v);
-            if (auto v = edge["use_anisotropic_diffusion"].value<bool>()) cfg.edge.use_anisotropic_diffusion = *v;
-            if (auto v = edge["diffusion_iterations"].value<int>()) cfg.edge.diffusion_iterations = *v;
-            if (auto v = edge["diffusion_kappa"].value<double>()) cfg.edge.diffusion_kappa = static_cast<float>(*v);
-            if (auto v = edge["diffusion_lambda"].value<double>()) cfg.edge.diffusion_lambda = static_cast<float>(*v);
-            if (auto v = edge["adaptive_mode"].value<std::string>()) cfg.edge.adaptive_mode = *v;
-            if (auto v = edge["tile_size"].value<int>()) cfg.edge.tile_size = *v;
-            if (auto v = edge["dark_scene_floor"].value<double>()) cfg.edge.dark_scene_floor = static_cast<float>(*v);
-            if (auto v = edge["global_percentile"].value<double>()) cfg.edge.global_percentile = static_cast<float>(*v);
-            if (auto v = edge["contours_enabled"].value<bool>()) cfg.edge.contours_enabled = *v;
-            if (auto v = edge["contour_min_occupancy"].value<double>()) cfg.edge.contour_min_occupancy = static_cast<float>(*v);
-            if (auto v = edge["contour_min_pixels"].value<int>()) cfg.edge.contour_min_pixels = *v;
-            if (auto v = edge["contour_dominance_ratio"].value<double>()) cfg.edge.contour_dominance_ratio = static_cast<float>(*v);
-            if (auto v = edge["contour_intersection_ratio"].value<double>()) cfg.edge.contour_intersection_ratio = static_cast<float>(*v);
-            if (auto v = edge["contour_dog_sigma_inner"].value<double>()) cfg.edge.contour_dog_sigma_inner = static_cast<float>(*v);
-            if (auto v = edge["contour_dog_sigma_outer"].value<double>()) cfg.edge.contour_dog_sigma_outer = static_cast<float>(*v);
+            if (!edge.is_table()) return std::nullopt;
+            read(edge["low_threshold"], cfg.edge.low_threshold);
+            read(edge["high_threshold"], cfg.edge.high_threshold);
+            read(edge["blur_sigma"], cfg.edge.blur_sigma);
+            read(edge["use_hysteresis"], cfg.edge.use_hysteresis);
+            read(edge["multi_scale"], cfg.edge.multi_scale);
+            read(edge["scale_sigma_0"], cfg.edge.scale_sigma_0);
+            read(edge["scale_sigma_1"], cfg.edge.scale_sigma_1);
+            read(edge["adaptive_scale_selection"], cfg.edge.adaptive_scale_selection);
+            read(edge["scale_variance_floor"], cfg.edge.scale_variance_floor);
+            read(edge["scale_variance_ceil"], cfg.edge.scale_variance_ceil);
+            read(edge["use_anisotropic_diffusion"], cfg.edge.use_anisotropic_diffusion);
+            read(edge["diffusion_iterations"], cfg.edge.diffusion_iterations);
+            read(edge["diffusion_kappa"], cfg.edge.diffusion_kappa);
+            read(edge["diffusion_lambda"], cfg.edge.diffusion_lambda);
+            read(edge["adaptive_mode"], cfg.edge.adaptive_mode);
+            read(edge["tile_size"], cfg.edge.tile_size);
+            read(edge["dark_scene_floor"], cfg.edge.dark_scene_floor);
+            read(edge["global_percentile"], cfg.edge.global_percentile);
+            read(edge["contours_enabled"], cfg.edge.contours_enabled);
+            read(edge["contour_min_occupancy"], cfg.edge.contour_min_occupancy);
+            read(edge["contour_min_pixels"], cfg.edge.contour_min_pixels);
+            read(edge["contour_dominance_ratio"], cfg.edge.contour_dominance_ratio);
+            read(edge["contour_intersection_ratio"], cfg.edge.contour_intersection_ratio);
+            read(edge["contour_dog_sigma_inner"], cfg.edge.contour_dog_sigma_inner);
+            read(edge["contour_dog_sigma_outer"], cfg.edge.contour_dog_sigma_outer);
         }
         
         if (auto temporal = tbl["temporal"]) {
-            if (auto v = temporal["alpha"].value<double>()) cfg.temporal.alpha = static_cast<float>(*v);
-            if (auto v = temporal["transition_penalty"].value<double>()) cfg.temporal.transition_penalty = static_cast<float>(*v);
-            if (auto v = temporal["edge_enter_threshold"].value<double>()) cfg.temporal.edge_enter_threshold = static_cast<float>(*v);
-            if (auto v = temporal["edge_exit_threshold"].value<double>()) cfg.temporal.edge_exit_threshold = static_cast<float>(*v);
-            if (auto v = temporal["motion_cap_pixels"].value<int>()) cfg.temporal.motion_cap_pixels = *v;
-            if (auto v = temporal["motion_solve_divisor"].value<int>()) cfg.temporal.motion_solve_divisor = *v;
-            if (auto v = temporal["motion_max_reuse_frames"].value<int>()) cfg.temporal.motion_max_reuse_frames = *v;
-            if (auto v = temporal["motion_reuse_scene_threshold"].value<double>()) cfg.temporal.motion_reuse_scene_threshold = static_cast<float>(*v);
-            if (auto v = temporal["motion_reuse_confidence_decay"].value<double>()) cfg.temporal.motion_reuse_confidence_decay = static_cast<float>(*v);
-            if (auto v = temporal["motion_still_scene_threshold"].value<double>()) cfg.temporal.motion_still_scene_threshold = static_cast<float>(*v);
-            if (auto v = temporal["use_wavelet_flicker"].value<bool>()) cfg.temporal.use_wavelet_flicker = *v;
-            if (auto v = temporal["wavelet_strength"].value<double>()) cfg.temporal.wavelet_strength = static_cast<float>(*v);
-            if (auto v = temporal["wavelet_window"].value<int>()) cfg.temporal.wavelet_window = *v;
-            if (auto v = temporal["use_phase_correlation"].value<bool>()) cfg.temporal.use_phase_correlation = *v;
-            if (auto v = temporal["phase_search_radius"].value<int>()) cfg.temporal.phase_search_radius = *v;
-            if (auto v = temporal["phase_blend"].value<double>()) cfg.temporal.phase_blend = static_cast<float>(*v);
-            if (auto v = temporal["motion_phase_interval"].value<int>()) cfg.temporal.motion_phase_interval = *v;
-            if (auto v = temporal["motion_phase_scene_trigger"].value<double>()) cfg.temporal.motion_phase_scene_trigger = static_cast<float>(*v);
+            if (!temporal.is_table()) return std::nullopt;
+            read(temporal["alpha"], cfg.temporal.alpha);
+            read(temporal["transition_penalty"], cfg.temporal.transition_penalty);
+            read(temporal["edge_enter_threshold"], cfg.temporal.edge_enter_threshold);
+            read(temporal["edge_exit_threshold"], cfg.temporal.edge_exit_threshold);
+            read(temporal["motion_cap_pixels"], cfg.temporal.motion_cap_pixels);
+            read(temporal["motion_solve_divisor"], cfg.temporal.motion_solve_divisor);
+            read(temporal["motion_max_reuse_frames"], cfg.temporal.motion_max_reuse_frames);
+            read(temporal["motion_reuse_scene_threshold"], cfg.temporal.motion_reuse_scene_threshold);
+            read(temporal["motion_reuse_confidence_decay"], cfg.temporal.motion_reuse_confidence_decay);
+            read(temporal["motion_still_scene_threshold"], cfg.temporal.motion_still_scene_threshold);
+            read(temporal["use_wavelet_flicker"], cfg.temporal.use_wavelet_flicker);
+            read(temporal["wavelet_strength"], cfg.temporal.wavelet_strength);
+            read(temporal["wavelet_window"], cfg.temporal.wavelet_window);
+            read(temporal["use_phase_correlation"], cfg.temporal.use_phase_correlation);
+            read(temporal["phase_search_radius"], cfg.temporal.phase_search_radius);
+            read(temporal["phase_blend"], cfg.temporal.phase_blend);
+            read(temporal["motion_phase_interval"], cfg.temporal.motion_phase_interval);
+            read(temporal["motion_phase_scene_trigger"], cfg.temporal.motion_phase_scene_trigger);
         }
         
         if (auto selector = tbl["selector"]) {
-            if (auto v = selector["char_set"].value<std::string>()) cfg.selector.char_set = *v;
-            if (auto v = selector["mode"].value<std::string>()) cfg.selector.mode = *v;
-            if (auto v = selector["weight_brightness"].value<double>()) cfg.selector.weight_brightness = static_cast<float>(*v);
-            if (auto v = selector["weight_orientation"].value<double>()) cfg.selector.weight_orientation = static_cast<float>(*v);
-            if (auto v = selector["weight_contrast"].value<double>()) cfg.selector.weight_contrast = static_cast<float>(*v);
-            if (auto v = selector["weight_frequency"].value<double>()) cfg.selector.weight_frequency = static_cast<float>(*v);
-            if (auto v = selector["weight_texture"].value<double>()) cfg.selector.weight_texture = static_cast<float>(*v);
-            if (auto v = selector["use_orientation_matching"].value<bool>()) cfg.selector.use_orientation_matching = *v;
-            if (auto v = selector["enable_frequency_matching"].value<bool>()) cfg.selector.enable_frequency_matching = *v;
-            if (auto v = selector["enable_gabor_texture"].value<bool>()) cfg.selector.enable_gabor_texture = *v;
-            if (auto v = selector["use_simple_orientation"].value<bool>()) cfg.selector.use_simple_orientation = *v;
+            if (!selector.is_table()) return std::nullopt;
+            read(selector["char_set"], cfg.selector.char_set);
+            read(selector["mode"], cfg.selector.mode);
+            read(selector["weight_brightness"], cfg.selector.weight_brightness);
+            read(selector["weight_orientation"], cfg.selector.weight_orientation);
+            read(selector["weight_contrast"], cfg.selector.weight_contrast);
+            read(selector["weight_frequency"], cfg.selector.weight_frequency);
+            read(selector["weight_texture"], cfg.selector.weight_texture);
+            read(selector["use_orientation_matching"], cfg.selector.use_orientation_matching);
+            read(selector["enable_frequency_matching"], cfg.selector.enable_frequency_matching);
+            read(selector["enable_gabor_texture"], cfg.selector.enable_gabor_texture);
+            read(selector["use_simple_orientation"], cfg.selector.use_simple_orientation);
         }
         
         if (auto color = tbl["color"]) {
+            if (!color.is_table()) return std::nullopt;
+            if (color["mode"] && !color["mode"].is_string()) return std::nullopt;
             if (auto v = color["mode"].value<std::string>()) {
                 if (*v == "none") cfg.color.mode = ColorMode::None;
                 else if (*v == "ansi16") cfg.color.mode = ColorMode::Ansi16;
                 else if (*v == "ansi256") cfg.color.mode = ColorMode::Ansi256;
                 else if (*v == "truecolor") cfg.color.mode = ColorMode::Truecolor;
                 else if (*v == "blockart") cfg.color.mode = ColorMode::BlockArt;
+                else return std::nullopt;
             }
-            if (auto v = color["quantization"].value<std::string>()) cfg.color.quantization = *v;
-            if (auto v = color["dither_error_clamp"].value<double>()) cfg.color.dither_error_clamp = static_cast<float>(*v);
-            if (auto v = color["use_blue_noise_halftone"].value<bool>()) cfg.color.use_blue_noise_halftone = *v;
-            if (auto v = color["halftone_strength"].value<double>()) cfg.color.halftone_strength = static_cast<float>(*v);
-            if (auto v = color["halftone_cell_size"].value<int>()) cfg.color.halftone_cell_size = *v;
-            if (auto v = color["use_bilateral_grid"].value<bool>()) cfg.color.use_bilateral_grid = *v;
-            if (auto v = color["bilateral_spatial_bins"].value<int>()) cfg.color.bilateral_spatial_bins = *v;
-            if (auto v = color["bilateral_range_bins"].value<int>()) cfg.color.bilateral_range_bins = *v;
-            if (auto v = color["bilateral_spatial_sigma"].value<double>()) cfg.color.bilateral_spatial_sigma = static_cast<float>(*v);
-            if (auto v = color["bilateral_range_sigma"].value<double>()) cfg.color.bilateral_range_sigma = static_cast<float>(*v);
-            if (auto v = color["block_spectral_palette"].value<int>()) cfg.color.block_spectral_palette = *v;
-            if (auto v = color["block_spectral_samples"].value<int>()) cfg.color.block_spectral_samples = *v;
-            if (auto v = color["block_spectral_iterations"].value<int>()) cfg.color.block_spectral_iterations = *v;
+            read(color["quantization"], cfg.color.quantization);
+            read(color["dither_error_clamp"], cfg.color.dither_error_clamp);
+            read(color["use_blue_noise_halftone"], cfg.color.use_blue_noise_halftone);
+            read(color["halftone_strength"], cfg.color.halftone_strength);
+            read(color["halftone_cell_size"], cfg.color.halftone_cell_size);
+            read(color["use_bilateral_grid"], cfg.color.use_bilateral_grid);
+            read(color["bilateral_spatial_bins"], cfg.color.bilateral_spatial_bins);
+            read(color["bilateral_range_bins"], cfg.color.bilateral_range_bins);
+            read(color["bilateral_spatial_sigma"], cfg.color.bilateral_spatial_sigma);
+            read(color["bilateral_range_sigma"], cfg.color.bilateral_range_sigma);
+            read(color["block_spectral_palette"], cfg.color.block_spectral_palette);
+            read(color["block_spectral_samples"], cfg.color.block_spectral_samples);
+            read(color["block_spectral_iterations"], cfg.color.block_spectral_iterations);
         }
         
         if (auto debug = tbl["debug"]) {
-            if (auto v = debug["enabled"].value<bool>()) cfg.debug.enabled = *v;
-            if (auto v = debug["mode"].value<std::string>()) cfg.debug.mode = *v;
-            if (auto v = debug["profile_live"].value<bool>()) cfg.debug.profile_live = *v;
-            if (auto v = debug["strict_memory"].value<bool>()) cfg.debug.strict_memory = *v;
+            if (!debug.is_table()) return std::nullopt;
+            read(debug["enabled"], cfg.debug.enabled);
+            read(debug["mode"], cfg.debug.mode);
+            read(debug["profile_live"], cfg.debug.profile_live);
+            read(debug["strict_memory"], cfg.debug.strict_memory);
         }
-        if (auto v = tbl["font_path"].value<std::string>()) cfg.font_path = *v;
-        if (auto v = tbl["fps"].value<int>()) cfg.fps = *v;
-        if (auto v = tbl["no_audio"].value<bool>()) cfg.no_audio = *v;
+        read(tbl["font_path"], cfg.font_path);
+        read(tbl["fps"], cfg.fps);
+        read(tbl["no_audio"], cfg.no_audio);
         
         std::string error;
-        if (!cfg.validate(error)) {
+        if (!valid || !cfg.validate(error)) {
             return std::nullopt;
         }
         
@@ -585,163 +648,6 @@ std::optional<Config> Config::load(const std::string& path) {
 std::optional<Config> Config::load_default() {
     std::string path = default_config_path();
     return load(path);
-}
-
-Config merge_config(Config base, const Config& override) {
-    Config result = base;
-    
-    if (!override.input.source.empty()) result.input.source = override.input.source;
-    if (!override.input.mode.empty()) result.input.mode = override.input.mode;
-    if (!override.output.target.empty()) result.output.target = override.output.target;
-    if (!override.output.mode.empty()) result.output.mode = override.output.mode;
-    if (!override.output.replay_path.empty()) result.output.replay_path = override.output.replay_path;
-    
-    if (override.grid.cols != 0) result.grid.cols = override.grid.cols;
-    if (override.grid.rows != 0) result.grid.rows = override.grid.rows;
-    if (override.grid.cell_width != Config::defaults().grid.cell_width) 
-        result.grid.cell_width = override.grid.cell_width;
-    if (override.grid.cell_height != Config::defaults().grid.cell_height) 
-        result.grid.cell_height = override.grid.cell_height;
-    if (override.grid.char_aspect != Config::defaults().grid.char_aspect)
-        result.grid.char_aspect = override.grid.char_aspect;
-    if (!override.grid.scale_mode.empty()) result.grid.scale_mode = override.grid.scale_mode;
-    result.grid.quad_tree_adaptive = override.grid.quad_tree_adaptive;
-    if (override.grid.quad_tree_max_depth != Config::defaults().grid.quad_tree_max_depth)
-        result.grid.quad_tree_max_depth = override.grid.quad_tree_max_depth;
-    if (override.grid.quad_tree_variance_threshold != Config::defaults().grid.quad_tree_variance_threshold)
-        result.grid.quad_tree_variance_threshold = override.grid.quad_tree_variance_threshold;
-    
-    if (override.edge.low_threshold != Config::defaults().edge.low_threshold)
-        result.edge.low_threshold = override.edge.low_threshold;
-    if (override.edge.high_threshold != Config::defaults().edge.high_threshold)
-        result.edge.high_threshold = override.edge.high_threshold;
-    if (override.edge.blur_sigma != Config::defaults().edge.blur_sigma)
-        result.edge.blur_sigma = override.edge.blur_sigma;
-    result.edge.use_hysteresis = override.edge.use_hysteresis;
-    result.edge.multi_scale = override.edge.multi_scale;
-    if (override.edge.scale_sigma_0 != Config::defaults().edge.scale_sigma_0)
-        result.edge.scale_sigma_0 = override.edge.scale_sigma_0;
-    if (override.edge.scale_sigma_1 != Config::defaults().edge.scale_sigma_1)
-        result.edge.scale_sigma_1 = override.edge.scale_sigma_1;
-    result.edge.adaptive_scale_selection = override.edge.adaptive_scale_selection;
-    if (override.edge.scale_variance_floor != Config::defaults().edge.scale_variance_floor)
-        result.edge.scale_variance_floor = override.edge.scale_variance_floor;
-    if (override.edge.scale_variance_ceil != Config::defaults().edge.scale_variance_ceil)
-        result.edge.scale_variance_ceil = override.edge.scale_variance_ceil;
-    result.edge.use_anisotropic_diffusion = override.edge.use_anisotropic_diffusion;
-    if (override.edge.diffusion_iterations != Config::defaults().edge.diffusion_iterations)
-        result.edge.diffusion_iterations = override.edge.diffusion_iterations;
-    if (override.edge.diffusion_kappa != Config::defaults().edge.diffusion_kappa)
-        result.edge.diffusion_kappa = override.edge.diffusion_kappa;
-    if (override.edge.diffusion_lambda != Config::defaults().edge.diffusion_lambda)
-        result.edge.diffusion_lambda = override.edge.diffusion_lambda;
-    if (!override.edge.adaptive_mode.empty()) result.edge.adaptive_mode = override.edge.adaptive_mode;
-    if (override.edge.tile_size != Config::defaults().edge.tile_size)
-        result.edge.tile_size = override.edge.tile_size;
-    if (override.edge.dark_scene_floor != Config::defaults().edge.dark_scene_floor)
-        result.edge.dark_scene_floor = override.edge.dark_scene_floor;
-    if (override.edge.global_percentile != Config::defaults().edge.global_percentile)
-        result.edge.global_percentile = override.edge.global_percentile;
-    result.edge.contours_enabled = override.edge.contours_enabled;
-    if (override.edge.contour_min_occupancy != Config::defaults().edge.contour_min_occupancy)
-        result.edge.contour_min_occupancy = override.edge.contour_min_occupancy;
-    if (override.edge.contour_min_pixels != Config::defaults().edge.contour_min_pixels)
-        result.edge.contour_min_pixels = override.edge.contour_min_pixels;
-    if (override.edge.contour_dominance_ratio != Config::defaults().edge.contour_dominance_ratio)
-        result.edge.contour_dominance_ratio = override.edge.contour_dominance_ratio;
-    if (override.edge.contour_intersection_ratio != Config::defaults().edge.contour_intersection_ratio)
-        result.edge.contour_intersection_ratio = override.edge.contour_intersection_ratio;
-    if (override.edge.contour_dog_sigma_inner != Config::defaults().edge.contour_dog_sigma_inner)
-        result.edge.contour_dog_sigma_inner = override.edge.contour_dog_sigma_inner;
-    if (override.edge.contour_dog_sigma_outer != Config::defaults().edge.contour_dog_sigma_outer)
-        result.edge.contour_dog_sigma_outer = override.edge.contour_dog_sigma_outer;
-    
-    if (override.temporal.alpha != Config::defaults().temporal.alpha)
-        result.temporal.alpha = override.temporal.alpha;
-    if (override.temporal.transition_penalty != Config::defaults().temporal.transition_penalty)
-        result.temporal.transition_penalty = override.temporal.transition_penalty;
-    if (override.temporal.edge_enter_threshold != Config::defaults().temporal.edge_enter_threshold)
-        result.temporal.edge_enter_threshold = override.temporal.edge_enter_threshold;
-    if (override.temporal.edge_exit_threshold != Config::defaults().temporal.edge_exit_threshold)
-        result.temporal.edge_exit_threshold = override.temporal.edge_exit_threshold;
-    if (override.temporal.motion_cap_pixels != Config::defaults().temporal.motion_cap_pixels)
-        result.temporal.motion_cap_pixels = override.temporal.motion_cap_pixels;
-    if (override.temporal.motion_solve_divisor != Config::defaults().temporal.motion_solve_divisor)
-        result.temporal.motion_solve_divisor = override.temporal.motion_solve_divisor;
-    if (override.temporal.motion_max_reuse_frames != Config::defaults().temporal.motion_max_reuse_frames)
-        result.temporal.motion_max_reuse_frames = override.temporal.motion_max_reuse_frames;
-    if (override.temporal.motion_reuse_scene_threshold != Config::defaults().temporal.motion_reuse_scene_threshold)
-        result.temporal.motion_reuse_scene_threshold = override.temporal.motion_reuse_scene_threshold;
-    if (override.temporal.motion_reuse_confidence_decay != Config::defaults().temporal.motion_reuse_confidence_decay)
-        result.temporal.motion_reuse_confidence_decay = override.temporal.motion_reuse_confidence_decay;
-    if (override.temporal.motion_still_scene_threshold != Config::defaults().temporal.motion_still_scene_threshold)
-        result.temporal.motion_still_scene_threshold = override.temporal.motion_still_scene_threshold;
-    result.temporal.use_wavelet_flicker = override.temporal.use_wavelet_flicker;
-    if (override.temporal.wavelet_strength != Config::defaults().temporal.wavelet_strength)
-        result.temporal.wavelet_strength = override.temporal.wavelet_strength;
-    if (override.temporal.wavelet_window != Config::defaults().temporal.wavelet_window)
-        result.temporal.wavelet_window = override.temporal.wavelet_window;
-    result.temporal.use_phase_correlation = override.temporal.use_phase_correlation;
-    if (override.temporal.phase_search_radius != Config::defaults().temporal.phase_search_radius)
-        result.temporal.phase_search_radius = override.temporal.phase_search_radius;
-    if (override.temporal.phase_blend != Config::defaults().temporal.phase_blend)
-        result.temporal.phase_blend = override.temporal.phase_blend;
-    if (override.temporal.motion_phase_interval != Config::defaults().temporal.motion_phase_interval)
-        result.temporal.motion_phase_interval = override.temporal.motion_phase_interval;
-    if (override.temporal.motion_phase_scene_trigger != Config::defaults().temporal.motion_phase_scene_trigger)
-        result.temporal.motion_phase_scene_trigger = override.temporal.motion_phase_scene_trigger;
-    
-    if (!override.selector.char_set.empty()) result.selector.char_set = override.selector.char_set;
-    if (!override.selector.mode.empty()) result.selector.mode = override.selector.mode;
-    if (override.selector.weight_brightness != Config::defaults().selector.weight_brightness)
-        result.selector.weight_brightness = override.selector.weight_brightness;
-    if (override.selector.weight_orientation != Config::defaults().selector.weight_orientation)
-        result.selector.weight_orientation = override.selector.weight_orientation;
-    if (override.selector.weight_contrast != Config::defaults().selector.weight_contrast)
-        result.selector.weight_contrast = override.selector.weight_contrast;
-    if (override.selector.weight_frequency != Config::defaults().selector.weight_frequency)
-        result.selector.weight_frequency = override.selector.weight_frequency;
-    if (override.selector.weight_texture != Config::defaults().selector.weight_texture)
-        result.selector.weight_texture = override.selector.weight_texture;
-    result.selector.enable_frequency_matching = override.selector.enable_frequency_matching;
-    result.selector.enable_gabor_texture = override.selector.enable_gabor_texture;
-    result.selector.use_simple_orientation = override.selector.use_simple_orientation;
-    
-    if (override.color.mode != Config::defaults().color.mode)
-        result.color.mode = override.color.mode;
-    if (!override.color.quantization.empty()) result.color.quantization = override.color.quantization;
-    if (override.color.dither_error_clamp != Config::defaults().color.dither_error_clamp)
-        result.color.dither_error_clamp = override.color.dither_error_clamp;
-    result.color.use_blue_noise_halftone = override.color.use_blue_noise_halftone;
-    if (override.color.halftone_strength != Config::defaults().color.halftone_strength)
-        result.color.halftone_strength = override.color.halftone_strength;
-    if (override.color.halftone_cell_size != Config::defaults().color.halftone_cell_size)
-        result.color.halftone_cell_size = override.color.halftone_cell_size;
-    result.color.use_bilateral_grid = override.color.use_bilateral_grid;
-    if (override.color.bilateral_spatial_bins != Config::defaults().color.bilateral_spatial_bins)
-        result.color.bilateral_spatial_bins = override.color.bilateral_spatial_bins;
-    if (override.color.bilateral_range_bins != Config::defaults().color.bilateral_range_bins)
-        result.color.bilateral_range_bins = override.color.bilateral_range_bins;
-    if (override.color.bilateral_spatial_sigma != Config::defaults().color.bilateral_spatial_sigma)
-        result.color.bilateral_spatial_sigma = override.color.bilateral_spatial_sigma;
-    if (override.color.bilateral_range_sigma != Config::defaults().color.bilateral_range_sigma)
-        result.color.bilateral_range_sigma = override.color.bilateral_range_sigma;
-    if (override.color.block_spectral_palette != Config::defaults().color.block_spectral_palette)
-        result.color.block_spectral_palette = override.color.block_spectral_palette;
-    if (override.color.block_spectral_samples != Config::defaults().color.block_spectral_samples)
-        result.color.block_spectral_samples = override.color.block_spectral_samples;
-    if (override.color.block_spectral_iterations != Config::defaults().color.block_spectral_iterations)
-        result.color.block_spectral_iterations = override.color.block_spectral_iterations;
-    
-    result.selector.use_orientation_matching = override.selector.use_orientation_matching;
-    result.debug = override.debug;
-    if (!override.profile.empty()) result.profile = override.profile;
-    
-    if (!override.font_path.empty()) result.font_path = override.font_path;
-    if (override.fps != Config::defaults().fps) result.fps = override.fps;
-    result.no_audio = override.no_audio;
-    
-    return result;
 }
 
 Config apply_cli_overrides(Config config, const Args& args) {
@@ -798,18 +704,14 @@ Config apply_cli_overrides(Config config, const Args& args) {
     if (args.color_mode_set)
         config.color.mode = args.color_mode;
     
-    if (args.orientation_mode_set) {
-        config.selector.use_orientation_matching = args.use_orientation_matching;
-        config.selector.use_simple_orientation = args.use_simple_orientation;
-    }
-
     if (args.fps_set) config.fps = args.fps;
     if (args.no_audio_set) config.no_audio = args.no_audio;
     if (args.profile_live_set) config.debug.profile_live = args.profile_live;
     if (args.strict_memory_set) config.debug.strict_memory = args.strict_memory;
     if (args.fast_mode) {
         config.selector.mode = "simple";
-        config.selector.use_simple_orientation = true;
+        config.selector.use_simple_orientation = config.selector.use_orientation_matching ||
+                                                 config.selector.use_simple_orientation;
         config.selector.enable_frequency_matching = false;
         config.selector.enable_gabor_texture = false;
 
@@ -825,6 +727,11 @@ Config apply_cli_overrides(Config config, const Args& args) {
 
         config.color.use_bilateral_grid = false;
         config.color.block_spectral_palette = 0;
+    }
+
+    if (args.orientation_mode_set) {
+        config.selector.use_orientation_matching = args.use_orientation_matching;
+        config.selector.use_simple_orientation = args.use_simple_orientation;
     }
 
     return config;

@@ -2,6 +2,7 @@
 
 #include "font_loader.hpp"
 #include "glyph_stats.hpp"
+#include "core/edge_detector.hpp"
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -13,13 +14,14 @@ class GlyphCache {
 public:
     GlyphCache();
     
-    bool initialize(FontLoader* loader, const std::vector<uint32_t>& codepoints, int target_width, int target_height);
+    bool initialize(FontLoader* loader, const std::vector<uint32_t>& codepoints, int target_width, int target_height,
+                    const EdgeDetector::Config& orientation_config = {});
     
     const GlyphStats* get_stats(uint32_t codepoint) const;
     const GlyphBitmap* get_bitmap(uint32_t codepoint) const;
     
-    std::vector<uint32_t> get_by_brightness() const;
-    std::vector<uint32_t> get_edge_glyphs() const;
+    const std::vector<uint32_t>& get_by_brightness() const;
+    const std::vector<uint32_t>& get_edge_glyphs() const;
     
     int cell_width() const { return cell_width_; }
     int cell_height() const { return cell_height_; }
@@ -30,6 +32,7 @@ private:
     FontLoader* loader_ = nullptr;
     int cell_width_ = 8;
     int cell_height_ = 16;
+    EdgeDetector::Config orientation_config_;
     
     std::unordered_map<uint32_t, GlyphBitmap> bitmaps_;
     std::unordered_map<uint32_t, GlyphStats> stats_;

@@ -6,51 +6,52 @@ namespace ascii {
 
 OKLab ColorMapper::palette16_oklab_[16];
 OKLab ColorMapper::palette256_oklab_[256];
-bool ColorMapper::palettes_initialized_ = false;
 
 ColorMapper::ColorMapper(ColorMode mode) : mode_(mode) {
     init_palettes();
 }
 
 void ColorMapper::init_palettes() {
-    if (palettes_initialized_) return;
-    
-    ColorSpace::init();
-    
-    static const uint8_t palette16[16][3] = {
-        {0, 0, 0}, {128, 0, 0}, {0, 128, 0}, {128, 128, 0},
-        {0, 0, 128}, {128, 0, 128}, {0, 128, 128}, {192, 192, 192},
-        {128, 128, 128}, {255, 0, 0}, {0, 255, 0}, {255, 255, 0},
-        {0, 0, 255}, {255, 0, 255}, {0, 255, 255}, {255, 255, 255}
-    };
-    
-    for (int i = 0; i < 16; ++i) {
-        palette16_oklab_[i] = ColorSpace::srgb_to_oklab(
-            palette16[i][0], palette16[i][1], palette16[i][2]);
-    }
-    
-    for (int i = 0; i < 256; ++i) {
-        uint8_t r, g, b;
-        if (i < 16) {
-            r = palette16[i][0];
-            g = palette16[i][1];
-            b = palette16[i][2];
-        } else if (i < 232) {
-            int idx = i - 16;
-            int rv = idx / 36;
-            int gv = (idx % 36) / 6;
-            int bv = idx % 6;
-            r = rv ? static_cast<uint8_t>(55 + rv * 40) : 0;
-            g = gv ? static_cast<uint8_t>(55 + gv * 40) : 0;
-            b = bv ? static_cast<uint8_t>(55 + bv * 40) : 0;
-        } else {
-            uint8_t gray = static_cast<uint8_t>(8 + (i - 232) * 10);
-            r = g = b = gray;
+    static const bool initialized = [] {
+
+        ColorSpace::init();
+
+        static const uint8_t palette16[16][3] = {
+            {0, 0, 0}, {128, 0, 0}, {0, 128, 0}, {128, 128, 0},
+            {0, 0, 128}, {128, 0, 128}, {0, 128, 128}, {192, 192, 192},
+            {128, 128, 128}, {255, 0, 0}, {0, 255, 0}, {255, 255, 0},
+            {0, 0, 255}, {255, 0, 255}, {0, 255, 255}, {255, 255, 255}
+        };
+
+        for (int i = 0; i < 16; ++i) {
+            palette16_oklab_[i] = ColorSpace::srgb_to_oklab(
+                palette16[i][0], palette16[i][1], palette16[i][2]);
         }
-        palette256_oklab_[i] = ColorSpace::srgb_to_oklab(r, g, b);
-    }
-    
-    palettes_initialized_ = true;
+
+        for (int i = 0; i < 256; ++i) {
+            uint8_t r, g, b;
+            if (i < 16) {
+                r = palette16[i][0];
+                g = palette16[i][1];
+                b = palette16[i][2];
+            } else if (i < 232) {
+                int idx = i - 16;
+                int rv = idx / 36;
+                int gv = (idx % 36) / 6;
+                int bv = idx % 6;
+                r = rv ? static_cast<uint8_t>(55 + rv * 40) : 0;
+                g = gv ? static_cast<uint8_t>(55 + gv * 40) : 0;
+                b = bv ? static_cast<uint8_t>(55 + bv * 40) : 0;
+            } else {
+                uint8_t gray = static_cast<uint8_t>(8 + (i - 232) * 10);
+                r = g = b = gray;
+            }
+            palette256_oklab_[i] = ColorSpace::srgb_to_oklab(r, g, b);
+        }
+
+        return true;
+    }();
+    (void)initialized;
 }
 
 uint8_t ColorMapper::find_nearest_palette_oklab(float r, float g, float b,
@@ -59,10 +60,10 @@ uint8_t ColorMapper::find_nearest_palette_oklab(float r, float g, float b,
         static_cast<uint8_t>(std::clamp(r * 255.0f, 0.0f, 255.0f)),
         static_cast<uint8_t>(std::clamp(g * 255.0f, 0.0f, 255.0f)),
         static_cast<uint8_t>(std::clamp(b * 255.0f, 0.0f, 255.0f)));
-    
+
     float best_dist = 1e10f;
     uint8_t best_idx = 0;
-    
+
     for (int i = 0; i < palette_size; ++i) {
         float dist = OKLab::distance(target, palette[i]);
         if (dist < best_dist) {
@@ -70,16 +71,18 @@ uint8_t ColorMapper::find_nearest_palette_oklab(float r, float g, float b,
             best_idx = static_cast<uint8_t>(i);
         }
     }
-    
+
     return best_idx;
 }
 
 uint8_t ColorMapper::find_nearest_16_oklab(uint8_t r, uint8_t g, uint8_t b) {
+    init_palettes();
     return find_nearest_palette_oklab(r / 255.0f, g / 255.0f, b / 255.0f,
                                        palette16_oklab_, 16);
 }
 
 uint8_t ColorMapper::find_nearest_256_oklab(uint8_t r, uint8_t g, uint8_t b) {
+    init_palettes();
     return find_nearest_palette_oklab(r / 255.0f, g / 255.0f, b / 255.0f,
                                        palette256_oklab_, 256);
 }
@@ -89,15 +92,15 @@ HSV ColorMapper::rgb_to_hsv(float r, float g, float b) {
     float max_val = std::max({r, g, b});
     float min_val = std::min({r, g, b});
     float delta = max_val - min_val;
-    
+
     hsv.v = max_val;
-    
+
     if (delta < 0.00001f) {
         hsv.h = 0.0f;
         hsv.s = 0.0f;
         return hsv;
     }
-    
+
     if (max_val > 0.0f) {
         hsv.s = delta / max_val;
     } else {
@@ -105,7 +108,7 @@ HSV ColorMapper::rgb_to_hsv(float r, float g, float b) {
         hsv.h = 0.0f;
         return hsv;
     }
-    
+
     if (r >= max_val) {
         hsv.h = (g - b) / delta;
     } else if (g >= max_val) {
@@ -113,12 +116,12 @@ HSV ColorMapper::rgb_to_hsv(float r, float g, float b) {
     } else {
         hsv.h = 4.0f + (r - g) / delta;
     }
-    
+
     hsv.h *= 60.0f;
     if (hsv.h < 0.0f) {
         hsv.h += 360.0f;
     }
-    
+
     return hsv;
 }
 
@@ -127,19 +130,19 @@ void ColorMapper::hsv_to_rgb(float h, float s, float v, uint8_t& r, uint8_t& g, 
         r = g = b = static_cast<uint8_t>(std::clamp(v * 255.0f, 0.0f, 255.0f));
         return;
     }
-    
+
     while (h >= 360.0f) h -= 360.0f;
     while (h < 0.0f) h += 360.0f;
-    
+
     h /= 60.0f;
     int i = static_cast<int>(h);
     float ff = h - i;
     float p = v * (1.0f - s);
     float q = v * (1.0f - (s * ff));
     float t = v * (1.0f - (s * (1.0f - ff)));
-    
+
     float rf, gf, bf;
-    
+
     switch (i) {
         case 0:  rf = v; gf = t; bf = p; break;
         case 1:  rf = q; gf = v; bf = p; break;
@@ -148,7 +151,7 @@ void ColorMapper::hsv_to_rgb(float h, float s, float v, uint8_t& r, uint8_t& g, 
         case 4:  rf = t; gf = p; bf = v; break;
         default: rf = v; gf = p; bf = q; break;
     }
-    
+
     r = static_cast<uint8_t>(std::clamp(rf * 255.0f, 0.0f, 255.0f));
     g = static_cast<uint8_t>(std::clamp(gf * 255.0f, 0.0f, 255.0f));
     b = static_cast<uint8_t>(std::clamp(bf * 255.0f, 0.0f, 255.0f));
@@ -198,23 +201,25 @@ ColorMapper::MappedColor ColorMapper::map(uint8_t r, uint8_t g, uint8_t b) const
 
 ColorMapper::MappedColor ColorMapper::map_with_dither(int x, int y, int row_dir,
                                                        float r, float g, float b, bool is_edge) const {
-    if (ditherer_ && ditherer_->should_dither_cell(is_edge)) {
+    const bool dither = (mode_ == ColorMode::Ansi16 || mode_ == ColorMode::Ansi256) &&
+        ditherer_ && ditherer_->should_dither_cell(is_edge);
+    if (dither) {
         ditherer_->apply_dithering(x, y, r, g, b);
     }
-    
+
     uint8_t ri = static_cast<uint8_t>(std::clamp(r * 255.0f, 0.0f, 255.0f));
     uint8_t gi = static_cast<uint8_t>(std::clamp(g * 255.0f, 0.0f, 255.0f));
     uint8_t bi = static_cast<uint8_t>(std::clamp(b * 255.0f, 0.0f, 255.0f));
-    
+
     MappedColor result = map(ri, gi, bi);
-    
-    if (ditherer_ && ditherer_->should_dither_cell(is_edge)) {
+
+    if (dither) {
         float er = r - (result.r / 255.0f);
         float eg = g - (result.g / 255.0f);
         float eb = b - (result.b / 255.0f);
         ditherer_->distribute_error(x, y, row_dir, er, eg, eb);
     }
-    
+
     return result;
 }
 
@@ -227,21 +232,21 @@ ColorMapper::MappedColor ColorMapper::map_rgb(float r, float g, float b) const {
     uint8_t ri = static_cast<uint8_t>(std::clamp(r * 255.0f, 0.0f, 255.0f));
     uint8_t gi = static_cast<uint8_t>(std::clamp(g * 255.0f, 0.0f, 255.0f));
     uint8_t bi = static_cast<uint8_t>(std::clamp(b * 255.0f, 0.0f, 255.0f));
-    
+
     if (mode_ == ColorMode::None) {
         float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
         return map_luminance(lum);
     }
-    
+
     return map(ri, gi, bi);
 }
 
 ColorMapper::BlockArtResult ColorMapper::map_block_art(uint8_t r, uint8_t g, uint8_t b) const {
     ColorMapper::BlockArtResult result;
-    
+
     LinearColor linear = ColorSpace::srgb_to_linear(r, g, b);
     float lum = linear.luminance();
-    
+
     static const uint32_t block_chars[] = {
         0x0020,
         0x2591,
@@ -249,7 +254,7 @@ ColorMapper::BlockArtResult ColorMapper::map_block_art(uint8_t r, uint8_t g, uin
         0x2593,
         0x2588
     };
-    
+
     if (lum < 0.125f) {
         result.codepoint = block_chars[0];
         result.fg_r = result.fg_g = result.fg_b = 0;
@@ -271,7 +276,7 @@ ColorMapper::BlockArtResult ColorMapper::map_block_art(uint8_t r, uint8_t g, uin
         result.fg_r = r; result.fg_g = g; result.fg_b = b;
         result.bg_r = r; result.bg_g = g; result.bg_b = b;
     }
-    
+
     return result;
 }
 

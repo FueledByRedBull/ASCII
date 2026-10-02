@@ -2,8 +2,8 @@
 
 #include <string>
 #include <cstdint>
-
-struct SDL_AudioSpec;
+#include <cstddef>
+#include <vector>
 
 namespace ascii {
 
@@ -11,6 +11,11 @@ class AudioPlayer {
 public:
     AudioPlayer();
     ~AudioPlayer();
+    AudioPlayer(const AudioPlayer&) = delete;
+    AudioPlayer& operator=(const AudioPlayer&) = delete;
+
+    // Applies to subsequent opens; never exceeds the 256 MiB decoded PCM cap.
+    void set_memory_limit(size_t bytes);
     
     bool open(const std::string& filename);
     void close();
@@ -29,17 +34,19 @@ private:
     bool load_audio(const std::string& filename);
     static void audio_callback(void* userdata, uint8_t* stream, int len);
     
-    uint8_t* audio_data_ = nullptr;
+    // Public operations must be serialized by the caller; SDL callback access is locked.
+    std::vector<uint8_t> audio_data_;
     uint32_t audio_len_ = 0;
     uint32_t audio_pos_ = 0;
     
-    SDL_AudioSpec* spec_ = nullptr;
-    int device_id_ = 0;
+    uint32_t device_id_ = 0;
+    bool audio_initialized_ = false;
     bool playing_ = false;
     double duration_ = 0.0;
     int bytes_per_sample_ = 0;
     int sample_rate_ = 0;
     int channels_ = 2;
+    size_t memory_limit_ = 256u * 1024u * 1024u;
 };
 
 }

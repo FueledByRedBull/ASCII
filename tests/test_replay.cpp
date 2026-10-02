@@ -5,6 +5,7 @@
 #include <iostream>
 #include <vector>
 #include <cstddef>
+#include <exception>
 
 #include "../src/core/replay.hpp"
 
@@ -236,6 +237,115 @@ void test_replay_bytes_are_deterministic() {
     std::filesystem::remove(path_b);
 }
 
+void test_delta_rejects_stale_previous_frame() {
+    const auto path = temp_replay_path("ascii_engine_replay_stale.areplay");
+    const std::vector<ASCIICell> first{cell('A', 1, 2, 3)};
+    const std::vector<ASCIICell> next{cell('B', 4, 5, 6)};
+    ReplayWriter writer;
+    assert(writer.open(path.string(), 1, 1, 30, "stale001"));
+    assert(writer.write_frame(0, first));
+    assert(!writer.write_frame_delta(1, next, next));
+    assert(!writer.close());
+    assert(!std::filesystem::exists(path));
+}
+
+void test_unfinished_and_empty_writers_preserve_destination() {
+    const auto path = temp_replay_path("ascii_engine_replay_preserve.areplay");
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "existing destination";
+    }
+    const auto before = read_all_bytes(path);
+    {
+        ReplayWriter writer;
+        assert(writer.open(path.string(), 1, 1, 30, "abort001"));
+        assert(writer.write_frame(0, {cell('A', 1, 2, 3)}));
+    }
+    assert(read_all_bytes(path) == before);
+    ReplayWriter empty;
+    assert(empty.open(path.string(), 1, 1, 30, "empty001"));
+    assert(!empty.close());
+    assert(read_all_bytes(path) == before);
+    std::filesystem::remove(path);
+}
+
+void test_reader_memory_budget() {
+    const auto path = temp_replay_path("ascii_engine_replay_budget.areplay");
+    ReplayWriter writer;
+    assert(writer.open(path.string(), 2, 2, 30, "budget01"));
+    assert(writer.write_frame(0, std::vector<ASCIICell>(4, cell('A', 1, 2, 3))));
+    assert(writer.close());
+    ReplayReader reader;
+    assert(!reader.open(path.string(), 32));
+    assert(!reader.is_open());
+    assert(reader.open(path.string(), 4096));
+    std::vector<ASCIICell> cells;
+    assert(reader.read_frame(0, cells) && cells.size() == 4);
+    assert(!reader.open(path.string(), 32));
+    assert(reader.open(path.string(), 4096));
+    reader.close();
+    std::filesystem::remove(path);
+}
+
+void test_reader_failed_index_clears_state() {
+    const auto path = temp_replay_path("ascii_engine_replay_index_failure.areplay");
+    ReplayWriter writer;
+    assert(writer.open(path.string(), 2, 2, 30, "index001"));
+    const std::vector<ASCIICell> frame(4, cell('A', 1, 2, 3));
+    assert(writer.write_frame(0, frame));
+    assert(writer.write_frame(1, frame));
+    assert(writer.close());
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
+
+    ReplayReader reader;
+    assert(!reader.open(path.string(), 4096));
+    assert(!reader.is_open());
+    assert(reader.indexed_frame_count() == 0);
+    std::vector<ASCIICell> cells;
+    assert(!reader.read_frame(0, cells));
+
+    assert(writer.open(path.string(), 2, 2, 30, "index002"));
+    assert(writer.write_frame(0, frame));
+    assert(writer.close());
+    assert(reader.open(path.string(), 4096));
+    assert(reader.read_frame(0, cells) && cells.size() == 4);
+    reader.close();
+    assert(reader.indexed_frame_count() == 0);
+    std::filesystem::remove(path);
+}
+
+void test_reader_reset_after_rejected_header() {
+    const auto path = temp_replay_path("ascii_engine_replay_rejected_reset.areplay");
+    write_deterministic_fixture(path);
+    patch_u32(path, offsetof(ReplayHeader, cols), UINT32_MAX);
+    patch_u32(path, offsetof(ReplayHeader, rows), UINT32_MAX);
+    ReplayReader reader;
+    assert(!reader.open(path.string()));
+    assert(!reader.is_open());
+    bool reset_threw = false;
+    try {
+        reader.reset_decode_state();
+    } catch (const std::exception& error) {
+        std::cerr << "Closed reader reset threw: " << error.what() << '\n';
+        reset_threw = true;
+    }
+    assert(!reset_threw);
+    assert(reader.header().cols == UINT32_MAX);
+    assert(reader.header().rows == UINT32_MAX);
+    assert(reader.indexed_frame_count() == 0);
+
+    write_deterministic_fixture(path);
+    assert(reader.open(path.string()));
+    std::vector<ASCIICell> cells;
+    assert(reader.read_frame(1, cells) && cells[1].codepoint == 'Q');
+    reader.reset_decode_state();
+    assert(reader.read_frame(0, cells) && cells[1].codepoint == 'B');
+    reader.close();
+    reader.reset_decode_state();
+    assert(!reader.is_open());
+    std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main() {
@@ -243,6 +353,11 @@ int main() {
     test_delta_frame_round_trip();
     test_replay_bytes_are_deterministic();
     test_unicode_random_access_and_validation();
+    test_delta_rejects_stale_previous_frame();
+    test_unfinished_and_empty_writers_preserve_destination();
+    test_reader_memory_budget();
+    test_reader_failed_index_clears_state();
+    test_reader_reset_after_rejected_header();
     std::cout << "Replay tests passed\n";
     return 0;
 }

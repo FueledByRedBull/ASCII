@@ -4,6 +4,11 @@
 #include <algorithm>
 #include <array>
 #include <utility>
+#include <stdexcept>
+
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <immintrin.h>
+#endif
 
 #ifdef HAS_OPENMP
 #include <omp.h>
@@ -107,9 +112,10 @@ void compute_cell_frequency_signature(const FloatImage& img,
         }
     }
 
-    float row_dct[H][W] = {};
+    // Only horizontal frequencies 0..3 contribute to the retained coefficients.
+    float row_dct[H][4] = {};
     for (int yy = 0; yy < H; ++yy) {
-        for (int u = 0; u < W; ++u) {
+        for (int u = 0; u < 4; ++u) {
             float sum = 0.0f;
             for (int xx = 0; xx < W; ++xx) {
                 sum += sample[yy][xx] * basis.cos_w[u][xx];
@@ -118,23 +124,17 @@ void compute_cell_frequency_signature(const FloatImage& img,
         }
     }
 
-    float dct[H][W] = {};
-    for (int v = 0; v < H; ++v) {
-        for (int u = 0; u < W; ++u) {
-            float sum = 0.0f;
-            for (int yy = 0; yy < H; ++yy) {
-                sum += row_dct[yy][u] * basis.cos_h[v][yy];
-            }
-            dct[v][u] = basis.alpha_w[u] * basis.alpha_h[v] * sum;
-        }
-    }
-
     static constexpr std::array<std::pair<int, int>, kFreqBins> kZigZag = {
         std::pair<int, int>{1, 0}, {0, 1}, {2, 0}, {1, 1},
         {0, 2}, {3, 0}, {2, 1}, {0, 3}
     };
     for (int i = 0; i < kFreqBins; ++i) {
-        out[i] = dct[kZigZag[i].second][kZigZag[i].first];
+        const auto [u, v] = kZigZag[i];
+        float sum = 0.0f;
+        for (int yy = 0; yy < H; ++yy) {
+            sum += row_dct[yy][u] * basis.cos_h[v][yy];
+        }
+        out[i] = basis.alpha_w[u] * basis.alpha_h[v] * sum;
     }
 
     float norm = 0.0f;
@@ -164,7 +164,27 @@ void compute_cell_texture_signature(const FloatImage& img,
             int samples = 0;
 
             for (int y = y0 + kRadius; y < y1 - kRadius; ++y) {
-                for (int x = x0 + kRadius; x < x1 - kRadius; ++x) {
+                int x = x0 + kRadius;
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+                for (; x <= x1 - kRadius - 4; x += 4) {
+                    __m128 responses = _mm_setzero_ps();
+                    const float* row_base = src + static_cast<size_t>(y) * stride + x;
+                    for (int ky = -kRadius; ky <= kRadius; ++ky) {
+                        const float* src_row = row_base + ky * stride;
+                        const float* kernel_row = bank.kernel[fi][oi][ky + kRadius];
+                        for (int kx = -kRadius; kx <= kRadius; ++kx) {
+                            responses = _mm_add_ps(responses, _mm_mul_ps(
+                                _mm_set1_ps(kernel_row[kx + kRadius]), _mm_loadu_ps(src_row + kx)));
+                        }
+                    }
+                    float values[4];
+                    _mm_storeu_ps(values, responses);
+                    // Keep the scalar left-to-right energy reduction unchanged.
+                    for (int lane = 0; lane < 4; ++lane) energy += std::abs(values[lane]);
+                    samples += 4;
+                }
+#endif
+                for (; x < x1 - kRadius; ++x) {
                     float resp = 0.0f;
                     const float* row_base = src + static_cast<size_t>(y) * stride + x;
                     for (int ky = -kRadius; ky <= kRadius; ++ky) {
@@ -246,7 +266,7 @@ void IntegralImage::compute(const FloatImage& input) {
     width_ = input.width();
     height_ = input.height();
     
-    data_.resize(static_cast<size_t>(width_ + 1) * (height_ + 1), 0.0);
+    data_.assign((static_cast<size_t>(width_) + 1) * (static_cast<size_t>(height_) + 1), 0.0);
     
     for (int y = 0; y < height_; ++y) {
         double row_sum = 0.0;
@@ -275,19 +295,37 @@ float IntegralImage::sum(int x0, int y0, int x1, int y1) const {
 }
 
 float IntegralImage::mean(int x0, int y0, int x1, int y1) const {
-    int area = (x1 - x0) * (y1 - y0);
-    if (area <= 0) return 0.0f;
-    return sum(x0, y0, x1, y1) / area;
+    x0 = std::max(0, x0);
+    y0 = std::max(0, y0);
+    x1 = std::min(width_, x1);
+    y1 = std::min(height_, y1);
+    if (x0 >= x1 || y0 >= y1) return 0.0f;
+    const double area = static_cast<double>(x1 - x0) * (y1 - y0);
+    return static_cast<float>(sum(x0, y0, x1, y1) / area);
 }
 
-CellStatsAggregator::CellStatsAggregator(const Config& config) : config_(config) {}
+CellStatsAggregator::CellStatsAggregator(const Config& config) {
+    set_config(config);
+}
+
+void CellStatsAggregator::set_config(const Config& config) {
+    if (config.cell_width <= 0 || config.cell_height <= 0) {
+        throw std::invalid_argument("Cell dimensions must be positive");
+    }
+    if (config.orientation_bins < 1 || config.orientation_bins > 8) {
+        throw std::invalid_argument("Cell orientation bins must be between 1 and 8");
+    }
+    config_ = config;
+}
 
 int CellStatsAggregator::grid_cols(int image_width) const {
-    return (image_width + config_.cell_width - 1) / config_.cell_width;
+    if (image_width < 0) throw std::invalid_argument("Image width must be non-negative");
+    return image_width == 0 ? 0 : 1 + (image_width - 1) / config_.cell_width;
 }
 
 int CellStatsAggregator::grid_rows(int image_height) const {
-    return (image_height + config_.cell_height - 1) / config_.cell_height;
+    if (image_height < 0) throw std::invalid_argument("Image height must be non-negative");
+    return image_height == 0 ? 0 : 1 + (image_height - 1) / config_.cell_height;
 }
 
 void CellStatsAggregator::compute_orientation_histogram(const FloatImage& gx, const FloatImage& gy,
@@ -364,28 +402,11 @@ void CellStatsAggregator::compute_structure_tensor(const FloatImage& gx, const F
 
 std::vector<CellStats> CellStatsAggregator::compute(const FloatImage& luminance, const EdgeData& edges,
                                                      const FrameBuffer* color, const GradientData* grad) const {
+    if (luminance.empty()) return {};
     int cols = grid_cols(luminance.width());
     int rows = grid_rows(luminance.height());
     
     std::vector<CellStats> result(static_cast<size_t>(cols) * rows);
-    
-    IntegralImage integral_lum(luminance);
-    FloatImage luminance_sq(luminance.width(), luminance.height());
-#ifdef HAS_OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
-    for (int y = 0; y < luminance.height(); ++y) {
-        for (int x = 0; x < luminance.width(); ++x) {
-            float v = luminance.get(x, y);
-            luminance_sq.set(x, y, v * v);
-        }
-    }
-    IntegralImage integral_lum_sq(luminance_sq);
-    
-    IntegralImage integral_mag;
-    if (!edges.magnitude.empty()) {
-        integral_mag.compute(edges.magnitude);
-    }
     
 #ifdef HAS_OPENMP
     #pragma omp parallel for schedule(dynamic)
@@ -394,41 +415,44 @@ std::vector<CellStats> CellStatsAggregator::compute(const FloatImage& luminance,
         for (int col = 0; col < cols; ++col) {
             int x0 = col * config_.cell_width;
             int y0 = row * config_.cell_height;
-            int x1 = std::min(x0 + config_.cell_width, luminance.width());
-            int y1 = std::min(y0 + config_.cell_height, luminance.height());
+            int x1 = x0 + std::min(config_.cell_width, luminance.width() - x0);
+            int y1 = y0 + std::min(config_.cell_height, luminance.height() - y0);
             
             CellStats& stats = result[static_cast<size_t>(row) * cols + col];
             
             int count = (x1 - x0) * (y1 - y0);
             if (count <= 0) continue;
             
-            stats.mean_luminance = integral_lum.mean(x0, y0, x1, y1);
-            
-            float mean_sq = integral_lum_sq.mean(x0, y0, x1, y1);
-            stats.luminance_variance = mean_sq - stats.mean_luminance * stats.mean_luminance;
-            stats.luminance_variance = std::max(0.0f, stats.luminance_variance);
-            stats.local_contrast = std::sqrt(stats.luminance_variance);
-            
-            if (!edges.magnitude.empty()) {
-                stats.edge_strength = integral_mag.mean(x0, y0, x1, y1);
-                
-                float max_mag = 0.0f;
-                int edge_count = 0;
-                for (int y = y0; y < y1; ++y) {
-                    for (int x = x0; x < x1; ++x) {
-                        float mag = edges.magnitude.get(x, y);
-                        max_mag = std::max(max_mag, mag);
-                        if (edges.is_edge(x, y)) {
-                            edge_count++;
-                        }
+            double luminance_sum = 0.0, luminance_square_sum = 0.0, magnitude_sum = 0.0;
+            float max_mag = 0.0f;
+            int edge_count = 0;
+            for (int y = y0; y < y1; ++y) {
+                for (int x = x0; x < x1; ++x) {
+                    const float value = luminance.get(x, y);
+                    luminance_sum += value;
+                    luminance_square_sum += value * value;
+                    if (!edges.magnitude.empty()) {
+                        const float magnitude = edges.magnitude.get(x, y);
+                        magnitude_sum += magnitude;
+                        max_mag = std::max(max_mag, magnitude);
+                        if (edges.is_edge(x, y)) ++edge_count;
                     }
                 }
+            }
+            // Preserve the integral mean's float rounding before division.
+            const auto mean = [count](double sum) {
+                return static_cast<float>(static_cast<float>(sum) / static_cast<double>(count));
+            };
+            stats.mean_luminance = mean(luminance_sum);
+            const float mean_sq = mean(luminance_square_sum);
+            stats.luminance_variance = std::max(0.0f, mean_sq - stats.mean_luminance * stats.mean_luminance);
+            stats.local_contrast = std::sqrt(stats.luminance_variance);
+            if (!edges.magnitude.empty()) {
+                stats.edge_strength = mean(magnitude_sum);
                 stats.edge_strength_max = max_mag;
                 stats.edge_occupancy = static_cast<float>(edge_count) / count;
-                stats.is_edge_cell = stats.edge_occupancy >= config_.edge_threshold || 
-                                     max_mag >= config_.edge_threshold;
+                stats.is_edge_cell = stats.edge_occupancy >= config_.edge_threshold || max_mag >= config_.edge_threshold;
             }
-            
             if (grad) {
                 if (config_.enable_orientation_histogram) {
                     compute_orientation_histogram(grad->gx, grad->gy, x0, y0, x1, y1,

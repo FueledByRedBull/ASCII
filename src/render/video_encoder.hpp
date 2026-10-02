@@ -28,9 +28,12 @@ public:
     
     VideoEncoder();
     ~VideoEncoder();
+    VideoEncoder(const VideoEncoder&) = delete;
+    VideoEncoder& operator=(const VideoEncoder&) = delete;
     
     bool open(const std::string& filename, const Config& config);
     bool close();
+    void abort();
     bool write_frame(const FrameBuffer& frame);
     bool is_open() const { return format_ctx_ != nullptr; }
     bool last_frame_was_written() const { return last_frame_written_; }
@@ -48,6 +51,7 @@ private:
     AVCodecContext* codec_ctx_ = nullptr;
     AVStream* stream_ = nullptr;
     AVFrame* frame_ = nullptr;
+    AVFrame* source_frame_ = nullptr;
     AVPacket* pkt_ = nullptr;
     SwsContext* sws_ctx_ = nullptr;
     int64_t pts_ = 0;
@@ -59,8 +63,6 @@ private:
     bool last_frame_written_ = false;
     bool header_written_ = false;
     bool failed_ = false;
-    int source_width_ = 0;
-    int source_height_ = 0;
     std::string last_error_;
 };
 

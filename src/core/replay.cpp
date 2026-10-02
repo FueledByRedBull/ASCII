@@ -60,11 +60,11 @@ ReplayWriter::ReplayWriter() {
 }
 
 ReplayWriter::~ReplayWriter() {
-    close();
+    abort();
 }
 
 bool ReplayWriter::open(const std::string& path, int cols, int rows, int fps, const std::string& config_hash) {
-    close();
+    abort();
     if (path.empty() || cols <= 0 || rows <= 0 || fps <= 0 ||
         cols > static_cast<int>(REPLAY_MAX_COLS) || rows > static_cast<int>(REPLAY_MAX_ROWS) ||
         fps > static_cast<int>(REPLAY_MAX_FPS) ||
@@ -101,7 +101,7 @@ bool ReplayWriter::open(const std::string& path, int cols, int rows, int fps, co
 }
 
 bool ReplayWriter::write_frame(uint32_t frame_index, const std::vector<ASCIICell>& cells) {
-    if (!file_ || frame_index != frame_count_ || cells.size() != static_cast<size_t>(cols_ * rows_)) {
+    if (!file_ || failed_ || frame_index != frame_count_ || cells.size() != static_cast<size_t>(cols_ * rows_)) {
         failed_ = true;
         return false;
     }
@@ -168,7 +168,7 @@ bool ReplayWriter::write_frame(uint32_t frame_index, const std::vector<ASCIICell
 
 bool ReplayWriter::write_frame_delta(uint32_t frame_index, const std::vector<ASCIICell>& cells,
                                      const std::vector<ASCIICell>& prev_cells) {
-    if (!file_ || frame_count_ == 0 || frame_index != frame_count_ ||
+    if (!file_ || failed_ || frame_count_ == 0 || frame_index != frame_count_ ||
         cells.size() != static_cast<size_t>(cols_ * rows_) || prev_cells.size() != cells.size()) {
         failed_ = true;
         return false;
@@ -180,12 +180,19 @@ bool ReplayWriter::write_frame_delta(uint32_t frame_index, const std::vector<ASC
     for (size_t i = 0; i < cells.size(); ++i) {
         const auto& curr = cells[i];
         const auto& prev = prev_cells[i];
+        const auto& written = last_cells_[i];
+        if (!valid_codepoint(curr.codepoint) ||
+            prev.codepoint != written.codepoint ||
+            prev.fg_r != written.fg_r || prev.fg_g != written.fg_g || prev.fg_b != written.fg_b ||
+            prev.bg_r != written.bg_r || prev.bg_g != written.bg_g || prev.bg_b != written.bg_b) {
+            failed_ = true;
+            return false;
+        }
         
         if (curr.codepoint != prev.codepoint ||
             curr.fg_r != prev.fg_r || curr.fg_g != prev.fg_g || curr.fg_b != prev.fg_b ||
             curr.bg_r != prev.bg_r || curr.bg_g != prev.bg_g || curr.bg_b != prev.bg_b) {
             
-            if (!valid_codepoint(curr.codepoint)) { failed_ = true; return false; }
             ReplayCellData cd;
             cd.glyph_index = curr.codepoint;
             cd.fg_r = curr.fg_r;
@@ -257,7 +264,7 @@ bool ReplayWriter::write_frame_delta(uint32_t frame_index, const std::vector<ASC
 }
 
 bool ReplayWriter::close() {
-    bool success = !failed_;
+    bool success = !failed_ && (temporary_path_.empty() || frame_count_ > 0);
     if (file_) {
         if (std::fflush(file_) != 0) success = false;
         if (fclose(file_) != 0) success = false;
@@ -279,23 +286,25 @@ bool ReplayWriter::close() {
     return success;
 }
 
-ReplayReader::ReplayReader() {
-    decompress_buffer_.resize(COMPRESS_BUFFER_SIZE);
+void ReplayWriter::abort() {
+    failed_ = true;
+    close();
 }
+
+ReplayReader::ReplayReader() = default;
 
 ReplayReader::~ReplayReader() {
     close();
 }
 
-bool ReplayReader::open(const std::string& path) {
+bool ReplayReader::open(const std::string& path, size_t memory_budget) {
     close();
     
     file_ = fopen(path.c_str(), "rb");
     if (!file_) return false;
     
     if (!read_header()) {
-        fclose(file_);
-        file_ = nullptr;
+        close();
         return false;
     }
     const uint64_t total_cells = static_cast<uint64_t>(header_.cols) * header_.rows;
@@ -303,22 +312,27 @@ bool ReplayReader::open(const std::string& path) {
         header_.cols == 0 || header_.cols > REPLAY_MAX_COLS ||
         header_.rows == 0 || header_.rows > REPLAY_MAX_ROWS ||
         total_cells > REPLAY_MAX_CELLS ||
-        header_.fps == 0 || header_.fps > REPLAY_MAX_FPS) {
-        fclose(file_);
-        file_ = nullptr;
+        header_.fps == 0 || header_.fps > REPLAY_MAX_FPS || header_.frame_count == 0) {
+        close();
         return false;
     }
     
+    const uint64_t decoded_bytes = total_cells * (sizeof(uint32_t) + sizeof(ReplayCellData));
+    const uint64_t working_bytes = total_cells * 4 * sizeof(ASCIICell) + 2 * decoded_bytes +
+        ZSTD_compressBound(static_cast<size_t>(decoded_bytes));
+    const uint64_t index_bytes = static_cast<uint64_t>(header_.frame_count) * sizeof(uint64_t);
+    if (working_bytes + index_bytes > memory_budget) {
+        close();
+        return false;
+    }
     last_cells_.resize(static_cast<size_t>(total_cells));
     
     if (!build_frame_index()) {
-        fclose(file_);
-        file_ = nullptr;
+        close();
         return false;
     }
     if (frame_offsets_.size() != header_.frame_count) {
-        fclose(file_);
-        file_ = nullptr;
+        close();
         return false;
     }
     
@@ -345,6 +359,9 @@ bool ReplayReader::build_frame_index() {
     const int64_t file_size = file_tell(file_);
     if (file_size < static_cast<int64_t>(sizeof(ReplayHeader)) ||
         !file_seek(file_, sizeof(ReplayHeader), SEEK_SET)) return false;
+    if (header_.frame_count > static_cast<uint64_t>(file_size - sizeof(ReplayHeader)) /
+            (sizeof(ReplayFrameHeader) + 1)) return false;
+    frame_offsets_.reserve(header_.frame_count);
     
     ReplayFrameHeader frame_hdr;
     const uint32_t total_cells = header_.cols * header_.rows;
@@ -513,11 +530,14 @@ void ReplayReader::close() {
         fclose(file_);
         file_ = nullptr;
     }
-    frame_offsets_.clear();
+    std::vector<uint64_t>().swap(frame_offsets_);
+    std::vector<ASCIICell>().swap(last_cells_);
+    std::vector<uint8_t>().swap(decompress_buffer_);
     decoded_frame_index_ = -1;
 }
 
 void ReplayReader::reset_decode_state() {
+    if (!file_) return;
     last_cells_.assign(static_cast<size_t>(header_.cols) * header_.rows, ASCIICell{});
     decoded_frame_index_ = -1;
 }

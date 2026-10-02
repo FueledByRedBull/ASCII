@@ -63,10 +63,6 @@ public:
     static float perceptual_luminance(uint8_t r, uint8_t g, uint8_t b);
     
 private:
-    static float srgb_decode_lut_[256];
-    static uint8_t srgb_encode_lut_[4096];
-    static bool initialized_;
-    
     static float srgb_decode(uint8_t c);
     static uint8_t srgb_encode(float c);
     

@@ -51,7 +51,7 @@ public:
     Selection select(const CellStats& stats, const TemporalSmoother& smoother, int idx);
     Selection select_fill(float luminance);
     Selection select_edge(float orientation);
-    Selection select_edge_simple(float orientation);
+    Selection select_edge_simple(float orientation) const;
     
     Selection select_unified(const CellStats& stats, uint32_t prev_glyph);
     

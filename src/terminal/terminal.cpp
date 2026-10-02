@@ -65,14 +65,29 @@ namespace {
 }
 
 Terminal::Terminal() {
+#ifdef _WIN32
+    const HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (handle != INVALID_HANDLE_VALUE && GetConsoleMode(handle, &mode)) {
+        native_output_handle_ = handle;
+        original_output_mode_ = mode;
+        original_output_codepage_ = GetConsoleOutputCP();
+        output_mode_changed_ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+        output_codepage_changed_ = SetConsoleOutputCP(CP_UTF8) != 0;
+    }
+#endif
     info_ = get_info();
 }
 
 Terminal::~Terminal() {
     if (in_alt_screen_) exit_alt_screen();
     if (cursor_hidden_) show_cursor();
-    reset_colors();
+    if (output_written_) reset_colors();
     flush();
+#ifdef _WIN32
+    if (output_mode_changed_) SetConsoleMode(native_output_handle_, original_output_mode_);
+    if (output_codepage_changed_) SetConsoleOutputCP(original_output_codepage_);
+#endif
 }
 
 TerminalInfo Terminal::get_info() const {
@@ -111,7 +126,7 @@ TerminalInfo Terminal::get_info() const {
                               t.find("kitty") != std::string::npos);
     }
 #ifdef _WIN32
-    info.supports_utf8 = true;
+    info.supports_utf8 = !native_output_handle_ || GetConsoleOutputCP() == CP_UTF8;
 #endif
     
     info.supports_box_drawing = info.supports_utf8;
@@ -124,6 +139,11 @@ Size Terminal::get_size() const {
 }
 
 ColorMode Terminal::detect_color_mode() const {
+#ifdef _WIN32
+    if (native_output_handle_) {
+        return output_mode_changed_ ? ColorMode::Truecolor : ColorMode::None;
+    }
+#endif
     const char* colorterm = std::getenv("COLORTERM");
     if (colorterm) {
         std::string ct(colorterm);
@@ -186,10 +206,12 @@ void Terminal::move_cursor_home() {
 }
 
 void Terminal::set_foreground(ColorMode mode, uint8_t r, uint8_t g, uint8_t b) {
+    output_written_ = true;
     printf("%s", color_code(mode, r, g, b, true).c_str());
 }
 
 void Terminal::set_background(ColorMode mode, uint8_t r, uint8_t g, uint8_t b) {
+    output_written_ = true;
     printf("%s", color_code(mode, r, g, b, false).c_str());
 }
 
@@ -198,7 +220,8 @@ void Terminal::reset_colors() {
 }
 
 void Terminal::write(const std::string& s) {
-    printf("%s", s.c_str());
+    output_written_ = output_written_ || !s.empty();
+    std::fwrite(s.data(), 1, s.size(), stdout);
 }
 
 void Terminal::flush() {

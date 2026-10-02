@@ -1,9 +1,11 @@
 #include "edge_detector.hpp"
 #include <algorithm>
-#include <queue>
+#include <array>
 #include <cstring>
 #include <numeric>
 #include <cmath>
+#include <utility>
+#include <memory>
 
 #if defined(__AVX2__) || defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <immintrin.h>
@@ -19,6 +21,29 @@ namespace {
 
 constexpr int kCacheTile = 64;
 
+std::vector<bool> connect_weak_edges(std::vector<uint8_t>& state,
+                                    std::vector<int>& pending, int w, int h) {
+    // 0 = rejected, 1 = weak, 2 = accepted. Mark before enqueue so each pixel
+    // enters the queue at most once; an all-rejected image allocates no queue.
+    std::vector<bool> result(state.size(), false);
+    for (size_t head = 0; head < pending.size(); ++head) {
+        const int index = pending[head];
+        result[index] = true;
+        const int cy = index / w;
+        const int cx = index - cy * w;
+        for (int y = std::max(0, cy - 1); y <= std::min(h - 1, cy + 1); ++y) {
+            for (int x = std::max(0, cx - 1); x <= std::min(w - 1, cx + 1); ++x) {
+                const int next = y * w + x;
+                if (state[next] == 1) {
+                    state[next] = 2;
+                    pending.push_back(next);
+                }
+            }
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 EdgeDetector::EdgeDetector(const Config& config) : config_(config) {}
@@ -26,15 +51,17 @@ EdgeDetector::EdgeDetector(const Config& config) : config_(config) {}
 GradientData EdgeDetector::compute_gradients(const FloatImage& input) {
     GradientData result;
 
-    FloatImage working = input;
-    if (config_.use_anisotropic_diffusion && config_.diffusion_iterations > 0) {
-        working = anisotropic_diffusion(
+    FloatImage diffused;
+    const bool use_diffusion = config_.use_anisotropic_diffusion && config_.diffusion_iterations > 0;
+    if (use_diffusion) {
+        diffused = anisotropic_diffusion(
             input,
             config_.diffusion_iterations,
             config_.diffusion_kappa,
             config_.diffusion_lambda
         );
     }
+    const FloatImage& working = use_diffusion ? diffused : input;
 
     FloatImage blurred = gaussian_blur(working, config_.blur_sigma);
     
@@ -44,6 +71,7 @@ GradientData EdgeDetector::compute_gradients(const FloatImage& input) {
     int h = blurred.height();
     result.magnitude = FloatImage(w, h);
     result.orientation = FloatImage(w, h);
+    if (blurred.empty()) return result;
     const float* gx_data = result.gx.data();
     const float* gy_data = result.gy.data();
     float* mag_data = result.magnitude.data();
@@ -96,187 +124,122 @@ MultiScaleGradientData EdgeDetector::compute_multi_scale_gradients(const FloatIm
     int w = input.width();
     int h = input.height();
 
-    FloatImage working = input;
-    if (config_.use_anisotropic_diffusion && config_.diffusion_iterations > 0) {
-        working = anisotropic_diffusion(
+    FloatImage diffused;
+    const bool use_diffusion = config_.use_anisotropic_diffusion && config_.diffusion_iterations > 0;
+    if (use_diffusion) {
+        diffused = anisotropic_diffusion(
             input,
             config_.diffusion_iterations,
             config_.diffusion_kappa,
             config_.diffusion_lambda
         );
     }
+    const FloatImage& working = use_diffusion ? diffused : input;
 
-    // Lindeberg-style normalized Laplacian scale selection over a small geometric scale stack.
+    // Compare the two configured normalized-Laplacian responses, retaining the
+    // first scale on ties. Variance can override this choice in flat/detail regions.
     const float sigma0 = std::max(0.1f, config_.scale_sigma_0);
     const float sigmaN = std::max(sigma0 + 1e-4f, config_.scale_sigma_1);
-    // The public configuration defines two scales; keep the analysis stack tied
-    // to those endpoints instead of silently adding resolution-dependent levels.
-    constexpr int kScaleLevels = 2;
-    const std::vector<float> sigmas = {sigma0, sigmaN};
-
-    std::vector<FloatImage> blurred(kScaleLevels);
-    std::vector<FloatImage> gx(kScaleLevels);
-    std::vector<FloatImage> gy(kScaleLevels);
-    std::vector<FloatImage> mag(kScaleLevels);
-    std::vector<FloatImage> orient(kScaleLevels);
-    std::vector<FloatImage> lap(kScaleLevels);
-    std::vector<FloatImage> norm_lap(kScaleLevels);
+    const std::array<float, 2> sigmas = {sigma0, sigmaN};
+    std::array<FloatImage, 2> gx, gy, norm_lap;
     const FloatImage variance = local_variance_3x3(working);
 
-    auto compute_laplacian = [](const FloatImage& img) {
-        FloatImage out(img.width(), img.height(), 0.0f);
-        for (int y = 1; y < img.height() - 1; ++y) {
-            for (int x = 1; x < img.width() - 1; ++x) {
-                float c = img.get(x, y);
-                float l = img.get(x - 1, y);
-                float r = img.get(x + 1, y);
-                float u = img.get(x, y - 1);
-                float d = img.get(x, y + 1);
-                out.set(x, y, l + r + u + d - 4.0f * c);
-            }
-        }
-        return out;
-    };
-
-    for (int s = 0; s < kScaleLevels; ++s) {
+    for (size_t s = 0; s < sigmas.size(); ++s) {
         const float effective_sigma = std::sqrt(
             sigmas[s] * sigmas[s] + config_.blur_sigma * config_.blur_sigma);
-        blurred[s] = gaussian_blur(working, effective_sigma);
-        sobel(blurred[s], gx[s], gy[s]);
-        mag[s] = FloatImage(w, h);
-        orient[s] = FloatImage(w, h);
-        lap[s] = compute_laplacian(blurred[s]);
+        const FloatImage blurred = gaussian_blur(working, effective_sigma);
+        sobel(blurred, gx[s], gy[s]);
         norm_lap[s] = FloatImage(w, h);
+        if (working.empty()) continue;
+        const float* pixels = blurred.data();
+        float* responses = norm_lap[s].data();
+        const float sigma_squared = sigmas[s] * sigmas[s];
 
 #ifdef HAS_OPENMP
         #pragma omp parallel for
 #endif
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                float sx = gx[s].get(x, y);
-                float sy = gy[s].get(x, y);
-                float m = std::sqrt(sx * sx + sy * sy);
-                mag[s].set(x, y, m);
-                orient[s].set(x, y, std::atan2(sy, sx));
-                float nlap = sigmas[s] * sigmas[s] * std::abs(lap[s].get(x, y));
-                norm_lap[s].set(x, y, nlap);
+        for (int y = 1; y < h - 1; ++y) {
+            const int row = y * w;
+            int x = 1;
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+            const __m128 four = _mm_set1_ps(4.0f);
+            const __m128 scale = _mm_set1_ps(sigma_squared);
+            const __m128 sign = _mm_set1_ps(-0.0f);
+            for (; x < w - 4; x += 4) {
+                const int i = row + x;
+                __m128 sum = _mm_add_ps(_mm_loadu_ps(pixels + i - 1), _mm_loadu_ps(pixels + i + 1));
+                sum = _mm_add_ps(sum, _mm_loadu_ps(pixels + i - w));
+                sum = _mm_add_ps(sum, _mm_loadu_ps(pixels + i + w));
+                const __m128 lap = _mm_sub_ps(sum, _mm_mul_ps(four, _mm_loadu_ps(pixels + i)));
+                _mm_storeu_ps(responses + i, _mm_mul_ps(scale, _mm_andnot_ps(sign, lap)));
+            }
+#endif
+            for (; x < w - 1; ++x) {
+                const int i = row + x;
+                const float lap = pixels[i - 1] + pixels[i + 1] + pixels[i - w] +
+                    pixels[i + w] - 4.0f * pixels[i];
+                responses[i] = sigma_squared * std::abs(lap);
             }
         }
     }
 
-    result.magnitude = FloatImage(w, h);
-    result.orientation = FloatImage(w, h);
-    result.gx = FloatImage(w, h);
-    result.gy = FloatImage(w, h);
+    const float variance_span = std::max(
+        config_.scale_variance_ceil - config_.scale_variance_floor, 1e-8f);
+    const float* variance_data = variance.data();
+    const float* response0 = norm_lap[0].data();
+    const float* response1 = norm_lap[1].data();
+    const std::array<const float*, 2> gx_data = {gx[0].data(), gx[1].data()};
+    const std::array<const float*, 2> gy_data = {gy[0].data(), gy[1].data()};
+    // Each source pixel is consumed once before these buffers are overwritten.
+    result.magnitude = std::move(norm_lap[0]);
+    result.orientation = std::move(norm_lap[1]);
+    result.gx = std::move(gx[0]);
+    result.gy = std::move(gy[0]);
+    result.best_scale = config_.adaptive_scale_selection ? -1 : 0;
+    if (working.empty()) return result;
+    float* out_gx = result.gx.data();
+    float* out_gy = result.gy.data();
+    float* out_magnitude = result.magnitude.data();
+    float* out_orientation = result.orientation.data();
 
 #ifdef HAS_OPENMP
     #pragma omp parallel for
 #endif
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
+            const int i = y * w + x;
             int best_scale = 0;
             if (config_.adaptive_scale_selection) {
-                float peak_response = -1.0f;
-                int peak_index = -1;
-
-                for (int s = 1; s < kScaleLevels - 1; ++s) {
-                    float prev = norm_lap[s - 1].get(x, y);
-                    float curr = norm_lap[s].get(x, y);
-                    float next = norm_lap[s + 1].get(x, y);
-                    if (curr >= prev && curr >= next && curr > peak_response) {
-                        peak_response = curr;
-                        peak_index = s;
-                    }
-                }
-
-                if (peak_index >= 0) {
-                    best_scale = peak_index;
-                } else {
-                    float best_response = norm_lap[0].get(x, y);
-                    best_scale = 0;
-                    for (int s = 1; s < kScaleLevels; ++s) {
-                        float rs = norm_lap[s].get(x, y);
-                        if (rs > best_response) {
-                            best_response = rs;
-                            best_scale = s;
-                        }
-                    }
-                }
-
-                const float variance_span = std::max(
-                    config_.scale_variance_ceil - config_.scale_variance_floor, 1e-8f);
                 const float detail = std::clamp(
-                    (variance.get(x, y) - config_.scale_variance_floor) / variance_span,
+                    (variance_data[i] - config_.scale_variance_floor) / variance_span,
                     0.0f, 1.0f);
-                const int variance_scale = static_cast<int>(std::lround(
-                    (1.0f - detail) * static_cast<float>(kScaleLevels - 1)));
-                if (detail <= 0.33f || detail >= 0.67f) {
-                    best_scale = variance_scale;
-                }
-            } else {
-                // Backward-compatible non-adaptive mode.
-                best_scale = 0;
+                if (detail <= 0.33f) best_scale = 1;
+                else if (detail >= 0.67f) best_scale = 0;
+                else best_scale = response1[i] > response0[i] ? 1 : 0;
             }
 
-            result.magnitude.set(x, y, mag[best_scale].get(x, y));
-            result.orientation.set(x, y, orient[best_scale].get(x, y));
-            result.gx.set(x, y, gx[best_scale].get(x, y));
-            result.gy.set(x, y, gy[best_scale].get(x, y));
+            const float sx = gx_data[best_scale][i];
+            const float sy = gy_data[best_scale][i];
+            out_gx[i] = sx;
+            out_gy[i] = sy;
+            out_magnitude[i] = std::sqrt(sx * sx + sy * sy);
+            out_orientation[i] = std::atan2(sy, sx);
         }
     }
 
-    result.best_scale = config_.adaptive_scale_selection ? -1 : 0;
     return result;
-}
-
-FloatImage EdgeDetector::fuse_multi_scale_magnitude(const FloatImage& mag0, const FloatImage& mag1,
-                                                     float w0, float w1) {
-    int w = mag0.width();
-    int h = mag0.height();
-    FloatImage result(w, h);
-    
-#ifdef HAS_OPENMP
-    #pragma omp parallel for
-#endif
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            result.set(x, y, mag0.get(x, y) * w0 + mag1.get(x, y) * w1);
-        }
-    }
-    
-    return result;
-}
-
-void EdgeDetector::fuse_multi_scale_orientation(const FloatImage& orient0, const FloatImage& mag0,
-                                                 const FloatImage& orient1, const FloatImage& mag1,
-                                                 FloatImage& out_orientation) {
-    int w = mag0.width();
-    int h = mag0.height();
-    out_orientation = FloatImage(w, h);
-    
-#ifdef HAS_OPENMP
-    #pragma omp parallel for
-#endif
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float m0 = mag0.get(x, y);
-            float m1 = mag1.get(x, y);
-            
-            if (m0 >= m1) {
-                out_orientation.set(x, y, orient0.get(x, y));
-            } else {
-                out_orientation.set(x, y, orient1.get(x, y));
-            }
-        }
-    }
 }
 
 float EdgeDetector::compute_global_percentile_threshold(const FloatImage& magnitude, float percentile) {
+    if (!std::isfinite(percentile) || percentile < 0.0f || percentile > 1.0f) {
+        throw std::invalid_argument("Edge percentile must be finite and between zero and one");
+    }
+    if (magnitude.empty()) return 0.1f;
     int w = magnitude.width();
     int h = magnitude.height();
     
     std::vector<float> values;
-    values.reserve(w * h);
+    values.reserve(checked_image_size(w, h));
     
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
@@ -297,11 +260,19 @@ float EdgeDetector::compute_global_percentile_threshold(const FloatImage& magnit
 
 float EdgeDetector::compute_tile_threshold(const FloatImage& magnitude, int x0, int y0, int tile_size,
                                             int img_w, int img_h, float percentile) {
+    if (tile_size <= 0 || img_w < 0 || img_h < 0 ||
+        !std::isfinite(percentile) || percentile < 0.0f || percentile > 1.0f) {
+        throw std::invalid_argument("Invalid edge tile size, bounds, or percentile");
+    }
+    img_w = std::min(img_w, magnitude.width());
+    img_h = std::min(img_h, magnitude.height());
+    const int x1 = static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(x0) + tile_size, 0, img_w));
+    const int y1 = static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(y0) + tile_size, 0, img_h));
+    x0 = std::clamp(x0, 0, img_w);
+    y0 = std::clamp(y0, 0, img_h);
+    if (x0 >= x1 || y0 >= y1) return 0.1f;
     std::vector<float> values;
-    values.reserve(tile_size * tile_size);
-    
-    int x1 = std::min(x0 + tile_size, img_w);
-    int y1 = std::min(y0 + tile_size, img_h);
+    values.reserve(checked_image_size(x1 - x0, y1 - y0));
     
     for (int y = y0; y < y1; ++y) {
         for (int x = x0; x < x1; ++x) {
@@ -322,17 +293,24 @@ float EdgeDetector::compute_tile_threshold(const FloatImage& magnitude, int x0, 
 
 FloatImage EdgeDetector::compute_adaptive_threshold_map(const FloatImage& magnitude, int tile_size,
                                                          float percentile, float floor) {
+    if (tile_size <= 0 || !std::isfinite(percentile) || percentile < 0.0f || percentile > 1.0f ||
+        !std::isfinite(floor)) {
+        throw std::invalid_argument("Invalid adaptive edge tile size, percentile, or floor");
+    }
     int w = magnitude.width();
     int h = magnitude.height();
-    FloatImage result((w + tile_size - 1) / tile_size, (h + tile_size - 1) / tile_size);
-    
-    int tw = result.width();
-    int th = result.height();
+    const int tw = w / tile_size + (w % tile_size != 0);
+    const int th = h / tile_size + (h % tile_size != 0);
+    const size_t tiles = checked_image_size(tw, th);
+    if (tiles > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("Adaptive edge grid exceeds supported tile count");
+    }
+    FloatImage result(tw, th);
 
 #ifdef HAS_OPENMP
     #pragma omp parallel for schedule(static)
 #endif
-    for (int tile = 0; tile < tw * th; ++tile) {
+    for (int tile = 0; tile < static_cast<int>(tiles); ++tile) {
         const int tx = tile % tw;
         const int ty = tile / tw;
         const int x0 = tx * tile_size;
@@ -346,6 +324,9 @@ FloatImage EdgeDetector::compute_adaptive_threshold_map(const FloatImage& magnit
 }
 
 EdgeData EdgeDetector::detect(const FloatImage& input, GradientData* selected_gradients) {
+    if (input.size_in_elements() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("Edge image exceeds supported pixel count");
+    }
     EdgeData result;
     
     GradientData grad;
@@ -376,11 +357,13 @@ EdgeData EdgeDetector::detect(const FloatImage& input, GradientData* selected_gr
     
     float low_thresh = config_.low_threshold;
     float high_thresh = config_.high_threshold;
+    const float low_ratio = high_thresh > 0.0f
+        ? std::clamp(low_thresh / high_thresh, 0.0f, 1.0f) : 0.0f;
     
     if (config_.adaptive_mode == "global") {
         high_thresh = compute_global_percentile_threshold(nms, config_.global_percentile);
-        high_thresh = std::max(high_thresh, config_.dark_scene_floor);
-        low_thresh = high_thresh * 0.5f;
+        high_thresh = std::max({high_thresh, config_.dark_scene_floor, config_.high_threshold});
+        low_thresh = high_thresh * low_ratio;
     } else if (config_.adaptive_mode == "local" || config_.adaptive_mode == "hybrid") {
         const float configured_floor = std::max(config_.dark_scene_floor, config_.high_threshold);
         FloatImage thresh_map = compute_adaptive_threshold_map(nms, config_.tile_size,
@@ -389,85 +372,34 @@ EdgeData EdgeDetector::detect(const FloatImage& input, GradientData* selected_gr
         const float global_high = std::max(
             compute_global_percentile_threshold(nms, config_.global_percentile), configured_floor);
         
-        result.edge_mask.resize(w * h, false);
-        
+        const size_t count = nms.size_in_elements();
+        if (count == 0) return result;
+        std::vector<uint8_t> state(config_.use_hysteresis ? count : 0, 0);
+        std::vector<int> pending;
+        if (!config_.use_hysteresis) result.edge_mask.resize(count, false);
         for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                int tx = x / config_.tile_size;
-                int ty = y / config_.tile_size;
-                if (tx >= thresh_map.width()) tx = thresh_map.width() - 1;
-                if (ty >= thresh_map.height()) ty = thresh_map.height() - 1;
-                
+            const int ty = y / config_.tile_size;
+            for (int tx = 0, x0 = 0; x0 < w; ++tx) {
+                const int x1 = x0 + std::min(config_.tile_size, w - x0);
                 float local_high = thresh_map.get(tx, ty);
                 if (config_.adaptive_mode == "hybrid") {
                     local_high = 0.5f * local_high + 0.5f * global_high;
                 }
-                
-                float mag = nms.get(x, y);
-                result.edge_mask[y * w + x] = mag >= local_high;
+                const float local_low = local_high * low_ratio;
+                for (int x = x0; x < x1; ++x) {
+                    const int i = y * w + x;
+                    const float mag = nms.data()[i];
+                    if (!config_.use_hysteresis) result.edge_mask[i] = mag >= local_high;
+                    else if (mag >= local_high) {
+                        state[i] = 2;
+                        pending.push_back(i);
+                    } else if (mag >= local_low) state[i] = 1;
+                }
+                x0 = x1;
             }
         }
-        
         if (config_.use_hysteresis) {
-            std::vector<bool> strong = result.edge_mask;
-            std::vector<bool> weak(w * h, false);
-            
-            for (int y = 0; y < h; ++y) {
-                for (int x = 0; x < w; ++x) {
-                    int idx = y * w + x;
-                    int tx = x / config_.tile_size;
-                    int ty = y / config_.tile_size;
-                    if (tx >= thresh_map.width()) tx = thresh_map.width() - 1;
-                    if (ty >= thresh_map.height()) ty = thresh_map.height() - 1;
-                    
-                    float local_high = thresh_map.get(tx, ty);
-                    if (config_.adaptive_mode == "hybrid") {
-                        local_high = 0.5f * local_high + 0.5f * global_high;
-                    }
-                    float local_low = local_high * 0.5f;
-                    
-                    float mag = nms.get(x, y);
-                    
-                    if (strong[idx]) {
-                        continue;
-                    } else if (mag >= local_low) {
-                        weak[idx] = true;
-                    }
-                }
-            }
-            
-            std::queue<std::pair<int, int>> queue;
-            std::fill(result.edge_mask.begin(), result.edge_mask.end(), false);
-            
-            for (int y = 0; y < h; ++y) {
-                for (int x = 0; x < w; ++x) {
-                    int idx = y * w + x;
-                    if (strong[idx]) {
-                        result.edge_mask[idx] = true;
-                        queue.push({x, y});
-                    }
-                }
-            }
-            
-            while (!queue.empty()) {
-                auto [cx, cy] = queue.front();
-                queue.pop();
-                
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (dx == 0 && dy == 0) continue;
-                        int nx = cx + dx;
-                        int ny = cy + dy;
-                        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
-                        
-                        int idx = ny * w + nx;
-                        if (weak[idx] && !result.edge_mask[idx]) {
-                            result.edge_mask[idx] = true;
-                            queue.push({nx, ny});
-                        }
-                    }
-                }
-            }
+            result.edge_mask = connect_weak_edges(state, pending, w, h);
         }
         
         return result;
@@ -540,22 +472,45 @@ FloatImage EdgeDetector::local_variance_3x3(const FloatImage& input) {
     #pragma omp parallel for
 #endif
     for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
+        const std::array<const float*, 3> rows = {
+            input.data() + static_cast<size_t>(std::max(0, y - 1)) * w,
+            input.data() + static_cast<size_t>(y) * w,
+            input.data() + static_cast<size_t>(std::min(h - 1, y + 1)) * w
+        };
+        const auto scalar_variance = [&](int x) {
             float sum = 0.0f;
             float sum_sq = 0.0f;
-            int count = 0;
-            for (int dy = -1; dy <= 1; ++dy) {
+            for (const float* row : rows) {
                 for (int dx = -1; dx <= 1; ++dx) {
-                    float v = input.get_clamped(x + dx, y + dy);
+                    const float v = row[std::clamp(x + dx, 0, w - 1)];
                     sum += v;
                     sum_sq += v * v;
-                    count++;
                 }
             }
-            float mean = sum / static_cast<float>(count);
-            float variance = std::max(0.0f, sum_sq / static_cast<float>(count) - mean * mean);
-            var.set(x, y, variance);
+            const float mean = sum / 9.0f;
+            return std::max(0.0f, sum_sq / 9.0f - mean * mean);
+        };
+        float* out = var.data() + static_cast<size_t>(y) * w;
+        out[0] = scalar_variance(0);
+        int x = 1;
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+        const __m128 nine = _mm_set1_ps(9.0f);
+        for (; x < w - 4; x += 4) {
+            __m128 sum = _mm_setzero_ps();
+            __m128 sum_sq = _mm_setzero_ps();
+            for (const float* row : rows) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const __m128 v = _mm_loadu_ps(row + x + dx);
+                    sum = _mm_add_ps(sum, v);
+                    sum_sq = _mm_add_ps(sum_sq, _mm_mul_ps(v, v));
+                }
+            }
+            const __m128 mean = _mm_div_ps(sum, nine);
+            const __m128 variance = _mm_sub_ps(_mm_div_ps(sum_sq, nine), _mm_mul_ps(mean, mean));
+            _mm_storeu_ps(out + x, _mm_max_ps(variance, _mm_setzero_ps()));
         }
+#endif
+        for (; x < w; ++x) out[x] = scalar_variance(x);
     }
     return var;
 }
@@ -563,14 +518,17 @@ FloatImage EdgeDetector::local_variance_3x3(const FloatImage& input) {
 FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
     int w = input.width();
     int h = input.height();
-    
-    if (sigma <= 0.0f) {
-        FloatImage result(w, h);
-        std::memcpy(result.data(), input.data(), w * h * sizeof(float));
-        return result;
+    if (!std::isfinite(sigma)) {
+        throw std::invalid_argument("Gaussian sigma must be finite");
     }
-    
-    int radius = static_cast<int>(std::ceil(sigma * 3));
+    // Below this scale all noncentral coefficients round to zero in float.
+    if (sigma <= 1e-4f) return input;
+    const double radius_value = std::ceil(static_cast<double>(sigma * 3.0f));
+    if (radius_value > (std::numeric_limits<int>::max() - 1) / 2) {
+        throw std::invalid_argument("Gaussian kernel radius exceeds supported size");
+    }
+    if (input.empty()) return input;
+    int radius = static_cast<int>(radius_value);
     int ksize = 2 * radius + 1;
     
     std::vector<float> kernel(ksize);
@@ -602,9 +560,9 @@ FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
 
     // Separable Gaussian: horizontal pass then vertical pass.
     // Border handling uses clamped replication to preserve energy.
-    FloatImage temp(w, h, 0.0f);
+    auto temp = std::make_unique_for_overwrite<float[]>(input.size_in_elements());
     const float* in_data = input.data();
-    float* temp_data = temp.data();
+    float* temp_data = temp.get();
 #ifdef HAS_OPENMP
     #pragma omp parallel for
 #endif
@@ -620,7 +578,7 @@ FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
         for (; x < interior_begin; ++x) {
             float acc = 0.0f;
             for (int k = -radius; k <= radius; ++k) {
-                int nx = std::clamp(x + k, 0, w - 1);
+                int nx = static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(x) + k, 0, w - 1));
                 acc += in_row[nx] * kernel[k + radius];
             }
             out_row[x] = acc;
@@ -661,7 +619,7 @@ FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
         for (; x < w; ++x) {
             float acc = 0.0f;
             for (int k = -radius; k <= radius; ++k) {
-                int nx = std::clamp(x + k, 0, w - 1);
+                int nx = static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(x) + k, 0, w - 1));
                 acc += in_row[nx] * kernel[k + radius];
             }
             out_row[x] = acc;
@@ -669,7 +627,7 @@ FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
     }
 
     FloatImage result(w, h, 0.0f);
-    const float* temp_ro = temp.data();
+    const float* temp_ro = temp.get();
     float* out_data = result.data();
     std::vector<const float*> row_ptrs(static_cast<size_t>(ksize), nullptr);
 #ifdef HAS_OPENMP
@@ -677,7 +635,7 @@ FloatImage EdgeDetector::gaussian_blur(const FloatImage& input, float sigma) {
 #endif
     for (int y = 0; y < h; ++y) {
         for (int k = -radius; k <= radius; ++k) {
-            int ny = std::clamp(y + k, 0, h - 1);
+            int ny = static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(y) + k, 0, h - 1));
             row_ptrs[k + radius] = temp_ro + static_cast<size_t>(ny) * w;
         }
 
@@ -820,6 +778,7 @@ FloatImage EdgeDetector::non_maximum_suppression(const FloatImage& magnitude, co
     int w = magnitude.width();
     int h = magnitude.height();
     FloatImage result(w, h, 0.0f);
+    if (w < 3 || h < 3) return result;
     
 #ifdef HAS_OPENMP
     #pragma omp parallel for
@@ -858,54 +817,26 @@ FloatImage EdgeDetector::non_maximum_suppression(const FloatImage& magnitude, co
 }
 
 std::vector<bool> EdgeDetector::hysteresis_threshold(const FloatImage& magnitude, int w, int h, float low, float high) {
-    std::vector<bool> strong(w * h, false);
-    std::vector<bool> weak(w * h, false);
-    std::vector<bool> result(w * h, false);
-    
+    const size_t count = checked_image_size(w, h);
+    if (count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("Edge image exceeds supported pixel count");
+    }
+    if (count == 0) return {};
+    std::vector<uint8_t> state(count, 0);
+    std::vector<int> pending;
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             int idx = y * w + x;
             float mag = magnitude.get(x, y);
             if (mag >= high) {
-                strong[idx] = true;
+                state[idx] = 2;
+                pending.push_back(idx);
             } else if (mag >= low) {
-                weak[idx] = true;
+                state[idx] = 1;
             }
         }
     }
-    
-    std::queue<std::pair<int, int>> queue;
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            int idx = y * w + x;
-            if (strong[idx]) {
-                result[idx] = true;
-                queue.push({x, y});
-            }
-        }
-    }
-    
-    while (!queue.empty()) {
-        auto [cx, cy] = queue.front();
-        queue.pop();
-        
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0) continue;
-                int nx = cx + dx;
-                int ny = cy + dy;
-                if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
-                
-                int idx = ny * w + nx;
-                if (weak[idx] && !result[idx]) {
-                    result[idx] = true;
-                    queue.push({nx, ny});
-                }
-            }
-        }
-    }
-    
-    return result;
+    return connect_weak_edges(state, pending, w, h);
 }
 
 }

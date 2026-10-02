@@ -43,7 +43,7 @@ public:
     CellStatsAggregator() = default;
     explicit CellStatsAggregator(const Config& config);
     
-    void set_config(const Config& config) { config_ = config; }
+    void set_config(const Config& config);
     const Config& config() const { return config_; }
     
     std::vector<CellStats> compute(const FloatImage& luminance, const EdgeData& edges, 

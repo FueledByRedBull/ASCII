@@ -3,6 +3,7 @@
 #include <fstream>
 #include <algorithm>
 #include <filesystem>
+#include <limits>
 #include "../src/core/temporal.hpp"
 #include "../src/core/edge_detector.hpp"
 #include "../src/core/types.hpp"
@@ -34,6 +35,7 @@ Args parse(std::initializer_list<const char*> values) {
 
 void test_cli_validation_and_precedence() {
     std::cout << "Testing CLI validation and config precedence...\n";
+    assert(parse({"ascii-engine", "../media/clip..mp4", "-o", "../output/frame.txt"}).valid);
 
     assert(!parse({"ascii-engine", "--fps"}).valid);
     assert(!parse({"ascii-engine", "--fps", "abc"}).valid);
@@ -97,6 +99,147 @@ void test_cli_validation_and_precedence() {
     std::cout << "[OK] CLI validation and config precedence test passed\n";
 }
 
+void test_config_numeric_validation() {
+    Config config;
+    std::string error;
+    assert(config.validate(error));
+    float* values[] = {
+        &config.grid.char_aspect, &config.grid.quad_tree_variance_threshold,
+        &config.edge.low_threshold, &config.edge.high_threshold, &config.edge.blur_sigma,
+        &config.edge.scale_sigma_0, &config.edge.scale_sigma_1,
+        &config.edge.scale_variance_floor, &config.edge.scale_variance_ceil,
+        &config.edge.diffusion_kappa, &config.edge.diffusion_lambda,
+        &config.edge.dark_scene_floor, &config.edge.global_percentile,
+        &config.edge.contour_min_occupancy, &config.edge.contour_dominance_ratio,
+        &config.edge.contour_intersection_ratio, &config.edge.contour_dog_sigma_inner,
+        &config.edge.contour_dog_sigma_outer, &config.temporal.alpha,
+        &config.temporal.transition_penalty, &config.temporal.edge_enter_threshold,
+        &config.temporal.edge_exit_threshold, &config.temporal.motion_reuse_scene_threshold,
+        &config.temporal.motion_reuse_confidence_decay, &config.temporal.motion_still_scene_threshold,
+        &config.temporal.wavelet_strength, &config.temporal.phase_blend,
+        &config.temporal.motion_phase_scene_trigger, &config.selector.weight_brightness,
+        &config.selector.weight_orientation, &config.selector.weight_contrast,
+        &config.selector.weight_frequency, &config.selector.weight_texture,
+        &config.color.dither_error_clamp, &config.color.halftone_strength,
+        &config.color.bilateral_spatial_sigma, &config.color.bilateral_range_sigma
+    };
+    for (float* value : values) {
+        const float original = *value;
+        for (float invalid : {std::numeric_limits<float>::quiet_NaN(),
+                              std::numeric_limits<float>::infinity(),
+                              -std::numeric_limits<float>::infinity()}) {
+            *value = invalid;
+            assert(!config.validate(error));
+            assert(!error.empty());
+        }
+        *value = original;
+    }
+    assert(config.validate(error));
+
+    config.edge.contour_dog_sigma_inner = 1.0e-30f;
+    config.edge.contour_dog_sigma_outer = 2.0e-30f;
+    assert(!config.validate(error));
+    config = Config::defaults();
+    for (float* sigma : {&config.edge.scale_sigma_0, &config.edge.scale_sigma_1,
+                         &config.edge.contour_dog_sigma_inner, &config.edge.contour_dog_sigma_outer}) {
+        const float original = *sigma;
+        *sigma = 1.0e30f;
+        assert(!config.validate(error));
+        *sigma = original;
+    }
+    for (float aspect : {0.0f, -1.0f, 1.0e-30f, 1.0e30f}) {
+        config.grid.char_aspect = aspect;
+        assert(!config.validate(error));
+    }
+    config.grid.char_aspect = 1.0f / 32.0f;
+    assert(config.validate(error));
+    config.grid.char_aspect = 64.0f;
+    assert(config.validate(error));
+    config = Config::defaults();
+    config.temporal.edge_exit_threshold = 0.8f;
+    config.temporal.edge_enter_threshold = 0.2f;
+    assert(!config.validate(error));
+    config.temporal.edge_enter_threshold = 1.1f;
+    assert(!config.validate(error));
+    config = Config::defaults();
+    config.temporal.motion_cap_pixels = std::numeric_limits<int>::max();
+    assert(!config.validate(error));
+    config = Config::defaults();
+    config.selector.weight_brightness = std::numeric_limits<float>::max();
+    config.selector.weight_orientation = std::numeric_limits<float>::max();
+    assert(!config.validate(error));
+}
+
+void test_config_toml_validation() {
+    const auto path = std::filesystem::temp_directory_path() / "ascii_engine_config_validation.toml";
+    const auto load_text = [&](const char* text) {
+        std::ofstream file(path);
+        file << text;
+        file.close();
+        assert(file);
+        return Config::load(path.string());
+    };
+    for (const char* invalid : {
+             "fps = \"30\"\n", "fps = true\n", "fps = 30.0\n", "fps = 1e100\n",
+             "fps = 4294967296\n", "config_version = \"1\"\n", "config_version = 2\n",
+             "profile = false\n", "no_audio = 1\n", "font_path = false\n",
+             "grid = 3\n", "[grid]\ncols = false\n", "[grid]\ncols = 4294967296\n",
+             "[grid]\nchar_aspect = true\n", "[grid]\nchar_aspect = 1e100\n",
+             "[edge]\nblur_sigma = nan\n", "[edge]\nscale_sigma_1 = inf\n",
+             "[edge]\nuse_hysteresis = 0\n", "[temporal]\nalpha = \"0.3\"\n",
+             "[selector]\nmode = \"unknown\"\n", "[color]\nmode = \"unknown\"\n",
+             "[color]\nmode = false\n", "[color]\nbilateral_spatial_bins = 32.0\n",
+             "[debug]\nstrict_memory = 1\n", "[input]\nsource = 4\n",
+             "[output]\nreplay_path = true\n", "[input]\nmode = \"webcam\"\n",
+             "[input]\nmode = \"\"\n", "[output]\nmode = \"video\"\n",
+             "[output]\nmode = \"\"\n", "[color]\nquantization = \"rgb\"\n",
+             "[color]\nquantization = \"\"\n"}) {
+        assert(!load_text(invalid));
+    }
+    const auto loaded = load_text("config_version = 1\nfps = 24\nno_audio = true\n"
+                                  "[grid]\ncols = 120\nrows = 40\nchar_aspect = 2\n"
+                                  "[edge]\nblur_sigma = 1.5\n"
+                                  "[selector]\nchar_set = \"traditional\"\n"
+                                  "[input]\nmode = \"file\"\n"
+                                  "[output]\nmode = \"terminal\"\n"
+                                  "[color]\nmode = \"none\"\nquantization = \"oklab\"\n");
+    assert(loaded);
+    assert(loaded->fps == 24 && loaded->no_audio);
+    assert(loaded->grid.cols == 120 && loaded->grid.char_aspect == 2.0f);
+    assert(loaded->edge.blur_sigma == 1.5f);
+    assert(loaded->selector.char_set == "traditional");
+    assert(loaded->color.mode == ColorMode::None);
+    std::filesystem::remove(path);
+}
+
+void test_orientation_preset_precedence_and_hash() {
+    for (const Args args : {
+             parse({"ascii-engine", "--fast", "--no-orientation"}),
+             parse({"ascii-engine", "--no-orientation", "--fast"})}) {
+        assert(args.valid);
+        const auto config = apply_cli_overrides(Config::defaults(), args);
+        assert(!config.selector.use_orientation_matching);
+        assert(!config.selector.use_simple_orientation);
+    }
+    Config config;
+    config.selector.use_orientation_matching = false;
+    config.selector.mode = "simple";
+    const auto fast = apply_cli_overrides(config, parse({"ascii-engine", "--fast"}));
+    assert(!fast.selector.use_orientation_matching && !fast.selector.use_simple_orientation);
+    const auto simple = apply_cli_overrides(config, parse({"ascii-engine", "--fast", "--simple-orientation"}));
+    assert(simple.selector.use_simple_orientation);
+    const auto original_hash = config.compute_hash();
+    config.selector.use_simple_orientation = true;
+    assert(config.compute_hash() != original_hash);
+    config = Config::defaults();
+    const auto standard_hash = config.compute_hash();
+    config.debug.enabled = true;
+    assert(config.compute_hash() != standard_hash);
+    const auto debug_hash = config.compute_hash();
+    config.debug.mode = "grayscale";
+    assert(config.compute_hash() != debug_hash);
+}
+
 void test_temporal_initialization() {
     std::cout << "Testing temporal smoothing initialization...\n";
     
@@ -155,12 +298,22 @@ void test_current_frame_hysteresis_and_orientation_controls() {
     FontLoader loader;
     assert(loader.load_system_fallback(16.0f).success());
     GlyphCache cache;
-    assert(cache.initialize(&loader, {' ', '-', '|', '/', '\\'}, 8, 16));
+    const std::vector<uint32_t> requested_glyphs = {' ', '-', '|', '/', '\\'};
+    assert(cache.initialize(&loader, requested_glyphs, 8, 16));
     const auto* space = cache.get_bitmap(' ');
     assert(space && space->width == 8 && space->height == 16);
     assert(std::all_of(space->pixels.begin(), space->pixels.end(), [](uint8_t v) { return v == 0; }));
     assert(cache.get_bitmap(0x2580));
     assert(cache.get_bitmap(0x2599));
+    const auto selectable_glyphs = cache.get_by_brightness();
+    assert(selectable_glyphs.size() == requested_glyphs.size());
+    assert(std::all_of(selectable_glyphs.begin(), selectable_glyphs.end(), [&](uint32_t cp) {
+        return std::find(requested_glyphs.begin(), requested_glyphs.end(), cp) != requested_glyphs.end();
+    }));
+    const auto edge_glyphs = cache.get_edge_glyphs();
+    assert(std::all_of(edge_glyphs.begin(), edge_glyphs.end(), [&](uint32_t cp) {
+        return std::find(requested_glyphs.begin(), requested_glyphs.end(), cp) != requested_glyphs.end();
+    }));
 
     selector_config.use_simple_orientation = true;
     selector_config.use_orientation_matching = false;
@@ -330,7 +483,7 @@ void test_runtime_cache_local_motion_and_area_downsample() {
     assert(!cache.begin_frame(first, query).reuse_pipeline_result);
     Pipeline::Result cached_result;
     cached_result.cell_stats.resize(1);
-    cache.commit_processed_result(cached_result, true, false);
+    cache.commit_processed_result(cached_result, true, true, false);
     assert(cache.begin_frame(first, query).reuse_pipeline_result);
 
     FrameBuffer localized = first;
@@ -558,6 +711,9 @@ int main() {
         test_frame_rate_invariant_temporal_and_motion_reference();
         test_exhaustive_glyph_selection_scene_cut_and_render_tolerance();
         test_cli_validation_and_precedence();
+        test_config_numeric_validation();
+        test_config_toml_validation();
+        test_orientation_preset_precedence_and_hash();
         test_edge_bounds_checking();
         test_font_validation();
         

@@ -6,9 +6,25 @@ namespace ascii {
 
 void BilateralGrid::build(const std::vector<CellStats>& cells, int cols, int rows) {
     built_ = false;
-    source_cols_ = std::max(1, cols);
-    source_rows_ = std::max(1, rows);
-    const int spatial_limit = std::max(2, config_.spatial_bins);
+    cols_ = rows_ = source_cols_ = source_rows_ = 0;
+    if (cols < 0 || rows < 0) {
+        throw std::invalid_argument("Bilateral source dimensions must be non-negative");
+    }
+    if (!config_.enabled || cols == 0 || rows == 0) return;
+    const size_t source_cells = checked_image_size(cols, rows);
+    if (cells.size() < source_cells) return;
+    if (source_cells > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("Bilateral source exceeds supported cell count");
+    }
+    if (config_.spatial_bins < 2 || config_.spatial_bins > 256 ||
+        config_.range_bins < 4 || config_.range_bins > 64 ||
+        !std::isfinite(config_.spatial_sigma) || config_.spatial_sigma < 0.0f || config_.spatial_sigma > 16.0f ||
+        !std::isfinite(config_.range_sigma) || config_.range_sigma < 0.0f || config_.range_sigma > 1.0f) {
+        throw std::invalid_argument("Invalid bilateral bin counts or smoothing sigmas");
+    }
+    source_cols_ = cols;
+    source_rows_ = rows;
+    const int spatial_limit = config_.spatial_bins;
     if (source_cols_ >= source_rows_) {
         cols_ = std::min(source_cols_, spatial_limit);
         rows_ = std::min(source_rows_, std::max(1, static_cast<int>(std::lround(
@@ -18,16 +34,12 @@ void BilateralGrid::build(const std::vector<CellStats>& cells, int cols, int row
         cols_ = std::min(source_cols_, std::max(1, static_cast<int>(std::lround(
             static_cast<double>(source_cols_) * rows_ / source_rows_))));
     }
-    range_bins_ = std::max(4, config_.range_bins);
-    int total = cols_ * rows_ * range_bins_;
+    range_bins_ = config_.range_bins;
+    const size_t total = checked_image_size(cols_, rows_, static_cast<size_t>(range_bins_));
     sum_r_.assign(total, 0.0f);
     sum_g_.assign(total, 0.0f);
     sum_b_.assign(total, 0.0f);
     weight_.assign(total, 0.0f);
-
-    if (!config_.enabled || static_cast<int>(cells.size()) < source_cols_ * source_rows_) {
-        return;
-    }
 
     for (int y = 0; y < source_rows_; ++y) {
         const float yf = source_rows_ > 1
@@ -43,6 +55,10 @@ void BilateralGrid::build(const std::vector<CellStats>& cells, int cols, int row
             const float tx = xf - x0;
             int ci = y * source_cols_ + x;
             const auto& c = cells[ci];
+            if (!std::isfinite(c.mean_luminance) || !std::isfinite(c.mean_r) ||
+                !std::isfinite(c.mean_g) || !std::isfinite(c.mean_b)) {
+                throw std::invalid_argument("Bilateral cell values must be finite");
+            }
             float lum = std::clamp(c.mean_luminance, 0.0f, 1.0f);
             float zf = lum * (range_bins_ - 1);
             int z0 = std::clamp(static_cast<int>(std::floor(zf)), 0, range_bins_ - 1);
@@ -89,7 +105,7 @@ void BilateralGrid::build(const std::vector<CellStats>& cells, int cols, int row
 
 BilateralGrid::Sample BilateralGrid::sample(int x, int y, float luminance) const {
     Sample s{};
-    if (!valid()) {
+    if (!valid() || !std::isfinite(luminance)) {
         return s;
     }
 
@@ -121,16 +137,16 @@ BilateralGrid::Sample BilateralGrid::sample(int x, int y, float luminance) const
         for (int iy = 0; iy < 2; ++iy) {
             for (int ix = 0; ix < 2; ++ix) {
                 const int grid_index = idx(xs[ix], ys[iy], zs[iz]);
-                if (weight_[grid_index] <= 1e-6f) continue;
                 const float interpolation_weight = xw[ix] * yw[iy] * zw[iz];
-                s.r += (sum_r_[grid_index] / weight_[grid_index]) * interpolation_weight;
-                s.g += (sum_g_[grid_index] / weight_[grid_index]) * interpolation_weight;
-                s.b += (sum_b_[grid_index] / weight_[grid_index]) * interpolation_weight;
-                accumulated_weight += interpolation_weight;
+                s.r += sum_r_[grid_index] * interpolation_weight;
+                s.g += sum_g_[grid_index] * interpolation_weight;
+                s.b += sum_b_[grid_index] * interpolation_weight;
+                accumulated_weight += weight_[grid_index] * interpolation_weight;
             }
         }
     }
     if (accumulated_weight > 1e-6f) {
+        s.has_support = true;
         s.r /= accumulated_weight;
         s.g /= accumulated_weight;
         s.b /= accumulated_weight;

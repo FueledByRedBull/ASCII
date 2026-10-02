@@ -1,6 +1,8 @@
 #include "terminal_renderer.hpp"
 #include <charconv>
 #include <system_error>
+#include <limits>
+#include <stdexcept>
 
 namespace ascii {
 
@@ -15,9 +17,12 @@ void TerminalRenderer::set_color_mode(ColorMode mode) {
 }
 
 void TerminalRenderer::set_grid_size(int cols, int rows) {
+    if (cols <= 0 || rows <= 0 || cols > std::numeric_limits<int>::max() / rows) {
+        throw std::invalid_argument("Terminal grid dimensions are invalid");
+    }
     cols_ = cols;
     rows_ = rows;
-    prev_buffer_.assign(static_cast<size_t>(cols) * rows, ASCIICell{});
+    prev_buffer_.clear();
     const size_t reserve_bytes = static_cast<size_t>(cols) * static_cast<size_t>(rows) * 8;
     if (out_buffer_.capacity() < reserve_bytes) {
         out_buffer_.reserve(reserve_bytes);
@@ -40,22 +45,24 @@ std::string TerminalRenderer::render_to_string(const std::vector<ASCIICell>& cel
     }
     int cursor_x = -1;
     int cursor_y = -1;
+    const auto changed = [&](size_t idx) {
+        if (idx >= prev_buffer_.size()) return true;
+        const auto& cell = cells[idx];
+        const auto& prev = prev_buffer_[idx];
+        return cell.codepoint != prev.codepoint ||
+               cell.fg_r != prev.fg_r || cell.fg_g != prev.fg_g || cell.fg_b != prev.fg_b ||
+               cell.bg_r != prev.bg_r || cell.bg_g != prev.bg_g || cell.bg_b != prev.bg_b;
+    };
     
     int y = 0;
     while (y < rows_) {
         int x = 0;
         while (x < cols_) {
             int idx = y * cols_ + x;
-            if (idx >= static_cast<int>(cells.size())) break;
+            if (static_cast<size_t>(idx) >= cells.size()) break;
             
             const ASCIICell& cell = cells[idx];
-            const ASCIICell& prev = prev_buffer_.empty() ? ASCIICell{} : prev_buffer_[idx];
-            
-            bool changed = cell.codepoint != prev.codepoint ||
-                          cell.fg_r != prev.fg_r || cell.fg_g != prev.fg_g || cell.fg_b != prev.fg_b ||
-                          cell.bg_r != prev.bg_r || cell.bg_g != prev.bg_g || cell.bg_b != prev.bg_b;
-            
-            if (!changed) {
+            if (!changed(static_cast<size_t>(idx))) {
                 x++;
                 continue;
             }
@@ -81,16 +88,10 @@ std::string TerminalRenderer::render_to_string(const std::vector<ASCIICell>& cel
             
             for (int rx = x; rx < cols_; ++rx) {
                 int ridx = y * cols_ + rx;
-                if (ridx >= static_cast<int>(cells.size())) break;
+                if (static_cast<size_t>(ridx) >= cells.size()) break;
                 
                 const ASCIICell& rcell = cells[ridx];
-                const ASCIICell& rprev = prev_buffer_.empty() ? ASCIICell{} : prev_buffer_[ridx];
-                
-                bool rchanged = rcell.codepoint != rprev.codepoint ||
-                               rcell.fg_r != rprev.fg_r || rcell.fg_g != rprev.fg_g || rcell.fg_b != rprev.fg_b ||
-                               rcell.bg_r != rprev.bg_r || rcell.bg_g != rprev.bg_g || rcell.bg_b != rprev.bg_b;
-                
-                if (!rchanged) break;
+                if (!changed(static_cast<size_t>(ridx))) break;
                 
                 bool color_matches = rcell.fg_r == run_r && rcell.fg_g == run_g && rcell.fg_b == run_b;
                 bool bg_matches = rcell.bg_r == run_bg_r && rcell.bg_g == run_bg_g && rcell.bg_b == run_bg_b;
@@ -101,7 +102,7 @@ std::string TerminalRenderer::render_to_string(const std::vector<ASCIICell>& cel
             
             for (int rx = x; rx <= run_end; ++rx) {
                 int ridx = y * cols_ + rx;
-                if (ridx < static_cast<int>(cells.size())) {
+                if (static_cast<size_t>(ridx) < cells.size()) {
                     append_utf8(cells[ridx].codepoint);
                 }
             }
@@ -147,6 +148,10 @@ void TerminalRenderer::append_cursor_move(int row, int col) {
 }
 
 void TerminalRenderer::append_utf8(uint32_t cp) {
+    if (cp < 0x20 || (cp >= 0x7F && cp <= 0x9F) ||
+        (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) {
+        cp = 0xFFFD;
+    }
     if (cp < 0x80) {
         out_buffer_.push_back(static_cast<char>(cp));
     } else if (cp < 0x800) {

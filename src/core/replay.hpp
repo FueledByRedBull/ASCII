@@ -47,12 +47,15 @@ class ReplayWriter {
 public:
     ReplayWriter();
     ~ReplayWriter();
+    ReplayWriter(const ReplayWriter&) = delete;
+    ReplayWriter& operator=(const ReplayWriter&) = delete;
     
     bool open(const std::string& path, int cols, int rows, int fps, const std::string& config_hash);
     bool write_frame(uint32_t frame_index, const std::vector<ASCIICell>& cells);
     bool write_frame_delta(uint32_t frame_index, const std::vector<ASCIICell>& cells, 
                            const std::vector<ASCIICell>& prev_cells);
     bool close();
+    void abort();
     
     uint32_t frame_count() const { return frame_count_; }
     bool is_open() const { return file_ != nullptr; }
@@ -76,8 +79,10 @@ class ReplayReader {
 public:
     ReplayReader();
     ~ReplayReader();
+    ReplayReader(const ReplayReader&) = delete;
+    ReplayReader& operator=(const ReplayReader&) = delete;
     
-    bool open(const std::string& path);
+    bool open(const std::string& path, size_t memory_budget = 256ull * 1024ull * 1024ull);
     bool read_frame(uint32_t frame_index, std::vector<ASCIICell>& cells);
     bool seek_frame(uint32_t frame_index);
     void close();

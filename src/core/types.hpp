@@ -85,11 +85,7 @@ public:
     FrameBuffer() = default;
     FrameBuffer(int w, int h) : width_(w), height_(h), data_(checked_image_size(w, h, 4), 0) {}
     FrameBuffer(int w, int h, const Color& fill) : width_(w), height_(h), data_(checked_image_size(w, h, 4)) {
-        const size_t pixels = checked_image_size(w, h);
-        for (size_t i = 0; i < pixels; ++i) {
-            set_pixel(static_cast<int>(i % static_cast<size_t>(w)),
-                      static_cast<int>(i / static_cast<size_t>(w)), fill);
-        }
+        this->fill(fill);
     }
     
     int width() const { return width_; }
@@ -102,13 +98,13 @@ public:
     
     Color get_pixel(int x, int y) const {
         if (x < 0 || x >= width_ || y < 0 || y >= height_) return Color();
-        const size_t idx = (y * width_ + x) * 4;
+        const size_t idx = (static_cast<size_t>(y) * width_ + x) * 4;
         return Color(data_[idx], data_[idx+1], data_[idx+2], data_[idx+3]);
     }
     
     void set_pixel(int x, int y, const Color& c) {
         if (x < 0 || x >= width_ || y < 0 || y >= height_) return;
-        const size_t idx = (y * width_ + x) * 4;
+        const size_t idx = (static_cast<size_t>(y) * width_ + x) * 4;
         data_[idx] = c.r;
         data_[idx+1] = c.g;
         data_[idx+2] = c.b;
@@ -116,10 +112,11 @@ public:
     }
     
     void fill(const Color& c) {
-        for (int y = 0; y < height_; ++y) {
-            for (int x = 0; x < width_; ++x) {
-                set_pixel(x, y, c);
-            }
+        for (size_t i = 0; i < data_.size(); i += 4) {
+            data_[i] = c.r;
+            data_[i + 1] = c.g;
+            data_[i + 2] = c.b;
+            data_[i + 3] = c.a;
         }
     }
     
@@ -149,18 +146,19 @@ public:
     
     float get(int x, int y) const {
         if (x < 0 || x >= width_ || y < 0 || y >= height_) return 0.0f;
-        return data_[y * width_ + x];
+        return data_[static_cast<size_t>(y) * width_ + x];
     }
     
     void set(int x, int y, float v) {
         if (x < 0 || x >= width_ || y < 0 || y >= height_) return;
-        data_[y * width_ + x] = v;
+        data_[static_cast<size_t>(y) * width_ + x] = v;
     }
     
     float get_clamped(int x, int y) const {
+        if (empty()) return 0.0f;
         x = std::clamp(x, 0, width_ - 1);
         y = std::clamp(y, 0, height_ - 1);
-        return data_[y * width_ + x];
+        return data_[static_cast<size_t>(y) * width_ + x];
     }
     
     void fill(float v) {
@@ -212,7 +210,8 @@ struct EdgeData {
     
     bool is_edge(int x, int y) const {
         if (x < 0 || x >= magnitude.width() || y < 0 || y >= magnitude.height()) return false;
-        return edge_mask[y * magnitude.width() + x];
+        const size_t index = static_cast<size_t>(y) * magnitude.width() + x;
+        return index < edge_mask.size() && edge_mask[index];
     }
 };
 

@@ -1,6 +1,6 @@
 # ASCII Engine
 
-Status: the no-OpenCV, non-AVX2 v1 baseline is complete. It passes 34 clean-build tests locally and in hosted Windows/Linux/macOS CI, and the Windows ZIP passes a separate clean-runner smoke test. Evidence is tracked in `PROJECT.md`.
+Status: Windows/MSVC with OpenCV and AVX2 disabled is the supported local baseline. Current validation and the separately dated hosted-CI/release evidence are tracked in `PROJECT.md` and `tests/baseline/README.md`.
 
 ASCII Engine is a deterministic, non-ML C++20 renderer that converts video and images into ANSI/ASCII output for terminal playback and file export.
 
@@ -17,8 +17,8 @@ ASCII Engine is a deterministic, non-ML C++20 renderer that converts video and i
 
 Recent performance-oriented updates include:
 
-1. Hierarchical motion estimation (coarse-to-fine pyramid refinement)
-2. SIMD hot paths when explicitly enabled; the default release baseline is scalar-portable
+1. Sparse block motion with hierarchical phase-correlation refinement
+2. Portable scalar paths and SSE2 on supported CPUs; AVX2 remains opt-in
 3. Cache-aware tiling in edge/blur kernels
 4. Optimized in-tree FFT phase-correlation (plan/twiddle caching, workspace reuse, rectangular FFT)
 5. Stable-frame cache reuse for pipeline and cell stats
@@ -47,10 +47,13 @@ assets/        assets
 
 ### Windows
 
+- Windows 10 version 1903 or later (verified locally on Windows 11)
 - Visual Studio 2022 (Build Tools or Community) with C++ desktop workload
 - CMake
 - Ninja
 - Git
+
+MSVC executables use a process-local UTF-8 manifest so non-ASCII filenames work consistently across the filesystem, C runtime, and FFmpeg. This uses [Windows UTF-8 code-page support](https://learn.microsoft.com/en-us/windows/apps/design/globalizing/use-utf8-code-page); no system locale change is needed.
 
 Dependencies installed by script:
 
@@ -192,12 +195,14 @@ Play replay or export replay text:
 | video | still (`.jpg`, `.jpeg`, `.bmp`) | write the first rendered frame only |
 | any | unsupported extension | fail before processing with a clear error |
 
-Requested file outputs are finalized through temporary files and return non-zero on open, write, encode, replay, or truncated-decode failure. PNG is intentionally not an output target in the verified no-OpenCV Windows baseline.
+Video, still-image and replay outputs are finalized through temporary files. Failures before finalization preserve the corresponding existing destination. Each destination is finalized separately: if another output fails later, an already finalized output remains. Numbered text frames are written incrementally; a later failure can leave earlier completed frames. Input, output and replay destinations must be distinct, including generated numbered filenames. PNG is intentionally not an output target in the verified no-OpenCV Windows baseline. Available video containers also require an installed encoder; unsupported encoder/container combinations fail explicitly.
+
+Bitmap exports blend antialiased glyphs in linear light. Ordinary ASCII uses source-colored glyph strokes on black, so its average brightness is limited by the selected glyphs' coverage. Use `--color blockart` for foreground/background quadrant reconstruction. Terminal appearance also depends on its configured font.
 
 ### Common Flags
 
 - `--profile natural|anime|ui`
-- `--char-set basic|blocks|line-art`
+- `--char-set basic|traditional|blocks|line-art` (`traditional` uses the compact ` .:-=+*#%@` ramp)
 - `--color none|16|256|truecolor|blockart`
 - `--fps N --cols N --rows N`
 - `--edge-thresh X --blur X --temporal X`
@@ -205,11 +210,11 @@ Requested file outputs are finalized through temporary files and return non-zero
 - `--motion-solve-div N --motion-reuse N --motion-still-thresh X`
 - `--phase-interval N --phase-scene-trigger X`
 - `--scale fit|fill|stretch`
-- `--font <PATH>`
+- `--font <PATH>` (an explicitly requested font must load successfully)
 - `--no-audio`
-- `--debug grayscale|edges|orientation`
+- `--debug grayscale|edges|orientation` (terminal, file and replay output; honors `--color`)
 - `--profile-live`
-- `--strict-memory`
+- `--strict-memory` (rejects requests whose estimated render memory exceeds 512 MiB)
 - `--fast` (disables costly analysis features for speed-focused preview)
 
 ### Performance Output
@@ -220,14 +225,21 @@ At program exit the engine prints a summary to `stderr`:
 - `[PERF_STAGES]` absolute stage times (pipeline, motion, select, render, encode, misc)
 - `[PERF_STAGES_PCT]` stage percentages of processing time
 
-The 2026-07-16 reference measurement used a deterministic 60-frame 1920x1080 video, `120x40`, truecolor, no audio, Release MSVC/OpenMP, no OpenCV, and no AVX2 on a Ryzen 7 7800X3D:
+The 2026-10-02 measurement used 120 changing 1920x1080 frames, `120x40`, truecolor, no audio, and offline text export on a Ryzen 7 7800X3D. Release MSVC/OpenMP, OpenCV off, AVX2 off; FPS values are medians of three independent runs, and memory is the maximum measured peak:
 
-| Mode | Processing | Peak working set |
-|---|---:|---:|
-| Full quality | 10.86 FPS | 136.43 MiB |
-| `--fast --no-contours` | 25.70 FPS | 106.70 MiB |
+| Mode | OpenMP threads | Processing | Including startup/exit | Peak working set |
+|---|---:|---:|---:|---:|
+| Full quality | 12 | 27.40 FPS | 26.60 FPS | 113.51 MiB |
+| `--fast --no-contours` | 4 | 56.34 FPS | 53.44 FPS | 93.95 MiB |
 
-One-image startup/process/exit measured 0.32 seconds and 75.91 MiB. The explicit speed path meets the 24 FPS reference target; full-quality mode does not, so use `--fast --no-contours` when throughput is the priority.
+Both meet the measured host's targets of 24 FPS full quality and 30 FPS fast mode. The supplied real-video segment reaches 37.11 FPS full quality. Independent one-image startup/render/exit runs took 0.10-0.11 seconds. These are processing/export measurements; terminal painting, other hardware, codecs and grid sizes can change throughput. The complete workload matrix and limitations are in `tests/baseline/README.md`.
+
+Set the measured thread count before launching (the best count depends on the host):
+
+```powershell
+$env:OMP_NUM_THREADS = '12'  # Use '4' for the measured fast mode.
+.\build-noopencv\ascii-engine.exe input.mp4 --cols 120 --rows 40 --color truecolor --no-audio -o frames.txt
+```
 
 ### Speed Tuning Example
 

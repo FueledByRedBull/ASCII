@@ -50,6 +50,7 @@ public:
     MultiScaleGradientData compute_multi_scale_gradients(const FloatImage& input);
     EdgeData detect(const FloatImage& input, GradientData* selected_gradients = nullptr);
     
+    // Finite nonpositive sigma returns the input unchanged; invalid kernel sizes throw.
     static FloatImage gaussian_blur(const FloatImage& input, float sigma);
     static void sobel(const FloatImage& input, FloatImage& gx, FloatImage& gy);
     static FloatImage non_maximum_suppression(const FloatImage& magnitude, const FloatImage& orientation);
@@ -64,11 +65,6 @@ public:
 private:
     Config config_;
     
-    static FloatImage fuse_multi_scale_magnitude(const FloatImage& mag0, const FloatImage& mag1,
-                                                  float w0, float w1);
-    static void fuse_multi_scale_orientation(const FloatImage& orient0, const FloatImage& mag0,
-                                             const FloatImage& orient1, const FloatImage& mag1,
-                                             FloatImage& out_orientation);
     static FloatImage anisotropic_diffusion(const FloatImage& input, int iterations, float kappa, float lambda);
     static FloatImage local_variance_3x3(const FloatImage& input);
 };

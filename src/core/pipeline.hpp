@@ -59,13 +59,14 @@ public:
     
     void set_config(const Config& config);
     const Config& config() const { return config_; }
+    const EdgeDetector::Config& edge_config() const { return edge_detector_.config(); }
     
     struct Result {
         FloatImage luminance;
         EdgeData edges;
         std::vector<CellStats> cell_stats;
-        int grid_cols;
-        int grid_rows;
+        int grid_cols = 0;
+        int grid_rows = 0;
         FrameBuffer color_buffer;
         GradientData gradients;
     };

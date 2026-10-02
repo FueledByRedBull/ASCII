@@ -203,11 +203,11 @@ std::string ffmpeg_error_string(int errnum) {
 VideoEncoder::VideoEncoder() = default;
 
 VideoEncoder::~VideoEncoder() {
-    close();
+    abort();
 }
 
 bool VideoEncoder::open(const std::string& filename, const Config& config) {
-    close();
+    abort();
     last_error_.clear();
     config_ = config;
     output_filename_ = filename;
@@ -217,8 +217,6 @@ bool VideoEncoder::open(const std::string& filename, const Config& config) {
     wrote_still_image_frame_ = false;
     header_written_ = false;
     failed_ = false;
-    source_width_ = 0;
-    source_height_ = 0;
     
     int ret = avformat_alloc_output_context2(
         &format_ctx_, nullptr, nullptr, temporary_filename_.c_str());
@@ -257,8 +255,12 @@ bool VideoEncoder::open(const std::string& filename, const Config& config) {
 bool VideoEncoder::close() {
     bool ok = !failed_;
     const bool has_frames = pts_ > 0 || wrote_still_image_frame_;
+    if (!temporary_filename_.empty() && !has_frames) {
+        if (last_error_.empty()) set_error("No frames were written");
+        ok = false;
+    }
     if (format_ctx_) {
-        if (header_written_ && !write_trailer()) {
+        if (ok && header_written_ && !write_trailer()) {
             ok = false;
         }
         
@@ -276,6 +278,9 @@ bool VideoEncoder::close() {
     
     if (frame_) {
         av_frame_free(&frame_);
+    }
+    if (source_frame_) {
+        av_frame_free(&source_frame_);
     }
     
     if (pkt_) {
@@ -313,9 +318,12 @@ bool VideoEncoder::close() {
     wrote_still_image_frame_ = false;
     header_written_ = false;
     failed_ = false;
-    source_width_ = 0;
-    source_height_ = 0;
     return ok;
+}
+
+void VideoEncoder::abort() {
+    failed_ = true;
+    close();
 }
 
 bool VideoEncoder::write_frame(const FrameBuffer& frame) {
@@ -340,9 +348,28 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
         return false;
     }
     
-    if (sws_ctx_ && (source_width_ != frame.width() || source_height_ != frame.height())) {
-        sws_freeContext(sws_ctx_);
+    if (source_frame_ && (source_frame_->width != frame.width() || source_frame_->height != frame.height())) {
+        av_frame_free(&source_frame_);
+        if (sws_ctx_) sws_freeContext(sws_ctx_);
         sws_ctx_ = nullptr;
+    }
+    if (!source_frame_) {
+        source_frame_ = av_frame_alloc();
+        if (!source_frame_) {
+            set_error("Failed to allocate source frame");
+            failed_ = true;
+            return false;
+        }
+        source_frame_->format = AV_PIX_FMT_RGBA;
+        source_frame_->width = frame.width();
+        source_frame_->height = frame.height();
+        const int ret = av_frame_get_buffer(source_frame_, 0);
+        if (ret < 0) {
+            av_frame_free(&source_frame_);
+            set_error("Failed to allocate source buffer: " + ffmpeg_error_string(ret));
+            failed_ = true;
+            return false;
+        }
     }
     if (!sws_ctx_) {
         sws_ctx_ = sws_getContext(
@@ -355,14 +382,15 @@ bool VideoEncoder::write_frame(const FrameBuffer& frame) {
             failed_ = true;
             return false;
         }
-        source_width_ = frame.width();
-        source_height_ = frame.height();
     }
-    
-    const uint8_t* src_data[1] = { frame.data() };
-    int src_linesize[1] = { frame.width() * 4 };
-    
-    if (sws_scale(sws_ctx_, src_data, src_linesize, 0, frame.height(),
+
+    // swscale requires padded planes and four plane/stride entries, even for RGBA.
+    const size_t row_bytes = static_cast<size_t>(frame.width()) * 4;
+    for (int y = 0; y < frame.height(); ++y) {
+        std::memcpy(source_frame_->data[0] + static_cast<size_t>(y) * source_frame_->linesize[0],
+                    frame.data() + static_cast<size_t>(y) * row_bytes, row_bytes);
+    }
+    if (sws_scale(sws_ctx_, source_frame_->data, source_frame_->linesize, 0, frame.height(),
                   frame_->data, frame_->linesize) <= 0) {
         set_error("Failed to convert input frame");
         failed_ = true;
@@ -435,6 +463,12 @@ bool VideoEncoder::init_codec() {
         }
     } else {
         push_codec_candidate(candidates, avcodec_find_encoder_by_name(config_.codec.c_str()));
+        push_codec_candidate(candidates, avcodec_find_encoder(format_ctx_->oformat->video_codec));
+        if (ends_with_ci(output_filename_, ".webm")) {
+            push_codec_candidate(candidates, avcodec_find_encoder(AV_CODEC_ID_VP9));
+            push_codec_candidate(candidates, avcodec_find_encoder(AV_CODEC_ID_VP8));
+            push_codec_candidate(candidates, avcodec_find_encoder(AV_CODEC_ID_AV1));
+        }
         push_codec_candidate(candidates, avcodec_find_encoder_by_name("libx264"));
         push_codec_candidate(candidates, avcodec_find_encoder_by_name("libopenh264"));
         push_codec_candidate(candidates, avcodec_find_encoder_by_name("mpeg4"));
@@ -449,6 +483,9 @@ bool VideoEncoder::init_codec() {
     const AVCodec* opened_codec = nullptr;
     for (const AVCodec* codec : candidates) {
         if (!codec) {
+            continue;
+        }
+        if (avformat_query_codec(format_ctx_->oformat, codec->id, FF_COMPLIANCE_NORMAL) == 0) {
             continue;
         }
 #ifdef _WIN32
@@ -560,11 +597,15 @@ bool VideoEncoder::write_trailer() {
     if (!format_ctx_) return false;
     
     if (codec_ctx_) {
-        avcodec_send_frame(codec_ctx_, nullptr);
+        const int sent = avcodec_send_frame(codec_ctx_, nullptr);
+        if (sent < 0 && sent != AVERROR_EOF) {
+            set_error("Failed to start encoder drain: " + ffmpeg_error_string(sent));
+            return false;
+        }
         
         while (true) {
             int ret = avcodec_receive_packet(codec_ctx_, pkt_);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret == AVERROR_EOF) break;
             if (ret < 0) {
                 set_error("Failed to flush encoder packet: " + ffmpeg_error_string(ret));
                 return false;

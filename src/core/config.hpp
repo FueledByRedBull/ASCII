@@ -147,7 +147,6 @@ struct Config {
     static std::string default_config_dir();
 };
 
-Config merge_config(Config base, const Config& override);
 Config apply_cli_overrides(Config config, const struct Args& args);
 void apply_content_profile(Config& config);
 

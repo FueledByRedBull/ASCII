@@ -161,16 +161,16 @@ TEST(cell_stats_computation) {
     assert(agg.grid_rows(16) == 1);
 }
 
-TEST(font_loader_path_traversal) {
+TEST(font_loader_invalid_paths) {
     FontLoader loader;
     
-    auto result = loader.load("../../../etc/passwd");
+    auto result = loader.load("missing_font_for_test.ttf");
     assert(!result.success());
     
-    result = loader.load("..\\..\\..\\windows\\system32");
+    result = loader.load(".");
     assert(!result.success());
     
-    result = loader.load("/etc/passwd\x00.ttf");
+    result = loader.load(std::string("missing\0.ttf", 12));
     assert(!result.success());
 }
 
@@ -221,6 +221,9 @@ TEST(char_sets_available) {
     auto basic = CharSet::get_set("basic");
     assert(!basic.empty());
     assert(std::find(basic.begin(), basic.end(), static_cast<uint32_t>(' ')) != basic.end());
+
+    auto traditional = CharSet::get_set("traditional");
+    assert(traditional == CharSet::to_codepoints(" .:-=+*#%@"));
     
     auto blocks = CharSet::get_set("blocks");
     assert(!blocks.empty());
@@ -279,16 +282,16 @@ TEST(color_mapper_hsv) {
 
 TEST(terminal_rgb_to_256) {
     uint8_t idx = Terminal::rgb_to_256(0, 0, 0);
-    assert(idx < 256);
+    assert(idx == 0);
     
     idx = Terminal::rgb_to_256(255, 255, 255);
-    assert(idx < 256);
+    assert(idx == 15);
     
     idx = Terminal::rgb_to_256(128, 128, 128);
-    assert(idx < 256);
+    assert(idx == 8);
     
     idx = Terminal::rgb_to_256(255, 0, 0);
-    assert(idx < 256);
+    assert(idx == 9);
 }
 
 TEST(terminal_rgb_to_16) {
@@ -437,6 +440,17 @@ TEST(size_type) {
     assert(s1.area() == 200);
 }
 
+TEST(temporal_invalid_geometry) {
+    TemporalSmoother smoother;
+    smoother.initialize(2, 2);
+    bool rejected = false;
+    try { smoother.initialize(-1, -1); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected);
+    smoother.reset();
+    assert(smoother.frame_state().size() == 4);
+}
+
 TEST(float_image_from_rgba) {
     uint8_t rgba[] = {
         255, 0, 0, 255,
@@ -465,6 +479,7 @@ int main() {
     RUN_TEST(temporal_bounds_checking);
     RUN_TEST(temporal_smoothing_formula);
     RUN_TEST(temporal_hysteresis);
+    RUN_TEST(temporal_invalid_geometry);
     
     std::cout << "\n--- Edge Detector Tests ---\n";
     RUN_TEST(edge_detector_bounds);
@@ -476,7 +491,7 @@ int main() {
     RUN_TEST(cell_stats_computation);
     
     std::cout << "\n--- Font Loader Tests ---\n";
-    RUN_TEST(font_loader_path_traversal);
+    RUN_TEST(font_loader_invalid_paths);
     RUN_TEST(font_loader_invalid_data);
     
     std::cout << "\n--- UTF-8 Validation Tests ---\n";
@@ -500,6 +515,8 @@ int main() {
     RUN_TEST(types_float_image);
     RUN_TEST(types_color_luminance);
     RUN_TEST(float_image_from_rgba);
+    RUN_TEST(result_type);
+    RUN_TEST(size_type);
     
     std::cout << "\n--- Glyph Stats Tests ---\n";
     RUN_TEST(glyph_stats_similarity);

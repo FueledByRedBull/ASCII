@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <utility>
 
 namespace ascii {
 
@@ -42,23 +43,40 @@ void ContourExtractor::apply(const FloatImage& luminance,
                              int grid_cols,
                              int grid_rows,
                              std::vector<CellStats>& cells) const {
-    if (!config_.enabled || luminance.empty() || grid_cols <= 0 || grid_rows <= 0 ||
-        cell_width <= 0 || cell_height <= 0 || cells.empty()) {
-        return;
+    if (grid_cols < 0 || grid_rows < 0 || cell_width < 0 || cell_height < 0) {
+        throw std::invalid_argument("Contour geometry must be non-negative");
     }
+    const bool active = config_.enabled && !luminance.empty() && grid_cols > 0 && grid_rows > 0;
+    if (active) {
+        if (cell_width == 0 || cell_height == 0 ||
+            grid_cols > 1 + (luminance.width() - 1) / cell_width ||
+            grid_rows > 1 + (luminance.height() - 1) / cell_height ||
+            cells.size() < checked_image_size(grid_cols, grid_rows)) {
+            throw std::invalid_argument("Contour grid does not match its cells");
+        }
+        if (!edges.empty() && (edges.size() != luminance.size() ||
+            edges.edge_mask.size() != luminance.size_in_elements())) {
+            throw std::invalid_argument("Contour edge mask does not match the image");
+        }
+    }
+    for (auto& cell : cells) {
+        cell.has_contour = false;
+        cell.contour_codepoint = 0;
+        cell.contour_strength = 0.0f;
+    }
+    if (!active) return;
 
     const int w = luminance.width();
     const int h = luminance.height();
 
-    FloatImage inner = EdgeDetector::gaussian_blur(luminance, config_.dog_sigma_inner);
+    FloatImage dog = EdgeDetector::gaussian_blur(luminance, config_.dog_sigma_inner);
     FloatImage outer = EdgeDetector::gaussian_blur(luminance, config_.dog_sigma_outer);
-    FloatImage dog(w, h, 0.0f);
 #ifdef HAS_OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            dog.set(x, y, inner.get(x, y) - outer.get(x, y));
+            dog.set(x, y, dog.get(x, y) - outer.get(x, y));
         }
     }
 
@@ -66,22 +84,23 @@ void ContourExtractor::apply(const FloatImage& luminance,
     FloatImage gy;
     EdgeDetector::sobel(dog, gx, gy);
 
-    FloatImage magnitude(w, h, 0.0f);
-    FloatImage orientation(w, h, 0.0f);
+    FloatImage magnitude = std::move(gx);
+    FloatImage orientation = std::move(gy);
 #ifdef HAS_OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            const float sx = gx.get(x, y);
-            const float sy = gy.get(x, y);
+            const float sx = magnitude.get(x, y);
+            const float sy = orientation.get(x, y);
             magnitude.set(x, y, std::sqrt(sx * sx + sy * sy));
             orientation.set(x, y, std::atan2(sy, sx));
         }
     }
 
     FloatImage nms = EdgeDetector::non_maximum_suppression(magnitude, orientation);
-    const int threshold_tile = std::max(4, std::min(cell_width, cell_height) * 2);
+    const int threshold_tile = static_cast<int>(std::min<int64_t>(
+        std::max(w, h), std::max<int64_t>(4, 2ll * std::min(cell_width, cell_height))));
     FloatImage threshold_map = EdgeDetector::compute_adaptive_threshold_map(
         nms, threshold_tile, 0.72f, 0.001f);
 
@@ -92,9 +111,9 @@ void ContourExtractor::apply(const FloatImage& luminance,
         for (int col = 0; col < grid_cols; ++col) {
             const int x0 = col * cell_width;
             const int y0 = row * cell_height;
-            const int x1 = std::min(x0 + cell_width, w);
-            const int y1 = std::min(y0 + cell_height, h);
-            const int area = (x1 - x0) * (y1 - y0);
+            const int x1 = x0 + std::min(cell_width, w - x0);
+            const int y1 = y0 + std::min(cell_height, h - y0);
+            const double area = static_cast<double>(x1 - x0) * (y1 - y0);
             if (area <= 0) continue;
 
             std::array<float, 4> hist{0.0f, 0.0f, 0.0f, 0.0f};
