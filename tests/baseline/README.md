@@ -67,9 +67,13 @@ Use four threads and add `--fast --no-contours` for the measured speed path. Hel
 | Decoded exports and binary-pipe contracts | `final-formats/results.json`, `final-raw-pipe/results.json`; `verify-formats.ps1`, `verify-raw-pipe.ps1` |
 | Diagnostic quality/reference limits | `analysis-repro/quality-report.md`, `analysis-repair-handoff.md` |
 
+### Hosted CI
+
+[Hosted CI run 37012995256](https://github.com/FueledByRedBull/ASCII/actions/runs/37012995256) passed for `ddc0043` on 2026-10-02 with 58/58 tests on Windows (MSVC), Linux and macOS. The packaged Windows x64 ZIP then passed `--help` on a separate clean Windows runner.
+
 ### Remaining limits
 
-OpenCV and AVX2 builds remain unverified. Webcam and audio playback polish remain deferred; audio regression checks use a dummy device. Live terminal/device behavior and encoder throughput are not represented by the text-export benchmark. PNG still output is intentionally rejected. WebM exports failed with the installed `av1_d3d12va` encoder (`Invalid argument`); this is an unavailable encoder path, not a successful export. Both failed formats left no destination file. No fresh hosted CI run or distributable ZIP was produced for this snapshot.
+OpenCV and AVX2 builds remain unverified. Webcam and audio playback polish remain deferred; audio regression checks use a dummy device. Live terminal/device behavior and encoder throughput are not represented by the text-export benchmark. PNG still output is intentionally rejected. WebM exports failed with the installed `av1_d3d12va` encoder (`Invalid argument`); this is an unavailable encoder path, not a successful export. Both failed formats left no destination file.
 
 ## Historical snapshot: 2026-07-16
 

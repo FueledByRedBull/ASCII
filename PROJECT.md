@@ -102,6 +102,7 @@ passing final checks do not erase those historical failures.
 | Replay/text determinism | Exact bytes across 1/8/12 threads for both 120-frame video fixtures; repeated benchmark text also identical |
 | Export matrix | All 18 supported image/video combinations decoded with expected geometry/frame count and clean EOF |
 | Input and admission failures | Truncated RGB/RGBA pipes and over-budget strict-memory requests rejected; existing outputs preserved |
+| Hosted CI on Windows, Linux and macOS ([run 37012995256](https://github.com/FueledByRedBull/ASCII/actions/runs/37012995256), `ddc0043`) | 58/58 pass on each platform; packaged Windows ZIP passes `--help` on a separate clean runner |
 
 Measurements use a Ryzen 7 7800X3D, Windows 11, MSVC 19.44, Release/OpenMP,
 truecolor, no audio, no OpenCV and no AVX2. Normal benchmark values are medians
@@ -131,7 +132,7 @@ commands carry `/fsanitize=address /Zi /O2`; prebuilt dependency DLLs are not
 instrumented, and ASan does not establish race freedom. Full original sample
 media decoding reached clean EOF at 1,874 MP4 frames and 52 GIF frames.
 
-OpenCV, AVX2, other-host performance, fresh hosted CI and packaging remain
+OpenCV, AVX2 and other-host performance remain
 unverified by this goal. PNG output remains deliberately excluded. The installed
 FFmpeg lacks a usable WebM encoder; the CLI fails explicitly without leaving a
 partial destination. Strict-memory is a conservative admission estimate, not an
