@@ -21,7 +21,7 @@ OpenCV, AVX2, webcam, audio polish, GPU compute paths, and richer packaging are 
 
 ### Completed correctness, algorithm and performance goal (2026-10-02)
 
-Ponytail full mode was used throughout. The goal was reordered into correctness
+The goal was reordered into correctness
 and algorithm repair first, followed by measured optimization and final verification.
 Both phases are complete for the Windows/MSVC no-OpenCV, non-AVX2 baseline.
 This is evidence for the tested contracts and inputs, not a claim that all possible
@@ -49,9 +49,8 @@ with user authorization. No dependency was added or upgraded.
 The unchanged starting source passed all 34 original tests, despite focused
 reproductions finding 13 configuration/CLI failures, nine analysis failures and
 21 mapping failures. Later reproductions exposed output replacement on failure,
-Windows pipe/path errors and FFmpeg buffer-contract violations. The original
-source, failures and subsequent proofs remain under `output/goal-audit/`;
-passing final checks do not erase those historical failures.
+Windows pipe/path errors and FFmpeg buffer-contract violations. Passing final
+checks do not erase those historical failures.
 
 **Main repairs and algorithm decisions**
 
@@ -122,8 +121,6 @@ improved from 0.4443 to 0.3764. Ordinary ASCII remains limited by glyph coverage
 block art is the foreground/background reconstruction mode. These finite corpora
 support the chosen algorithms without claiming universal visual optimality.
 
-Evidence: `output/goal-audit/final-58-*`, `asan-final58/`, `final-benchmarks/`,
-`final-scaling/`, `final-runtime/`, `final-formats/` and `final-raw-pipe/`.
 The final CLI SHA-256 is
 `A9F6E5F18FC9A3C86C004AB73B55E947E5DBA0C43EB1B8D6155B1D2887E5197C`.
 Source hashes stayed unchanged during each build/test gate, and executable/input
@@ -435,7 +432,7 @@ Measured baseline (2026-10-02):
   the full-quality reference peak is 113.51 MiB. Threads are an explicit setting,
   and terminal painting is outside the offline-export throughput measurement.
 
-The complete current matrix, 240x80 stress result, commands and proof locations
+The complete current matrix, 240x80 stress result and commands
 are in [tests/baseline/README.md](tests/baseline/README.md). Its separately dated
 July snapshot preserves the earlier performance miss and hosted release evidence.
 

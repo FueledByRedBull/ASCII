@@ -41,7 +41,7 @@ Three image-to-text startup/process/exit runs at 120x40 took a median **0.103 se
 - Colored ASCII retains mean foreground color on a black background. Sparse glyph coverage limits reconstructed brightness; whole-image radiometric brightness preservation is not claimed. Tone remapping was not introduced to improve benchmark numbers.
 - Final format checks decoded all 18 supported image/video combinations: `.jpg`, `.jpeg`, `.bmp`, `.mp4`, `.m4v`, `.mov`, `.mkv`, `.avi`, `.gif`. Image exports contain one frame; video-to-still contains the first frame; video-to-video contains all eight fixture frames. Binary RGB/RGBA pipe inputs passed complete-frame checks and rejected partial final frames.
 
-### Reproduction and retained evidence
+### Reproduction
 
 From an x64 Visual Studio developer shell with existing local dependencies configured:
 
@@ -51,21 +51,10 @@ cmake --build build-noopencv -j 4
 ctest --test-dir build-noopencv --output-on-failure
 
 $env:OMP_NUM_THREADS = '12'
-.\build-noopencv\ascii-engine.exe output/goal-audit/reference-1080p.mkv --cols 120 --rows 40 --color truecolor --no-audio -o output/reference-frames.txt
+.\build-noopencv\ascii-engine.exe reference-1080p.mkv --cols 120 --rows 40 --color truecolor --no-audio -o frames.txt
 ```
 
-Use four threads and add `--fast --no-contours` for the measured speed path. Helpers and raw evidence remain local under `output/goal-audit/` and are intentionally not release artifacts:
-
-| Evidence | Local path under `output/goal-audit/` |
-|---|---|
-| Release gate and source/binary hashes | `final-58-ctest.log`, `final-58-sources-{before,after}.json`, `final-58-binaries.json` |
-| ASan gate, compile flags, tool/dependency hashes | `asan-final58/README.md` and proof files; `run-asan-gate.ps1` |
-| Three-run timings, arguments, hashes and text digests | `final-benchmarks/{summary,results,environment}.json`; `run-benchmarks.ps1 -FullThreads 12 -FastThreads 4 -Repeats 3` |
-| Fixture provenance and generation | `benchmark-fixtures/manifest.json`, `create-benchmark-fixtures.ps1` |
-| Single-run 240x80 scaling | `final-scaling/{summary,results,environment}.json` |
-| Startup, strict-memory, thread determinism, Unicode paths | `final-runtime/results.json`, `final-runtime/hashes-{before,after}.json`; `verify-final-runtime.ps1` |
-| Decoded exports and binary-pipe contracts | `final-formats/results.json`, `final-raw-pipe/results.json`; `verify-formats.ps1`, `verify-raw-pipe.ps1` |
-| Diagnostic quality/reference limits | `analysis-repro/quality-report.md`, `analysis-repair-handoff.md` |
+Use four threads and add `--fast --no-contours` for the measured speed path. Raw measurement data and helper scripts are kept locally and are not release artifacts.
 
 ### Hosted CI
 
